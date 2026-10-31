@@ -5,7 +5,8 @@ all: build
 build:
 	./scripts/build.sh
 
-serve: build
+serve:
+	@if [ ! -f dist/index.html ]; then ./scripts/build.sh; fi
 	ruby -run -e httpd dist -p 8080
 
 clean:
