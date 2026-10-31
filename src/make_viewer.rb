@@ -712,13 +712,13 @@ HTML_TEMPLATE = <<~'HTML'
 
   <div class="pane">
     <div class="pane-header">
-      <span>Live Arenas, Memory &amp; AST Assembly</span>
+      <span id="astPaneTitle">Live Arenas, Memory &amp; AST Assembly</span>
       <span id="astSummary" style="font-family:var(--font-mono); color:var(--muted);"></span>
     </div>
     <div style="padding:10px 12px 0 12px; flex-shrink:0; border-bottom:1px solid var(--border);">
       <div class="card">
         <div class="card-title">
-          <span>Arena Memory Telemetry (Used / Capacity)</span>
+          <span id="memCardTitle">Arena Memory Telemetry (Used / Capacity)</span>
           <span id="memCardBadge"></span>
         </div>
         <div id="memBreakdownBox"></div>
@@ -729,7 +729,7 @@ HTML_TEMPLATE = <<~'HTML'
         <div class="card-title">Active AST Roots (Attached &amp; In-Flight Nodes)</div>
         <div id="astTreeBox"></div>
       </div>
-      <div class="card">
+      <div class="card" id="astOrphansCard">
         <div class="card-title">Superseded / Unreferenced Arena Nodes</div>
         <div id="astOrphansBox"></div>
       </div>
@@ -1171,6 +1171,7 @@ function preprocessTrace(trace) {
   trace._underflowEvents = [];
   trace._underflowFirstStepByNode = {};
   trace._peakMemUsed = 0;
+  trace._hasArena = false;
   trace.steps.forEach((s, i) => {
     const newUnderflows = [];
     if (s.ast) {
@@ -1227,6 +1228,7 @@ function preprocessTrace(trace) {
     s._memDelta = i > 0 ? Math.max(0, totalU - prevTotalU) : 0;
     s._memTotalUsed = totalU;
     s._memTotalCap = totalCap;
+    if (totalCap > 0) trace._hasArena = true;
     if (totalU > trace._peakMemUsed) trace._peakMemUsed = totalU;
 
     prevAstU = astU;
@@ -1727,9 +1729,47 @@ function updateGeminiDomContext(step) {
   if (el) el.textContent = buildGeminiContextMarkdown(step);
 }
 
+function traceHasArena() {
+  if (currentTrace && typeof currentTrace._hasArena === 'boolean' && currentTrace.steps && currentTrace.steps.length > 0) {
+    if (currentTrace._hasArena) return true;
+  }
+  if (PRISM_BUILD_INFO && typeof PRISM_BUILD_INFO.has_arena === 'boolean') {
+    return PRISM_BUILD_INFO.has_arena;
+  }
+  return Boolean(currentTrace && currentTrace._hasArena);
+}
+
 function renderMemoryTelemetry(step) {
+  const hasArena = traceHasArena();
   const m = step.mem || { ast: [0, 0, 0], meta: [0, 0, 0], scratch: [0, 0, 0], lo: [0, 0], cp: [0, 0] };
   const badge = document.getElementById('memCardBadge');
+  const paneTitle = document.getElementById('astPaneTitle');
+  const cardTitle = document.getElementById('memCardTitle');
+  const prevAllocBtn = document.getElementById('btnPrevAlloc');
+  const nextAllocBtn = document.getElementById('btnNextAlloc');
+  if (paneTitle) {
+    paneTitle.textContent = hasArena ? 'Live Arenas, Memory & AST Assembly' : 'Live Memory & AST Assembly';
+  }
+  if (cardTitle) {
+    cardTitle.textContent = hasArena ? 'Arena Memory Telemetry (Used / Capacity)' : 'Parser Table Telemetry';
+  }
+  if (prevAllocBtn) prevAllocBtn.style.display = hasArena ? '' : 'none';
+  if (nextAllocBtn) nextAllocBtn.style.display = hasArena ? '' : 'none';
+
+  const [loSize, loCap] = m.lo || [0, 0];
+  const [cpSize, cpCap] = m.cp || [0, 0];
+
+  if (!hasArena) {
+    badge.innerHTML = `<span style="color:var(--muted)">malloc/free (pre-arena)</span>`;
+    document.getElementById('memBreakdownBox').innerHTML = `
+      <div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:11px;color:var(--muted);">
+        <span><code>line_offsets</code>: <strong style="color:var(--text)">${loSize}</strong>/${loCap} (${loSize * 4} B)</span>
+        <span><code>constant_pool</code>: <strong style="color:var(--text)">${cpSize}</strong>/${cpCap}</span>
+      </div>
+    `;
+    return;
+  }
+
   badge.innerHTML = step._memDelta > 0
     ? `<span class="mem-delta-pill">+${formatBytes(step._memDelta)} this step</span>`
     : `<span style="color:var(--muted)">peak: ${formatBytes(currentTrace._peakMemUsed || 0)}</span>`;
@@ -1754,9 +1794,6 @@ function renderMemoryTelemetry(step) {
     `;
   };
 
-  const [loSize, loCap] = m.lo || [0, 0];
-  const [cpSize, cpCap] = m.cp || [0, 0];
-
   document.getElementById('memBreakdownBox').innerHTML = `
     ${makeArenaRow('AST Arena (<code>parser-&gt;arena</code>)', m.ast, step._astDelta, 'var(--accent)')}
     ${makeArenaRow('Metadata Arena (<code>metadata_arena</code>)', m.meta, step._metaDelta, 'var(--purple)')}
@@ -1770,19 +1807,22 @@ function renderMemoryTelemetry(step) {
 }
 
 function renderAstForest(step) {
+  const hasArena = traceHasArena();
   const nodes = step._astSnapshot || [];
   const treeBox = document.getElementById('astTreeBox');
   const orphansBox = document.getElementById('astOrphansBox');
+  const orphansCard = document.getElementById('astOrphansCard');
+  if (orphansCard) {
+    orphansCard.style.display = hasArena ? '' : 'none';
+  }
   const astPaneBody = treeBox.closest('.pane-body');
   const prevAstScrollTop = astPaneBody ? astPaneBody.scrollTop : 0;
   treeBox.innerHTML = '';
   orphansBox.innerHTML = '';
   const underflowCount = nodes.filter(n => n.underflow || n.end < n.start).length;
-  document.getElementById('astSummary').innerHTML = underflowCount > 0
-    ? `<span style="color:var(--red);font-weight:700;">⚠ ${underflowCount} corrupted location(s) / ${nodes.length} nodes</span>`
-    : `${nodes.length} allocated node(s)`;
 
   if (nodes.length === 0) {
+    document.getElementById('astSummary').innerHTML = '0 allocated node(s)';
     treeBox.innerHTML = '<span style="color:var(--muted)">(no AST nodes allocated yet)</span>';
     orphansBox.innerHTML = '<span style="color:var(--muted)">—</span>';
     return;
@@ -1813,6 +1853,21 @@ function renderAstForest(step) {
       activeRoots.push(r);
     }
   });
+
+  let displayNodeCount = nodes.length;
+  if (!hasArena) {
+    let activeCount = 0;
+    const countSubtree = (n) => {
+      if (!n) return;
+      activeCount++;
+      n.children.forEach(cid => countSubtree(byId.get(cid)));
+    };
+    activeRoots.forEach(countSubtree);
+    displayNodeCount = activeCount;
+  }
+  document.getElementById('astSummary').innerHTML = underflowCount > 0
+    ? `<span style="color:var(--red);font-weight:700;">⚠ ${underflowCount} corrupted location(s) / ${displayNodeCount} nodes</span>`
+    : `${displayNodeCount} ${hasArena ? 'allocated' : 'active'} node(s)`;
 
   function buildNodeDom(n) {
     const wrapper = document.createElement('div');
@@ -3550,6 +3605,12 @@ if Dir.exist?(versions_root)
     next unless File.exist?(meta_file)
 
     meta = JSON.parse(File.read(meta_file, encoding: "UTF-8"))
+    compat_file = File.join(vdir, "trace_compat.h")
+    meta["has_arena"] = if File.exist?(compat_file)
+      File.read(compat_file).include?("#define PRISM_HAS_ARENA 1")
+    else
+      !meta["version"].to_s.start_with?("1.")
+    end
     meta["wasm_b64"] = File.exist?(wasm_file) ? [File.binread(wasm_file)].pack("m0") : ""
     prism_versions << meta
   end
