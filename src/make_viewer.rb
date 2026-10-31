@@ -465,6 +465,8 @@ HTML_TEMPLATE = <<~'HTML'
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 6px;
+    white-space: nowrap;
     margin-bottom: 3px;
   }
   .mem-bar-bg {
@@ -1767,7 +1769,7 @@ function renderMemoryTelemetry(step) {
     paneTitle.textContent = hasArena ? 'Live Arenas, Memory & AST Assembly' : 'Live Memory & AST Assembly';
   }
   if (cardTitle) {
-    cardTitle.textContent = hasArena ? 'Arena & Heap Memory Telemetry' : 'Heap Memory Telemetry (PRISM_XALLOCATOR)';
+    cardTitle.textContent = hasArena ? 'Arena & Heap Telemetry' : 'Heap Memory Telemetry';
   }
 
   const [loSize, loCap] = m.lo || [0, 0];
@@ -1777,8 +1779,8 @@ function renderMemoryTelemetry(step) {
   const xPct = xPeak > 0 ? Math.min(100, (xLive / xPeak) * 100).toFixed(1) : 0;
   const xDelta = step._xallocDelta || 0;
   const xDeltaPill = xDelta > 0
-    ? `<span class="mem-delta-pill">+${formatBytes(xDelta)}</span>`
-    : (xDelta < 0 ? `<span class="mem-delta-pill" style="background:rgba(88,166,255,0.18);color:var(--accent);">-${formatBytes(Math.abs(xDelta))}</span>` : '');
+    ? `<span class="mem-delta-pill">xmalloc +${formatBytes(xDelta)}</span>`
+    : (xDelta < 0 ? `<span class="mem-delta-pill" style="background:rgba(88,166,255,0.18);color:var(--accent);">xfree -${formatBytes(Math.abs(xDelta))}</span>` : '');
 
   const leak = currentTrace && currentTrace.leak_summary;
   let leakBadgeHtml = '';
@@ -1795,10 +1797,10 @@ function renderMemoryTelemetry(step) {
   const xallocRowHtml = `
     <div class="mem-row">
       <div class="mem-row-header">
-        <span><span class="swatch" style="background:var(--green);margin-right:5px;"></span>Heap (<code>xmalloc</code> / <code>xfree</code>)${xDeltaPill}</span>
+        <span><span class="swatch" style="background:var(--green);margin-right:5px;"></span>Heap${xDeltaPill}</span>
         <span style="color:var(--muted)">
-          <strong style="color:var(--text)">${formatBytes(xLive)}</strong> / peak ${formatBytes(xPeak)}
-          (${xAllocs} alloc / ${xFrees} free)
+          <strong style="color:var(--text)">${formatBytes(xLive)}</strong> / ${formatBytes(xPeak)} peak
+          (${xAllocs} alloc, ${xFrees} free)
         </span>
       </div>
       <div class="mem-bar-bg">
