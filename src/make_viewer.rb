@@ -2066,8 +2066,313 @@ document.getElementById('repoRootInput').addEventListener('keydown', (e) => {
   }
 });
 
+function buildTraceSummaryObject() {
+  if (!currentTrace) return { loaded: false };
+  const steps = currentTrace.steps || [];
+  const lastStep = steps[steps.length - 1] || {};
+  const lo = lastStep.line_offsets || [];
+  const badLineOffsets = [];
+  for (let i = 1; i < lo.length; i++) {
+    if (lo[i] <= lo[i - 1]) {
+      badLineOffsets.push({ lineIndex: i, offset: lo[i], prevOffset: lo[i - 1] });
+    }
+  }
+  const crashStep = currentTrace._crashIdx >= 0 ? steps[currentTrace._crashIdx] : null;
+  return {
+    name: currentTrace.name,
+    prismBuild: PRISM_BUILD_INFO,
+    source: currentTrace.source,
+    sourceBytes: new TextEncoder().encode(currentTrace.source).length,
+    shareUrl: buildShareableUrl(currentTrace.source),
+    currentStepIndex: currentIdx,
+    totalSteps: steps.length,
+    lexTokenCount: steps.filter(s => s.kind === 'LEX_TOKEN').length,
+    rewindCount: steps.filter(s => s._isRewind).length,
+    peakArenaBytes: currentTrace._peakMemUsed || 0,
+    crash: crashStep ? {
+      stepIndex: currentTrace._crashIdx,
+      step: crashStep.step,
+      func: (crashStep.detail && crashStep.detail.func) || crashStep.func,
+      file: stepSourceFile(crashStep),
+      line: (crashStep.detail && crashStep.detail.line) || crashStep.line,
+      reason: crashStep.detail && crashStep.detail.reason,
+      expr: crashStep.detail && crashStep.detail.expr
+    } : null,
+    underflows: (currentTrace._underflowEvents || []).map(ev => ({
+      stepIndex: ev.stepIdx,
+      step: ev.step,
+      nodeId: ev.node.id,
+      nodeType: ev.node.type,
+      start: ev.node.start,
+      end: ev.node.end,
+      len: ev.node.len,
+      func: ev.func,
+      file: ev.file,
+      line: ev.line
+    })),
+    lineOffsetsCount: lo.length,
+    lineOffsetAnomalies: badLineOffsets
+  };
+}
+
+function buildStepStateObject(idx = currentIdx) {
+  if (!currentTrace || !currentTrace.steps.length) return { error: 'No trace loaded' };
+  const clamped = Math.max(0, Math.min(currentTrace.steps.length - 1, idx));
+  const s = currentTrace.steps[clamped];
+  return {
+    stepIndex: clamped,
+    totalSteps: currentTrace.steps.length,
+    step: s.step,
+    kind: s.kind,
+    func: s.func,
+    file: stepSourceFile(s),
+    line: s.line,
+    detail: s.detail || {},
+    prevToken: { start: s.prev[0], end: s.prev[1], type: s.prev[2] },
+    currToken: { start: s.curr[0], end: s.curr[1], type: s.curr[2] },
+    nextStart: s.next_start,
+    heredocEnd: s.heredoc_end,
+    lexState: s.lex_state,
+    lexModes: s.lex_modes || [],
+    contexts: s.contexts || [],
+    callStack: s.call_stack || [],
+    lineOffsets: s.line_offsets || [],
+    errors: s.errors || 0,
+    isRewind: Boolean(s._isRewind),
+    rewindDelta: s._rewindDelta || 0,
+    hasNewUnderflow: Boolean(s._hasNewUnderflow),
+    memUsedBytes: s._memTotalUsed || 0,
+    memCapBytes: s._memTotalCap || 0,
+    astNodes: s._astSnapshot || []
+  };
+}
+
+async function registerWebMcpTools() {
+  const toolDefs = [
+    {
+      name: 'parse_and_trace',
+      description: 'Parse and trace a Ruby source snippet in the live Prism Wasm visualizer, update the UI and shareable URL (?code=), and return a structured summary of steps, tokens, crashes, AST location underflows, and line_offsets anomalies.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          code: {
+            type: 'string',
+            description: 'Ruby source code snippet to parse and trace with Prism.'
+          },
+          jumpTo: {
+            type: 'string',
+            enum: ['start', 'end', 'crash', 'underflow'],
+            description: 'Optional position to move the playhead to after tracing (default: start).'
+          }
+        },
+        required: ['code']
+      },
+      handler: async (input) => {
+        const code = String(input && input.code !== undefined ? input.code : '');
+        document.getElementById('rubyEditor').value = code;
+        await parseWithWasm(code, 'WebMCP Input');
+        if (input && input.jumpTo && currentTrace) {
+          if (input.jumpTo === 'crash' && currentTrace._crashIdx >= 0) {
+            jumpToStep(currentTrace._crashIdx);
+          } else if (input.jumpTo === 'underflow' && currentTrace._underflowIdx >= 0) {
+            jumpToStep(currentTrace._underflowIdx);
+          } else if (input.jumpTo === 'end') {
+            jumpToStep(currentTrace.steps.length - 1);
+          } else {
+            jumpToStep(0);
+          }
+        }
+        return buildTraceSummaryObject();
+      }
+    },
+    {
+      name: 'get_trace_summary',
+      description: 'Return metadata and anomaly summary for the currently loaded Prism trace (Prism version/SHA, Ruby source, total steps, crash details, AST node location underflows, duplicate/out-of-order line_offsets, peak arena memory, and shareable URL).',
+      inputSchema: {
+        type: 'object',
+        properties: {}
+      },
+      handler: async () => buildTraceSummaryObject()
+    },
+    {
+      name: 'get_step_state',
+      description: 'Get the complete lexer, parser, call stack, line_offsets, memory, and AST snapshot for a trace step (defaults to the currently displayed step).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          step: {
+            type: 'number',
+            description: '0-based step index to inspect (defaults to current step).'
+          },
+          selectInUi: {
+            type: 'boolean',
+            description: 'Whether to move the viewer playhead to this step (default: true).'
+          },
+          format: {
+            type: 'string',
+            enum: ['json', 'markdown'],
+            description: 'Output format: structured json (default) or markdown.'
+          }
+        }
+      },
+      handler: async (input = {}) => {
+        const targetIdx = (typeof input.step === 'number' && !Number.isNaN(input.step))
+          ? Math.max(0, Math.min(currentTrace.steps.length - 1, Math.trunc(input.step)))
+          : currentIdx;
+        if (input.selectInUi !== false && targetIdx !== currentIdx) {
+          jumpToStep(targetIdx);
+        }
+        if (input.format === 'markdown') {
+          return { stepIndex: targetIdx, markdown: buildGeminiContextMarkdown() };
+        }
+        return buildStepStateObject(targetIdx);
+      }
+    },
+    {
+      name: 'jump_to_step',
+      description: 'Move the visualizer playhead to a specific step number or semantic landmark (crash, underflow, next_token, prev_token, next_ast, prev_ast, next_alloc, prev_alloc, next_rewind, prev_rewind, start, end) and return that step state.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          target: {
+            type: 'string',
+            description: "Step number (e.g. '42') or landmark: 'crash', 'underflow', 'next_token', 'prev_token', 'next_ast', 'prev_ast', 'next_alloc', 'prev_alloc', 'next_rewind', 'prev_rewind', 'start', 'end'."
+          }
+        },
+        required: ['target']
+      },
+      handler: async (input = {}) => {
+        const t = String(input.target || '').trim();
+        if (t === 'crash' && currentTrace._crashIdx >= 0) jumpToStep(currentTrace._crashIdx);
+        else if (t === 'underflow') document.getElementById('btnJumpUnderflow').click();
+        else if (t === 'next_token') stepToKind(['LEX_TOKEN'], 1);
+        else if (t === 'prev_token') stepToKind(['LEX_TOKEN'], -1);
+        else if (t === 'next_ast') stepToKind(['NODE_NEW', 'NODE_LIST_APPEND'], 1);
+        else if (t === 'prev_ast') stepToKind(['NODE_NEW', 'NODE_LIST_APPEND'], -1);
+        else if (t === 'next_alloc') stepToAlloc(1);
+        else if (t === 'prev_alloc') stepToAlloc(-1);
+        else if (t === 'next_rewind') stepToRewind(1);
+        else if (t === 'prev_rewind') stepToRewind(-1);
+        else if (t === 'start') jumpToStep(0);
+        else if (t === 'end') jumpToStep(currentTrace.steps.length - 1);
+        else {
+          const n = parseInt(t, 10);
+          if (!Number.isNaN(n)) jumpToStep(n);
+        }
+        return buildStepStateObject(currentIdx);
+      }
+    },
+    {
+      name: 'search_trace_steps',
+      description: 'Filter trace steps by event kind, C function name, cursor rewind, or AST location underflow to quickly locate key transitions.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          kind: {
+            type: 'string',
+            description: 'Optional event kind filter (e.g. LEX_TOKEN, LEX_MODE_PUSH, LEX_MODE_POP, HEREDOC_FLUSH, PARSE_ENTER, PARSE_EXIT, NODE_NEW, ERROR, CRASH).'
+          },
+          func: {
+            type: 'string',
+            description: 'Optional substring match on the C function name (e.g. parse_heredoc, escape_read).'
+          },
+          onlyRewinds: {
+            type: 'boolean',
+            description: 'If true, only return steps where parser->current.start rewound backward.'
+          },
+          onlyUnderflows: {
+            type: 'boolean',
+            description: 'If true, only return steps where a new AST node location underflow occurred.'
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum matching steps to return (default: 50, max: 200).'
+          }
+        }
+      },
+      handler: async (input = {}) => {
+        const maxResults = Math.max(1, Math.min(200, Number(input.limit) || 50));
+        const matches = [];
+        const steps = (currentTrace && currentTrace.steps) || [];
+        for (let i = 0; i < steps.length; i++) {
+          const s = steps[i];
+          if (input.kind && s.kind !== input.kind) continue;
+          if (input.func && !(s.func || '').includes(input.func)) continue;
+          if (input.onlyRewinds && !s._isRewind) continue;
+          if (input.onlyUnderflows && !s._hasNewUnderflow) continue;
+          matches.push({
+            stepIndex: i,
+            step: s.step,
+            kind: s.kind,
+            func: s.func,
+            file: stepSourceFile(s),
+            line: s.line,
+            curr: s.curr,
+            nextStart: s.next_start,
+            heredocEnd: s.heredoc_end,
+            isRewind: Boolean(s._isRewind),
+            hasNewUnderflow: Boolean(s._hasNewUnderflow)
+          });
+          if (matches.length >= maxResults) break;
+        }
+        return { totalMatchedReturned: matches.length, matches };
+      }
+    }
+  ];
+
+  // Expose structured helper on window.prismMcp for direct DevTools / script automation
+  const toolMap = Object.fromEntries(toolDefs.map(t => [t.name, t]));
+  window.prismMcp = {
+    tools: toolDefs.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+    async callTool(name, args = {}) {
+      const def = toolMap[name];
+      if (!def) throw new Error(`Unknown Prism WebMCP tool: ${name}`);
+      return await def.handler(args);
+    }
+  };
+
+  // Register with browser-native WebMCP (document.modelContext or navigator.modelContext)
+  const mc = (typeof document !== 'undefined' && document.modelContext)
+    || (typeof navigator !== 'undefined' && navigator.modelContext)
+    || null;
+  if (!mc) return;
+
+  const webMcpTools = toolDefs.map(def => ({
+    name: def.name,
+    description: def.description,
+    inputSchema: def.inputSchema,
+    execute: async (input) => {
+      try {
+        const result = await def.handler(input || {});
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          structuredContent: result
+        };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `Error in ${def.name}: ${err && err.message ? err.message : String(err)}` }],
+          isError: true
+        };
+      }
+    }
+  }));
+
+  try {
+    if (typeof mc.registerTool === 'function') {
+      for (const tool of webMcpTools) {
+        await mc.registerTool(tool);
+      }
+    } else if (typeof mc.provideContext === 'function') {
+      await mc.provideContext({ tools: webMcpTools });
+    }
+  } catch (err) {
+    console.warn('WebMCP tool registration warning:', err);
+  }
+}
+
 (async function initFromUrlOrPreset() {
   loadTrace(PRESETS[0]);
+  await registerWebMcpTools();
   const params = new URLSearchParams(window.location.search);
   const codeParam = params.get('code');
   const stepParam = params.get('step');
