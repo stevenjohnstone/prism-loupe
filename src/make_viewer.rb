@@ -523,7 +523,7 @@ HTML_TEMPLATE = <<~'HTML'
     <span>Prism v__PRISM_VERSION__</span>
     <span class="version-sha">(__PRISM_SHORT_SHA__)</span>
   </a>
-  <button id="btnPlayPause" class="success" style="min-width:68px;" title="Play / Pause automatic playthrough at 1 step/s (Spacebar)">&#9654; Play</button>
+  <button id="btnPlayPause" class="success" style="min-width:68px;" title="Play / Pause automatic playthrough (Spacebar)">&#9654; Play</button>
   <button id="btnPrev" class="primary" title="Step backward 1 trace event (Left Arrow)">&larr; Step</button>
   <button id="btnNext" class="primary" title="Step forward 1 trace event (Right Arrow)">Step &rarr;</button>
   <button id="btnPrevTok" class="primary" title="Jump to previous lexed token (Shift + Left Arrow)">&larr; Token</button>
@@ -538,13 +538,28 @@ HTML_TEMPLATE = <<~'HTML'
   <button id="btnJumpCrash" class="warn" style="display:none;" title="Jump to intercepted crash step (Key: C)">💥 Crash</button>
   <span id="stepCounter" style="margin-left:auto; font-family:var(--font-mono); font-size:12px; color:var(--muted); white-space:nowrap;">Step 0 / 0</span>
   <button id="btnToggleGemini" style="display:none; border-color:var(--purple); color:var(--purple); font-weight:600;" title="Open in-page Gemini assistant drawer">✨ Ask Gemini</button>
-  <button id="btnSettings" title="Settings (Configure local Prism repository path for Antigravity IDE links)">&#9881;</button>
+  <button id="btnSettings" title="Settings (Playback speed &amp; local Prism repository path)">&#9881;</button>
 </header>
 
 <div id="settingsPopover" class="settings-popover">
   <div class="card-title" style="margin-bottom:8px;">
     <span>Viewer Settings</span>
     <span id="btnCloseSettings" style="cursor:pointer; font-size:14px; color:var(--muted);" title="Close">&times;</span>
+  </div>
+  <div style="margin-bottom:12px; padding-bottom:10px; border-bottom:1px solid var(--border);">
+    <label for="playIntervalInput" style="display:block; font-size:11.5px; color:var(--muted); margin-bottom:5px;">
+      Playback Step Interval (ms):
+    </label>
+    <div style="display:flex; align-items:center; gap:5px; margin-bottom:6px;">
+      <input type="number" id="playIntervalInput" min="10" max="10000" step="10" value="250" style="width:90px; background:#090d13; color:var(--text); border:1px solid var(--border); border-radius:4px; padding:5px 8px; font-size:12px; font-family:var(--font-mono);">
+      <div style="display:flex; gap:4px; flex-wrap:wrap;">
+        <button type="button" class="interval-preset-btn" data-ms="50" style="padding:3px 6px; font-size:11px;">50ms</button>
+        <button type="button" class="interval-preset-btn" data-ms="100" style="padding:3px 6px; font-size:11px;">100ms</button>
+        <button type="button" class="interval-preset-btn" data-ms="250" style="padding:3px 6px; font-size:11px;">250ms</button>
+        <button type="button" class="interval-preset-btn" data-ms="500" style="padding:3px 6px; font-size:11px;">500ms</button>
+        <button type="button" class="interval-preset-btn" data-ms="1000" style="padding:3px 6px; font-size:11px;">1s</button>
+      </div>
+    </div>
   </div>
   <label for="repoRootInput" style="display:block; font-size:11.5px; color:var(--muted); margin-bottom:5px;">
     Prism Repository Path (enables <code>&nearr; Antigravity IDE</code> links):
@@ -711,10 +726,47 @@ const PRESETS = __PRESETS_JSON__;
 const WASM_BASE64 = "__WASM_BASE64__";
 const PRISM_BUILD_INFO = __PRISM_BUILD_INFO_JSON__;
 const REPO_ROOT_STORAGE = 'prism_trace_repo_root';
+const PLAY_INTERVAL_STORAGE = 'prism_trace_play_interval_ms';
+const DEFAULT_PLAY_INTERVAL_MS = 250;
 
 function getRepoRoot() {
   const saved = localStorage.getItem(REPO_ROOT_STORAGE);
   return saved ? saved.trim().replace(/\/+$/, '') : '';
+}
+
+function getPlayIntervalMs() {
+  const saved = parseInt(localStorage.getItem(PLAY_INTERVAL_STORAGE), 10);
+  if (Number.isFinite(saved) && saved >= 10 && saved <= 10000) {
+    return saved;
+  }
+  return DEFAULT_PLAY_INTERVAL_MS;
+}
+
+function updatePlayIntervalUI(ms) {
+  const input = document.getElementById('playIntervalInput');
+  if (input && document.activeElement !== input) {
+    input.value = ms;
+  }
+  document.querySelectorAll('.interval-preset-btn').forEach(btn => {
+    const btnMs = parseInt(btn.getAttribute('data-ms'), 10);
+    btn.classList.toggle('active', btnMs === ms);
+  });
+  const playBtn = document.getElementById('btnPlayPause');
+  if (playBtn) {
+    playBtn.title = `Play / Pause automatic stepping (${ms}ms per step)`;
+  }
+}
+
+function setPlayIntervalMs(rawMs) {
+  const parsed = parseInt(rawMs, 10);
+  const clamped = Number.isFinite(parsed) ? Math.max(10, Math.min(10000, parsed)) : DEFAULT_PLAY_INTERVAL_MS;
+  localStorage.setItem(PLAY_INTERVAL_STORAGE, String(clamped));
+  updatePlayIntervalUI(clamped);
+  if (playInterval !== null) {
+    clearInterval(playInterval);
+    playInterval = setInterval(advancePlaybackStep, clamped);
+  }
+  return clamped;
 }
 
 let wasmBytes = null;
@@ -733,6 +785,18 @@ function stopPlayback() {
   if (btn) btn.innerHTML = '&#9654; Play';
 }
 
+function advancePlaybackStep() {
+  if (!currentTrace || currentIdx >= currentTrace.steps.length - 1) {
+    stopPlayback();
+    return;
+  }
+  currentIdx++;
+  renderStep();
+  if (currentIdx >= currentTrace.steps.length - 1) {
+    stopPlayback();
+  }
+}
+
 function togglePlayback() {
   if (!currentTrace || currentTrace.steps.length <= 1) return;
   if (playInterval !== null) {
@@ -745,17 +809,7 @@ function togglePlayback() {
   }
   const btn = document.getElementById('btnPlayPause');
   btn.innerHTML = '&#9208; Pause';
-  playInterval = setInterval(() => {
-    if (!currentTrace || currentIdx >= currentTrace.steps.length - 1) {
-      stopPlayback();
-      return;
-    }
-    currentIdx++;
-    renderStep();
-    if (currentIdx >= currentTrace.steps.length - 1) {
-      stopPlayback();
-    }
-  }, 1000);
+  playInterval = setInterval(advancePlaybackStep, getPlayIntervalMs());
 }
 
 const presetSelect = document.getElementById('presetSelect');
@@ -2023,15 +2077,53 @@ document.getElementById('geminiPromptInput').addEventListener('keydown', (e) => 
   }
 });
 
+updatePlayIntervalUI(getPlayIntervalMs());
+
 document.getElementById('btnSettings').addEventListener('click', () => {
   const pop = document.getElementById('settingsPopover');
   const opening = !pop.classList.contains('open');
   pop.classList.toggle('open');
   if (opening) {
+    const ms = getPlayIntervalMs();
+    const intervalInput = document.getElementById('playIntervalInput');
+    if (intervalInput) intervalInput.value = ms;
+    updatePlayIntervalUI(ms);
     const input = document.getElementById('repoRootInput');
     input.value = getRepoRoot();
-    input.focus();
   }
+});
+
+document.getElementById('playIntervalInput').addEventListener('change', (e) => {
+  const clamped = setPlayIntervalMs(e.target.value);
+  e.target.value = clamped;
+});
+
+document.getElementById('playIntervalInput').addEventListener('input', (e) => {
+  const val = parseInt(e.target.value, 10);
+  if (Number.isFinite(val) && val >= 10 && val <= 10000) {
+    setPlayIntervalMs(val);
+  }
+});
+
+document.getElementById('playIntervalInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const clamped = setPlayIntervalMs(e.target.value);
+    e.target.value = clamped;
+    document.getElementById('settingsPopover').classList.remove('open');
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    document.getElementById('settingsPopover').classList.remove('open');
+  }
+});
+
+document.querySelectorAll('.interval-preset-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const ms = parseInt(btn.getAttribute('data-ms'), 10);
+    const clamped = setPlayIntervalMs(ms);
+    const intervalInput = document.getElementById('playIntervalInput');
+    if (intervalInput) intervalInput.value = clamped;
+  });
 });
 
 document.getElementById('btnCloseSettings').addEventListener('click', () => {
@@ -2039,6 +2131,10 @@ document.getElementById('btnCloseSettings').addEventListener('click', () => {
 });
 
 document.getElementById('btnSaveRepoRoot').addEventListener('click', () => {
+  const intervalInput = document.getElementById('playIntervalInput');
+  if (intervalInput && intervalInput.value) {
+    intervalInput.value = setPlayIntervalMs(intervalInput.value);
+  }
   const val = document.getElementById('repoRootInput').value.trim().replace(/\/+$/, '');
   if (val) {
     localStorage.setItem(REPO_ROOT_STORAGE, val);
