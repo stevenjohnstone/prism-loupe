@@ -579,6 +579,7 @@ HTML_TEMPLATE = <<~'HTML'
             <button id="btnEditSource" class="success" title="Edit Ruby source in-place (or double-click source buffer)">✎ Edit Code</button>
             <button id="btnRunWasm" class="success" style="display:none;" title="Parse &amp; trace with in-browser Prism Wasm (Cmd/Ctrl + Enter)">▶ Parse &amp; Trace (⌘+Enter)</button>
             <button id="btnCancelEdit" style="display:none;">Cancel</button>
+            <button id="btnShareCode" title="Copy a shareable URL with the current Ruby snippet Base64-encoded in ?code=">🔗 Share</button>
             <button id="btnOpenRb" title="Load a .rb file and trace it live">📂 .rb</button>
             <button id="btnOpenJsonl" title="Load a pre-recorded .jsonl trace">📂 .jsonl</button>
             <input type="file" id="rbFileInput" accept=".rb,.txt,*" style="display:none;">
@@ -875,6 +876,7 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse') {
 
   const dt = (performance.now() - t0).toFixed(1);
   loadTrace({ name: label, source: meta.source, steps }, false);
+  updateBrowserUrlWithCode(rubyCode);
 
   const hasCrash = currentTrace._crashIdx >= 0;
   const hasUnderflow = currentTrace._underflowIdx >= 0;
@@ -890,6 +892,53 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse') {
     document.getElementById('wasmStatus').innerHTML =
       `<span style="color:var(--green)">● Traced ${steps.length} steps in ${dt} ms</span>`;
   }
+}
+
+function encodeCodeBase64(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return btoa(bin);
+}
+
+function decodeCodeBase64(b64) {
+  const normalized = b64.trim().replace(/ /g, '+').replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+  const bin = atob(padded);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function buildShareableUrl(rubyCode) {
+  const url = new URL(window.location.href);
+  url.searchParams.set('code', encodeCodeBase64(rubyCode));
+  return url.toString();
+}
+
+function updateBrowserUrlWithCode(rubyCode) {
+  try {
+    if (typeof rubyCode === 'string' && rubyCode.length <= 16384) {
+      const url = new URL(window.location.href);
+      url.searchParams.set('code', encodeCodeBase64(rubyCode));
+      window.history.replaceState(null, '', url.toString());
+    }
+  } catch (_) {}
+}
+
+function clearBrowserUrlCodeParam() {
+  try {
+    const url = new URL(window.location.href);
+    if (url.searchParams.has('code') || url.searchParams.has('step')) {
+      url.searchParams.delete('code');
+      url.searchParams.delete('step');
+      window.history.replaceState(null, '', url.toString());
+    }
+  } catch (_) {}
 }
 
 function formatBytes(b) {
@@ -1662,6 +1711,23 @@ document.getElementById('btnOpenRb').addEventListener('click', () => {
   document.getElementById('rbFileInput').click();
 });
 
+document.getElementById('btnShareCode').addEventListener('click', async () => {
+  const editor = document.getElementById('rubyEditor');
+  const isEditing = editor.style.display !== 'none';
+  const rubyCode = isEditing ? editor.value : (currentTrace ? currentTrace.source : '');
+  const shareUrl = buildShareableUrl(rubyCode);
+  updateBrowserUrlWithCode(rubyCode);
+  const btn = document.getElementById('btnShareCode');
+  const orig = btn.textContent;
+  try {
+    await navigator.clipboard.writeText(shareUrl);
+    btn.textContent = '✓ Copied!';
+  } catch (_) {
+    btn.textContent = '✓ URL Set';
+  }
+  setTimeout(() => { btn.textContent = orig; }, 1400);
+});
+
 document.getElementById('btnOpenJsonl').addEventListener('click', () => {
   document.getElementById('fileInput').click();
 });
@@ -1760,6 +1826,7 @@ function attachTrackScrubber(trackEl) {
 attachTrackScrubber(document.getElementById('timelineTrack'));
 
 presetSelect.addEventListener('change', (e) => {
+  clearBrowserUrlCodeParam();
   loadTrace(PRESETS[parseInt(e.target.value, 10)]);
 });
 
@@ -1999,8 +2066,33 @@ document.getElementById('repoRootInput').addEventListener('keydown', (e) => {
   }
 });
 
-loadTrace(PRESETS[0]);
-initWasm();
+(async function initFromUrlOrPreset() {
+  loadTrace(PRESETS[0]);
+  const params = new URLSearchParams(window.location.search);
+  const codeParam = params.get('code');
+  const stepParam = params.get('step');
+  await initWasm();
+  if (codeParam !== null && codeParam !== '') {
+    try {
+      const decoded = decodeCodeBase64(codeParam);
+      document.getElementById('rubyEditor').value = decoded;
+      await parseWithWasm(decoded, 'Shared URL Snippet');
+      if (stepParam && currentTrace) {
+        if (stepParam === 'crash' && currentTrace._crashIdx >= 0) {
+          jumpToStep(currentTrace._crashIdx);
+        } else if (stepParam === 'underflow' && currentTrace._underflowIdx >= 0) {
+          jumpToStep(currentTrace._underflowIdx);
+        } else {
+          const n = parseInt(stepParam, 10);
+          if (!Number.isNaN(n)) jumpToStep(n);
+        }
+      }
+    } catch (err) {
+      document.getElementById('wasmStatus').innerHTML =
+        `<span style="color:var(--red)">Invalid ?code= Base64 parameter: ${escapeHtml(err.message)}</span>`;
+    }
+  }
+})();
 </script>
 </body>
 </html>
