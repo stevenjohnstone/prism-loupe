@@ -133,7 +133,11 @@ main(int argc, char **argv) {
 
     flush_trace_to_disk(0);
 
+#if PRISM_TRACE_HAS_BUFFER_NEW
     pm_buffer_cleanup(&s_trace_buf);
+#else
+    pm_buffer_free(&s_trace_buf);
+#endif
     free(owned_buf);
     return 0;
 }

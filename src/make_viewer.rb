@@ -1,7 +1,6 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-require "base64"
 require "fileutils"
 require "json"
 
@@ -3342,8 +3341,8 @@ presets.concat([
 ])
 
 wasm_path = File.join(BUILD_DIR, "prism_trace.wasm")
-wasm_b64 = File.exist?(wasm_path) ? Base64.strict_encode64(File.binread(wasm_path)) : ""
-ruby_svg_b64 = Base64.strict_encode64(File.binread(File.join(PRISM_DIR, "doc/images/ruby.svg")))
+wasm_b64 = File.exist?(wasm_path) ? [File.binread(wasm_path)].pack("m0") : ""
+ruby_svg_b64 = [File.binread(File.join(PRISM_DIR, "doc/images/ruby.svg"))].pack("m0")
 
 version_h_path = File.join(PRISM_DIR, "include/prism/version.h")
 prism_semver = if File.exist?(version_h_path)

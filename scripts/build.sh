@@ -27,6 +27,7 @@ elif [ "$PRISM_DIR" = "$ROOT_DIR/vendor/prism" ] && [ -d "$PRISM_DIR/.git" ]; th
     if [ -z "$TARGET_SHA" ] || [ -n "${FORCE_PRISM_CHECKOUT:-}" ]; then
       git -C "$PRISM_DIR" fetch origin
     fi
+    git -C "$PRISM_DIR" clean -fdx include src
     git -C "$PRISM_DIR" checkout "$PRISM_REF"
     (cd "$PRISM_DIR" && ruby templates/template.rb)
   fi
@@ -88,7 +89,7 @@ done
 # 5. Compile native trace CLI (used to generate built-in presets)
 echo "==> Compiling native prism_trace CLI..."
 ${CC:-cc} -O0 -g -std=c99 -D_POSIX_C_SOURCE=200809L \
-  -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
+  -I"$BUILD_DIR" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
   "$BUILD_DIR/trace_prism.c" \
   "$BUILD_DIR/trace_node.c" \
   "$ROOT_DIR/src/trace_runtime.c" \
@@ -102,7 +103,7 @@ if [ -n "${WASI_SDK_PATH:-}" ] && [ -x "${WASI_SDK_PATH}/bin/clang" ]; then
   "${WASI_SDK_PATH}/bin/clang" --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
     -DPRISM_EXPORT_SYMBOLS -DPRISM_EXCLUDE_PRETTYPRINT -DPRISM_EXCLUDE_JSON \
     -D_WASI_EMULATED_MMAN -lwasi-emulated-mman \
-    -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
+    -I"$BUILD_DIR" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
     -std=c99 \
     -Wl,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer \
     -Wl,-z,stack-size=8388608 \

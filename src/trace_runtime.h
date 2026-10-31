@@ -1,14 +1,7 @@
 #ifndef PRISM_TRACE_RUNTIME_H
 #define PRISM_TRACE_RUNTIME_H
 
-#include "prism/internal/parser.h"
-#include "prism/internal/arena.h"
-#include "prism/internal/node.h"
-#include "prism/internal/tokens.h"
-#include "prism/internal/diagnostic.h"
-#include "prism/internal/buffer.h"
-#include "prism/diagnostic.h"
-#include "prism/node.h"
+#include "trace_compat.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +53,14 @@ void prism_trace_emit_event(
     const char *detail_json,
     int include_ast
 );
+
+void prism_trace_emit_last_error(const pm_parser_t *parser, const char *func, int line);
+
+static inline bool
+prism_trace_emit_bool(bool result, const pm_parser_t *parser, const char *kind, const char *func, int line) {
+    prism_trace_emit_event(parser, kind, func, line, NULL, 0);
+    return result;
+}
 
 prism_trace_scope_t prism_trace_scope_enter(const char *func, int line);
 void prism_trace_scope_cleanup(prism_trace_scope_t *scope);

@@ -14,6 +14,40 @@ int g_trace_crashed = 0;
 static uint64_t g_last_ast_hash = 0;
 static prism_trace_crash_cb_t g_trace_crash_cb = NULL;
 
+#if !PRISM_TRACE_HAS_BUFFER_NEW
+#define pm_buffer_cleanup(buf_) pm_buffer_free(buf_)
+
+PRISM_EXPORTED_FUNCTION pm_buffer_t *
+pm_buffer_new(void) {
+    pm_buffer_t *buf = (pm_buffer_t *) calloc(1, sizeof(pm_buffer_t));
+    if (buf != NULL) {
+        pm_buffer_init(buf);
+    }
+    return buf;
+}
+#endif
+
+static inline uint32_t
+loc_start_offset(const pm_parser_t *parser, const pm_location_t *loc) {
+#if PRISM_TRACE_LOCATION_IS_OFFSET
+    (void) parser;
+    return loc->start;
+#else
+    if (parser == NULL || parser->start == NULL || loc->start == NULL) return 0;
+    return (uint32_t)(loc->start - parser->start);
+#endif
+}
+
+static inline uint32_t
+loc_length_bytes(const pm_location_t *loc) {
+#if PRISM_TRACE_LOCATION_IS_OFFSET
+    return loc->length;
+#else
+    if (loc->start == NULL || loc->end == NULL) return 0;
+    return (uint32_t)(loc->end - loc->start);
+#endif
+}
+
 void
 prism_trace_set_crash_cb(prism_trace_crash_cb_t cb) {
     g_trace_crash_cb = cb;
@@ -36,7 +70,25 @@ prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps) {
 static void
 buf_append_json_escaped(pm_buffer_t *buf, const uint8_t *str, size_t len) {
     pm_buffer_append_byte(buf, '"');
-    pm_buffer_append_source(buf, str, len, PM_BUFFER_ESCAPING_JSON);
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = str[i];
+        switch (c) {
+            case '"':  PM_BUFFER_APPEND_LITERAL(buf, "\\\""); break;
+            case '\\': PM_BUFFER_APPEND_LITERAL(buf, "\\\\"); break;
+            case '\b': PM_BUFFER_APPEND_LITERAL(buf, "\\b"); break;
+            case '\f': PM_BUFFER_APPEND_LITERAL(buf, "\\f"); break;
+            case '\n': PM_BUFFER_APPEND_LITERAL(buf, "\\n"); break;
+            case '\r': PM_BUFFER_APPEND_LITERAL(buf, "\\r"); break;
+            case '\t': PM_BUFFER_APPEND_LITERAL(buf, "\\t"); break;
+            default:
+                if (c < 0x20 || c >= 0x7f) {
+                    pm_buffer_append_format(buf, "\\u%04x", (unsigned)c);
+                } else {
+                    pm_buffer_append_byte(buf, c);
+                }
+                break;
+        }
+    }
     pm_buffer_append_byte(buf, '"');
 }
 
@@ -77,74 +129,12 @@ format_lex_state(pm_lex_state_t state, char *buf, size_t buf_size) {
 #undef ADD_STATE
 }
 
-static const char *
-context_name(pm_context_t ctx) {
-    switch (ctx) {
-        case PM_CONTEXT_NONE: return "NONE";
-        case PM_CONTEXT_BEGIN: return "BEGIN";
-        case PM_CONTEXT_BEGIN_ENSURE: return "BEGIN_ENSURE";
-        case PM_CONTEXT_BEGIN_ELSE: return "BEGIN_ELSE";
-        case PM_CONTEXT_BEGIN_RESCUE: return "BEGIN_RESCUE";
-        case PM_CONTEXT_BLOCK_BRACES: return "BLOCK_BRACES";
-        case PM_CONTEXT_BLOCK_KEYWORDS: return "BLOCK_KEYWORDS";
-        case PM_CONTEXT_BLOCK_ENSURE: return "BLOCK_ENSURE";
-        case PM_CONTEXT_BLOCK_ELSE: return "BLOCK_ELSE";
-        case PM_CONTEXT_BLOCK_PARAMETERS: return "BLOCK_PARAMETERS";
-        case PM_CONTEXT_BLOCK_RESCUE: return "BLOCK_RESCUE";
-        case PM_CONTEXT_CASE_WHEN: return "CASE_WHEN";
-        case PM_CONTEXT_CASE_IN: return "CASE_IN";
-        case PM_CONTEXT_CLASS: return "CLASS";
-        case PM_CONTEXT_CLASS_ENSURE: return "CLASS_ENSURE";
-        case PM_CONTEXT_CLASS_ELSE: return "CLASS_ELSE";
-        case PM_CONTEXT_CLASS_RESCUE: return "CLASS_RESCUE";
-        case PM_CONTEXT_DEF: return "DEF";
-        case PM_CONTEXT_DEF_ENSURE: return "DEF_ENSURE";
-        case PM_CONTEXT_DEF_ELSE: return "DEF_ELSE";
-        case PM_CONTEXT_DEF_RESCUE: return "DEF_RESCUE";
-        case PM_CONTEXT_DEF_PARAMS: return "DEF_PARAMS";
-        case PM_CONTEXT_DEFINED: return "DEFINED";
-        case PM_CONTEXT_DEFAULT_PARAMS: return "DEFAULT_PARAMS";
-        case PM_CONTEXT_ELSE: return "ELSE";
-        case PM_CONTEXT_ELSIF: return "ELSIF";
-        case PM_CONTEXT_EMBEXPR: return "EMBEXPR";
-        case PM_CONTEXT_FOR: return "FOR";
-        case PM_CONTEXT_FOR_INDEX: return "FOR_INDEX";
-        case PM_CONTEXT_IF: return "IF";
-        case PM_CONTEXT_LAMBDA_BRACES: return "LAMBDA_BRACES";
-        case PM_CONTEXT_LAMBDA_DO_END: return "LAMBDA_DO_END";
-        case PM_CONTEXT_LAMBDA_ENSURE: return "LAMBDA_ENSURE";
-        case PM_CONTEXT_LAMBDA_ELSE: return "LAMBDA_ELSE";
-        case PM_CONTEXT_LAMBDA_RESCUE: return "LAMBDA_RESCUE";
-        case PM_CONTEXT_LOOP_PREDICATE: return "LOOP_PREDICATE";
-        case PM_CONTEXT_MAIN: return "MAIN";
-        case PM_CONTEXT_MODULE: return "MODULE";
-        case PM_CONTEXT_MODULE_ENSURE: return "MODULE_ENSURE";
-        case PM_CONTEXT_MODULE_ELSE: return "MODULE_ELSE";
-        case PM_CONTEXT_MODULE_RESCUE: return "MODULE_RESCUE";
-        case PM_CONTEXT_MULTI_TARGET: return "MULTI_TARGET";
-        case PM_CONTEXT_PARENS: return "PARENS";
-        case PM_CONTEXT_POSTEXE: return "POSTEXE";
-        case PM_CONTEXT_PREDICATE: return "PREDICATE";
-        case PM_CONTEXT_PREEXE: return "PREEXE";
-        case PM_CONTEXT_RESCUE_MODIFIER: return "RESCUE_MODIFIER";
-        case PM_CONTEXT_SCLASS: return "SCLASS";
-        case PM_CONTEXT_SCLASS_ENSURE: return "SCLASS_ENSURE";
-        case PM_CONTEXT_SCLASS_ELSE: return "SCLASS_ELSE";
-        case PM_CONTEXT_SCLASS_RESCUE: return "SCLASS_RESCUE";
-        case PM_CONTEXT_TERNARY: return "TERNARY";
-        case PM_CONTEXT_UNLESS: return "UNLESS";
-        case PM_CONTEXT_UNTIL: return "UNTIL";
-        case PM_CONTEXT_WHILE: return "WHILE";
-        case PM_CONTEXT_MAXIMUM: return "MAX";
-    }
-    return "UNKNOWN";
-}
-
 typedef struct {
     uint32_t ids[256];
     size_t count;
 } direct_children_t;
 
+#if PRISM_TRACE_VISIT_RETURNS_ENUM
 static pm_visit_result_t
 collect_direct_child(const pm_node_t *child, void *data) {
     direct_children_t *dc = (direct_children_t *) data;
@@ -153,6 +143,16 @@ collect_direct_child(const pm_node_t *child, void *data) {
     }
     return PM_VISIT_SKIP;
 }
+#else
+static bool
+collect_direct_child(const pm_node_t *child, void *data) {
+    direct_children_t *dc = (direct_children_t *) data;
+    if (child != NULL && dc->count < 256) {
+        dc->ids[dc->count++] = child->node_id;
+    }
+    return false;
+}
+#endif
 
 static uint64_t
 compute_ast_hash(void) {
@@ -160,9 +160,11 @@ compute_ast_hash(void) {
     for (uint32_t i = 1; i <= g_trace_node_count; i++) {
         const pm_node_t *n = g_trace_nodes[i];
         if (n == NULL) continue;
+        uint32_t n_start = loc_start_offset(g_trace_parser, &n->location);
+        uint32_t n_len = loc_length_bytes(&n->location);
         h ^= (uint64_t)n->node_id; h *= 1099511628211ULL;
-        h ^= (uint64_t)n->location.start; h *= 1099511628211ULL;
-        h ^= (uint64_t)n->location.length; h *= 1099511628211ULL;
+        h ^= (uint64_t)n_start; h *= 1099511628211ULL;
+        h ^= (uint64_t)n_len; h *= 1099511628211ULL;
         direct_children_t dc = { .count = 0 };
         pm_visit_child_nodes(n, collect_direct_child, &dc);
         h ^= (uint64_t)dc.count; h *= 1099511628211ULL;
@@ -187,6 +189,7 @@ safe_token_type_name(pm_token_type_t t) {
     return pm_token_type(t);
 }
 
+#if PRISM_TRACE_HAS_ARENA
 static void
 measure_arena(const pm_arena_t *arena, size_t *out_used, size_t *out_cap, size_t *out_blocks) {
     size_t used = 0;
@@ -204,6 +207,28 @@ measure_arena(const pm_arena_t *arena, size_t *out_used, size_t *out_cap, size_t
     *out_used = used;
     *out_cap = cap;
     *out_blocks = blocks;
+}
+#endif
+
+void
+prism_trace_emit_last_error(const pm_parser_t *parser, const char *func, int line) {
+    if (parser == NULL) return;
+    const pm_diagnostic_t *diag = (const pm_diagnostic_t *) parser->error_list.tail;
+    char buf[512];
+    if (diag != NULL) {
+#if PRISM_TRACE_HAS_DIAG_TYPE_FN
+        const char *dtype = pm_diagnostic_type(diag);
+#else
+        const char *dtype = pm_diagnostic_id_human(diag->diag_id);
+#endif
+        uint32_t d_start = loc_start_offset(parser, &diag->location);
+        uint32_t d_len = loc_length_bytes(&diag->location);
+        snprintf(buf, sizeof(buf), "{\"diag_type\":\"%s\",\"start\":%" PRIu32 ",\"length\":%" PRIu32 "}",
+                 dtype ? dtype : "ERROR", d_start, d_len);
+        prism_trace_emit_event(parser, "ERROR", func, line, buf, 0);
+    } else {
+        prism_trace_emit_event(parser, "ERROR", func, line, NULL, 0);
+    }
 }
 
 void
@@ -301,7 +326,7 @@ prism_trace_emit_event(
     while (cn != NULL && guard++ < 64) {
         if (!first_cn) pm_buffer_append_byte(out, ',');
         first_cn = 0;
-        pm_buffer_append_format(out, "\"%s\"", context_name(cn->context));
+        pm_buffer_append_format(out, "\"%s\"", prism_trace_context_name(cn->context));
         cn = cn->prev;
     }
     pm_buffer_append_byte(out, ']');
@@ -316,12 +341,23 @@ prism_trace_emit_event(
 
     // Line offsets (up to 128)
     PM_BUFFER_APPEND_LITERAL(out, ",\"line_offsets\":[");
+#if PRISM_TRACE_HAS_LINE_OFFSETS
     size_t n_lines = parser->line_offsets.size;
+    size_t lo_cap = parser->line_offsets.capacity;
     if (n_lines > 128) n_lines = 128;
     for (size_t i = 0; i < n_lines; i++) {
         if (i > 0) pm_buffer_append_byte(out, ',');
         pm_buffer_append_format(out, "%" PRIu32, parser->line_offsets.offsets[i]);
     }
+#else
+    size_t n_lines = parser->newline_list.size;
+    size_t lo_cap = parser->newline_list.capacity;
+    if (n_lines > 128) n_lines = 128;
+    for (size_t i = 0; i < n_lines; i++) {
+        if (i > 0) pm_buffer_append_byte(out, ',');
+        pm_buffer_append_format(out, "%zu", parser->newline_list.offsets[i]);
+    }
+#endif
     pm_buffer_append_byte(out, ']');
 
     pm_buffer_append_format(out, ",\"errors\":%zu", parser->error_list.size);
@@ -329,9 +365,15 @@ prism_trace_emit_event(
     size_t ast_u = 0, ast_c = 0, ast_b = 0;
     size_t meta_u = 0, meta_c = 0, meta_b = 0;
     size_t scr_u = 0, scr_c = 0, scr_b = 0;
+#if PRISM_TRACE_HAS_ARENA
     measure_arena(parser->arena, &ast_u, &ast_c, &ast_b);
+#endif
+#if PRISM_TRACE_HAS_METADATA_ARENA
     measure_arena(&parser->metadata_arena, &meta_u, &meta_c, &meta_b);
+#endif
+#if PRISM_TRACE_HAS_SCRATCH_ARENA
     measure_arena(&parser->scratch_arena, &scr_u, &scr_c, &scr_b);
+#endif
 
     pm_buffer_append_format(
         out,
@@ -339,7 +381,11 @@ prism_trace_emit_event(
         ast_u, ast_c, ast_b,
         meta_u, meta_c, meta_b,
         scr_u, scr_c, scr_b,
-        parser->line_offsets.size, parser->line_offsets.capacity,
+#if PRISM_TRACE_HAS_LINE_OFFSETS
+        parser->line_offsets.size, lo_cap,
+#else
+        parser->newline_list.size, lo_cap,
+#endif
         parser->constant_pool.size, parser->constant_pool.capacity
     );
 
@@ -370,12 +416,14 @@ prism_trace_emit_event(
             direct_children_t dc = { .count = 0 };
             pm_visit_child_nodes(n, collect_direct_child, &dc);
 
-            uint32_t wrapped_end = n->location.start + n->location.length;
-            int underflow = ((uint64_t)n->location.start + (uint64_t)n->location.length > src_len) ? 1 : 0;
+            uint32_t n_start = loc_start_offset(parser, &n->location);
+            uint32_t n_len = loc_length_bytes(&n->location);
+            uint32_t wrapped_end = n_start + n_len;
+            int underflow = ((uint64_t)n_start + (uint64_t)n_len > src_len) ? 1 : 0;
 
             pm_buffer_append_format(out,
                     "{\"id\":%" PRIu32 ",\"type\":\"%s\",\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"len\":%" PRIu32 ",\"underflow\":%s,\"children\":[",
-                    n->node_id, tname, n->location.start, wrapped_end, n->location.length,
+                    n->node_id, tname, n_start, wrapped_end, n_len,
                     underflow ? "true" : "false");
             for (size_t j = 0; j < dc.count; j++) {
                 if (j > 0) pm_buffer_append_byte(out, ',');
@@ -485,9 +533,11 @@ prism_trace_node_new(const pm_node_t *node, const char *func, int line) {
         char detail[320];
         const char *tname = pm_node_type(node->type);
         if (strncmp(tname, "PM_", 3) == 0) tname += 3;
+        uint32_t n_start = loc_start_offset(g_trace_parser, &node->location);
+        uint32_t n_len = loc_length_bytes(&node->location);
         snprintf(detail, sizeof(detail),
                  "{\"node_id\":%" PRIu32 ",\"node_type\":\"%s\",\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"len\":%" PRIu32 "}",
-                 node->node_id, tname, node->location.start, node->location.start + node->location.length, node->location.length);
+                 node->node_id, tname, n_start, n_start + n_len, n_len);
         prism_trace_emit_event(g_trace_parser, "NODE_NEW", func, line, detail, 1);
     }
     return node;
@@ -519,6 +569,7 @@ prism_trace_run_to_buffer(
     buf_append_json_escaped(out_buf, source, size);
     pm_buffer_append_format(out_buf, ",\"length\":%zu}\n", size);
 
+#if PRISM_TRACE_HAS_ARENA
     pm_arena_t arena = { 0 };
     pm_parser_t parser;
     pm_parser_init(&arena, &parser, source, size, NULL);
@@ -532,4 +583,19 @@ prism_trace_run_to_buffer(
 
     pm_parser_cleanup(&parser);
     pm_arena_cleanup(&arena);
+#else
+    pm_parser_t parser;
+    pm_parser_init(&parser, source, size, NULL);
+    g_trace_parser = &parser;
+
+    pm_node_t *root = pm_parse(&parser);
+
+    g_trace_buf = NULL;
+    g_trace_parser = NULL;
+
+    if (root != NULL) {
+        pm_node_destroy(&parser, root);
+    }
+    pm_parser_free(&parser);
+#endif
 }
