@@ -110,6 +110,6 @@ PRISM_DIR=/path/to/local/prism make build
 
 ## Deploying to GitHub Pages
 
-This repository includes [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml), which automatically builds `dist/index.html` (with embedded WebAssembly and presets) and deploys it to GitHub Pages on every push to `main`.
+This repository includes [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml), which automatically builds `dist/index.html` (with embedded WebAssembly and presets) and deploys it to GitHub Pages on every push to `main` and once every evening (`0 22 * * *` UTC) to keep upstream `ruby/prism` `main` and release tags up to date.
 
 In your GitHub repository settings (**Settings → Pages**), set **Build and deployment → Source** to **GitHub Actions**.
