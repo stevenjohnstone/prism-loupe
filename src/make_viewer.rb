@@ -359,7 +359,7 @@ HTML_TEMPLATE = <<~'HTML'
     font-weight: 600;
     display: none;
   }
-  .crash-banner {
+  .crash-banner, .underflow-banner {
     background: rgba(248, 81, 73, 0.22);
     border: 1px solid var(--red);
     color: #ffa198;
@@ -506,6 +506,7 @@ HTML_TEMPLATE = <<~'HTML'
   <button id="btnNextAlloc" class="primary" title="Jump to next memory allocation (Key: M)">Alloc &rarr;</button>
   <button id="btnPrevRewind" class="primary" title="Jump to previous cursor rewind (Shift + R)">&larr; Rewind</button>
   <button id="btnNextRewind" class="primary" title="Jump to next cursor rewind (Key: R)">Rewind &rarr;</button>
+  <button id="btnJumpUnderflow" class="warn" style="display:none;" title="Jump to corrupted node underflow detection step (Key: U)">⚠ Underflow</button>
   <button id="btnJumpCrash" class="warn" style="display:none;" title="Jump to intercepted crash step (Key: C)">💥 Crash</button>
   <span id="stepCounter" style="margin-left:auto; font-family:var(--font-mono); font-size:12px; color:var(--muted); white-space:nowrap;">Step 0 / 0</span>
   <button id="btnToggleGemini" style="display:none; border-color:var(--purple); color:var(--purple); font-weight:600;" title="Open in-page Gemini assistant drawer">✨ Ask Gemini</button>
@@ -528,7 +529,7 @@ HTML_TEMPLATE = <<~'HTML'
 </div>
 
 <div class="scrubber-bar">
-  <div class="timeline-track" id="timelineTrack" title="Drag or click to scrub — Red = Crash | Pink = Syntax Error | Amber = Cursor Rewind | Blue = AST Update | Green = Token">
+  <div class="timeline-track" id="timelineTrack" title="Drag or click to scrub — Red = Crash / Corrupted Node (Underflow) | Pink = Syntax Error | Amber = Cursor Rewind | Blue = AST Update | Green = Token">
     <div class="timeline-playhead" id="timelinePlayhead"></div>
   </div>
 </div>
@@ -541,6 +542,7 @@ HTML_TEMPLATE = <<~'HTML'
     </div>
     <div class="pane-body">
       <div id="crashBanner" class="crash-banner"></div>
+      <div id="underflowBanner" class="underflow-banner"></div>
       <div id="rewindBanner" class="rewind-banner"></div>
       <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:6px;">
         <div style="display:flex; align-items:center; justify-content:space-between; gap:5px;">
@@ -843,17 +845,22 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse') {
   }
 
   const dt = (performance.now() - t0).toFixed(1);
-  const hasCrash = steps.some(s => s.kind === 'CRASH');
+  loadTrace({ name: label, source: meta.source, steps }, false);
+
+  const hasCrash = currentTrace._crashIdx >= 0;
+  const hasUnderflow = currentTrace._underflowIdx >= 0;
 
   if (hasCrash) {
     document.getElementById('wasmStatus').innerHTML =
       `<span style="color:var(--red);font-weight:700;">💥 Crash captured at step ${steps.length - 1} (${dt} ms) — Wasm reset</span>`;
+  } else if (hasUnderflow) {
+    const uStep = currentTrace.steps[currentTrace._underflowIdx];
+    document.getElementById('wasmStatus').innerHTML =
+      `<span style="color:var(--red);font-weight:700;">⚠ Corrupted node (underflow) at step ${uStep.step} (${dt} ms)</span>`;
   } else {
     document.getElementById('wasmStatus').innerHTML =
       `<span style="color:var(--green)">● Traced ${steps.length} steps in ${dt} ms</span>`;
   }
-
-  loadTrace({ name: label, source: meta.source, steps }, false);
 }
 
 function formatBytes(b) {
@@ -867,17 +874,51 @@ function preprocessTrace(trace) {
   let lastChangedNodeId = -1;
   let prevCurrStart = 0;
   let prevAstU = 0, prevMetaU = 0, prevScratchU = 0, prevTotalU = 0;
+  const prevUnderflowById = new Map();
   trace._crashIdx = -1;
+  trace._underflowIdx = -1;
+  trace._underflowSteps = [];
+  trace._underflowEvents = [];
+  trace._underflowFirstStepByNode = {};
   trace._peakMemUsed = 0;
   trace.steps.forEach((s, i) => {
+    const newUnderflows = [];
     if (s.ast) {
       lastAst = s.ast;
+      s.ast.forEach(n => {
+        const isU = Boolean(n.underflow || n.end < n.start);
+        const wasU = prevUnderflowById.get(n.id) || false;
+        if (isU && !wasU) {
+          newUnderflows.push(n);
+          if (trace._underflowFirstStepByNode[n.id] === undefined) {
+            trace._underflowFirstStepByNode[n.id] = i;
+          }
+          trace._underflowEvents.push({
+            stepIdx: i,
+            step: s.step,
+            node: n,
+            func: s.func,
+            line: s.line,
+            file: stepSourceFile(s),
+            callStack: s.call_stack || []
+          });
+        }
+        prevUnderflowById.set(n.id, isU);
+      });
     }
     if (s.detail && s.detail.node_id) {
       lastChangedNodeId = s.detail.node_id;
+    } else if (newUnderflows.length > 0) {
+      lastChangedNodeId = newUnderflows[0].id;
     }
     s._astSnapshot = lastAst;
     s._lastChangedNodeId = lastChangedNodeId;
+    s._newUnderflows = newUnderflows;
+    s._hasNewUnderflow = newUnderflows.length > 0;
+    if (s._hasNewUnderflow) {
+      if (trace._underflowIdx < 0) trace._underflowIdx = i;
+      trace._underflowSteps.push(i);
+    }
     s._isRewind = (i > 0 && s.curr[0] >= 0 && prevCurrStart >= 0 && s.curr[0] < prevCurrStart);
     s._rewindDelta = s._isRewind ? (s.curr[0] - prevCurrStart) : 0;
     if (s.curr[0] >= 0) prevCurrStart = s.curr[0];
@@ -960,6 +1001,11 @@ function renderTimeline() {
       width = '6px';
       zIndex = 2;
       shadow = '0 0 6px var(--red)';
+    } else if (s._hasNewUnderflow) {
+      color = 'var(--red)';
+      width = '5px';
+      zIndex = 2;
+      shadow = '0 0 5px var(--red)';
     } else if (s.kind === 'ERROR') {
       color = 'var(--pink)';
       width = '3px';
@@ -1122,6 +1168,9 @@ function updateNavButtons() {
   document.getElementById('btnNextAlloc').disabled = !hasStepInDir(1, s => s._memDelta > 0);
   document.getElementById('btnPrevRewind').disabled = !hasStepInDir(-1, s => s._isRewind);
   document.getElementById('btnNextRewind').disabled = !hasStepInDir(1, s => s._isRewind);
+  const btnUnderflow = document.getElementById('btnJumpUnderflow');
+  const uSteps = currentTrace._underflowSteps || [];
+  btnUnderflow.disabled = !(uSteps.length > 0 && (uSteps.length > 1 || currentIdx !== uSteps[0]));
   const btnCrash = document.getElementById('btnJumpCrash');
   btnCrash.disabled = !(currentTrace._crashIdx >= 0 && currentIdx !== currentTrace._crashIdx);
 }
@@ -1166,6 +1215,54 @@ function renderStep() {
   } else {
     cb.style.display = 'none';
     btnCrash.style.display = 'none';
+  }
+
+  const ub = document.getElementById('underflowBanner');
+  const btnUnderflow = document.getElementById('btnJumpUnderflow');
+  const uEvents = currentTrace._underflowEvents || [];
+  const uSteps = currentTrace._underflowSteps || [];
+  if (uEvents.length > 0) {
+    ub.style.display = 'block';
+    btnUnderflow.style.display = 'inline-block';
+    btnUnderflow.disabled = (uSteps.length === 1 && currentIdx === uSteps[0]);
+    const atUnderflowStep = uSteps.includes(currentIdx);
+    const nextUStepIdx = uSteps.find(idx => idx > currentIdx) ?? uSteps[0];
+    const nextUStep = currentTrace.steps[nextUStepIdx];
+    let headerActionHtml = '';
+    if (!atUnderflowStep) {
+      headerActionHtml = `<button class="warn" style="margin-left:8px;padding:2px 7px;" onclick="jumpToStep(${nextUStepIdx})">Jump to Detection Step #${nextUStep.step}</button>`;
+    } else if (uSteps.length > 1) {
+      headerActionHtml = `
+        <span style="display:inline-flex;align-items:center;gap:6px;margin-left:8px;">
+          <span class="badge kind-CRASH">AT DETECTION STEP #${step.step}</span>
+          <button class="warn" style="padding:2px 7px;" onclick="jumpToStep(${nextUStepIdx})">Next Underflow (#${nextUStep.step}) &rarr;</button>
+        </span>
+      `;
+    } else {
+      headerActionHtml = `<span class="badge kind-CRASH" style="margin-left:8px;">AT DETECTION STEP</span>`;
+    }
+    const itemsHtml = uEvents.map(ev => {
+      const caller = ev.callStack.length > 0 ? ev.callStack[ev.callStack.length - 1] : null;
+      const callerStr = (caller && caller !== ev.func) ? ` via <code>${escapeHtml(caller)}()</code>` : '';
+      const stepBtn = (uEvents.length > 1 && currentIdx !== ev.stepIdx)
+        ? ` <button class="warn" style="padding:1px 6px;font-size:11px;margin-left:4px;" onclick="jumpToStep(${ev.stepIdx})">Step #${ev.step}</button>`
+        : '';
+      return `
+        <div style="margin-top:4px;color:var(--text);">
+          Node <code>#${ev.node.id} ${escapeHtml(ev.node.type)}</code> underflowed (<code>start=${ev.node.start}, end=${ev.node.end}, len=${ev.node.len}</code>) in <code>${escapeHtml(ev.func)}()</code>${callerStr} at <code>${escapeHtml(ev.file)}:${ev.line}</code>${stepBtn}
+        </div>
+      `;
+    }).join('');
+    ub.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <strong>⚠ CORRUPTED AST NODE DETECTED (${uEvents.length === 1 ? 'LOCATION UNDERFLOW' : uEvents.length + ' LOCATION UNDERFLOWS'})</strong>
+        ${headerActionHtml}
+      </div>
+      ${itemsHtml}
+    `;
+  } else {
+    ub.style.display = 'none';
+    btnUnderflow.style.display = 'none';
   }
 
   const rb = document.getElementById('rewindBanner');
@@ -1322,6 +1419,9 @@ function buildGeminiContextMarkdown(step) {
     `- line_offsets (${step.line_offsets.length}): [${step.line_offsets.join(', ')}]`,
     `- Arena Memory Used/Cap: AST=${step.mem ? step.mem.ast[0] : 0}/${step.mem ? step.mem.ast[1] : 0}B, Meta=${step.mem ? step.mem.meta[0] : 0}/${step.mem ? step.mem.meta[1] : 0}B, Scratch=${step.mem ? step.mem.scratch[0] : 0}/${step.mem ? step.mem.scratch[1] : 0}B`,
     `- Allocated AST Nodes: ${nodes.length} (${underflows.length} underflowed locations)`,
+    (currentTrace._underflowEvents && currentTrace._underflowEvents.length > 0)
+      ? `- DETECTED CORRUPTED/UNDERFLOW NODES: ` + currentTrace._underflowEvents.map(ev => `#${ev.node.id} ${ev.node.type} [start=${ev.node.start}, end=${ev.node.end}, len=${ev.node.len}] detected at Step ${ev.step} in ${ev.func}() (${ev.file}:${ev.line})`).join('; ')
+      : '',
     crashStep ? `- INTERCEPTED CRASH at Step ${crashStep.step}: ${JSON.stringify(crashStep.detail)}` : '',
     `\n## Surrounding Trace Steps (${startWin}..${endWin}):\n` + nearby.join('\n')
   ].filter(Boolean).join('\n');
@@ -1424,6 +1524,9 @@ function renderAstForest(step) {
     wrapper.className = 'ast-node';
 
     const isUnderflow = n.underflow || n.end < n.start;
+    const detectIdx = isUnderflow && currentTrace._underflowFirstStepByNode
+      ? currentTrace._underflowFirstStepByNode[n.id]
+      : undefined;
     const row = document.createElement('div');
     row.className = 'ast-row' +
       (n.id === changedNodeId ? ' just-changed' : '') +
@@ -1431,12 +1534,23 @@ function renderAstForest(step) {
     const slice = isUnderflow
       ? `⚠ UNDERFLOW len=${n.len} (end=${n.end} < start=${n.start})`
       : JSON.stringify(currentTrace.source.slice(n.start, Math.min(n.end, n.start + 24)));
+    const jumpPill = (typeof detectIdx === 'number' && detectIdx !== currentIdx)
+      ? `<span class="copy-pill ast-jump-underflow" style="border-color:var(--red);color:#ffa198;" title="Jump to step #${currentTrace.steps[detectIdx].step} where this corrupted node was detected">↳ Jump to Step #${currentTrace.steps[detectIdx].step}</span>`
+      : '';
     row.innerHTML = `
       <span class="ast-id">#${n.id}</span>
       <span>${n.type}</span>
       <span class="ast-loc">[${n.start}..${n.end}]</span>
       <span class="ast-slice" style="${isUnderflow ? 'color:var(--red);font-weight:700;' : ''}">${escapeHtml(slice)}</span>
+      ${jumpPill}
     `;
+    const jumpEl = row.querySelector('.ast-jump-underflow');
+    if (jumpEl && typeof detectIdx === 'number') {
+      jumpEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        jumpToStep(detectIdx);
+      });
+    }
     row.addEventListener('mouseenter', () => {
       hoverRange = isUnderflow ? [n.end, n.start] : [n.start, n.end];
       renderSource(currentTrace.steps[currentIdx]);
@@ -1568,6 +1682,13 @@ document.getElementById('btnPrevAlloc').addEventListener('click', () => stepToAl
 document.getElementById('btnNextAlloc').addEventListener('click', () => stepToAlloc(1));
 document.getElementById('btnPrevRewind').addEventListener('click', () => stepToRewind(-1));
 document.getElementById('btnNextRewind').addEventListener('click', () => stepToRewind(1));
+document.getElementById('btnJumpUnderflow').addEventListener('click', () => {
+  if (currentTrace && currentTrace._underflowSteps && currentTrace._underflowSteps.length > 0) {
+    const uSteps = currentTrace._underflowSteps;
+    const nextIdx = uSteps.find(idx => idx > currentIdx) ?? uSteps[0];
+    jumpToStep(nextIdx);
+  }
+});
 document.getElementById('btnJumpCrash').addEventListener('click', () => {
   if (currentTrace && currentTrace._crashIdx >= 0) {
     jumpToStep(currentTrace._crashIdx);
@@ -1638,6 +1759,18 @@ window.addEventListener('keydown', (e) => {
   else if (e.key === 'm' || e.key === 'M') { e.preventDefault(); stepToAlloc(1); }
   else if ((e.key === 'r' || e.key === 'R') && e.shiftKey) { e.preventDefault(); stepToRewind(-1); }
   else if (e.key === 'r' || e.key === 'R') { e.preventDefault(); stepToRewind(1); }
+  else if (e.key === 'u' || e.key === 'U') {
+    e.preventDefault();
+    if (currentTrace && currentTrace._underflowSteps && currentTrace._underflowSteps.length > 0) {
+      const uSteps = currentTrace._underflowSteps;
+      if (e.shiftKey && uSteps.length > 1) {
+        const prevs = uSteps.filter(idx => idx < currentIdx);
+        jumpToStep(prevs.length ? prevs[prevs.length - 1] : uSteps[uSteps.length - 1]);
+      } else {
+        document.getElementById('btnJumpUnderflow').click();
+      }
+    }
+  }
   else if (e.key === 'c' || e.key === 'C') { e.preventDefault(); document.getElementById('btnJumpCrash').click(); }
 });
 

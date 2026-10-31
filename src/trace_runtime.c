@@ -347,6 +347,12 @@ prism_trace_emit_event(
         pm_buffer_append_format(out, ",\"detail\":%s", detail_json);
     }
 
+    if (!include_ast && g_trace_node_count > 0) {
+        if (compute_ast_hash() != g_last_ast_hash) {
+            include_ast = 1;
+        }
+    }
+
     if (include_ast) {
         g_last_ast_hash = compute_ast_hash();
         uint64_t src_len = (parser->end >= parser->start) ? (uint64_t)(parser->end - parser->start) : 0;
