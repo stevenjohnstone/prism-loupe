@@ -2177,9 +2177,164 @@ function createSourceVideoRenderer(trace) {
   return { canvas, renderFrame };
 }
 
+function ebmlVintSize(len) {
+  if (len < 0x7F) {
+    return new Uint8Array([0x80 | len]);
+  }
+  if (len < 0x3FFF) {
+    return new Uint8Array([0x40 | ((len >> 8) & 0x3F), len & 0xFF]);
+  }
+  if (len < 0x1FFFFF) {
+    return new Uint8Array([0x20 | ((len >> 16) & 0x1F), (len >> 8) & 0xFF, len & 0xFF]);
+  }
+  if (len < 0x0FFFFFFF) {
+    return new Uint8Array([
+      0x10 | ((len >>> 24) & 0x0F),
+      (len >>> 16) & 0xFF,
+      (len >>> 8) & 0xFF,
+      len & 0xFF
+    ]);
+  }
+  const out = new Uint8Array(8);
+  out[0] = 0x01;
+  let rem = len;
+  for (let i = 7; i >= 1; i--) {
+    out[i] = rem & 0xFF;
+    rem = Math.floor(rem / 256);
+  }
+  return out;
+}
+
+function ebmlElement(idBytes, payload) {
+  const parts = Array.isArray(payload) ? payload : [payload];
+  let totalPayload = 0;
+  for (const p of parts) totalPayload += p.byteLength;
+  const sizeBytes = ebmlVintSize(totalPayload);
+  const out = new Uint8Array(idBytes.length + sizeBytes.length + totalPayload);
+  out.set(idBytes, 0);
+  out.set(sizeBytes, idBytes.length);
+  let offset = idBytes.length + sizeBytes.length;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.byteLength;
+  }
+  return out;
+}
+
+function ebmlUint(idBytes, val) {
+  let n = Math.max(0, Math.floor(val));
+  const bytes = [];
+  do {
+    bytes.unshift(n & 0xFF);
+    n = Math.floor(n / 256);
+  } while (n > 0);
+  return ebmlElement(idBytes, new Uint8Array(bytes));
+}
+
+function ebmlFloat64(idBytes, val) {
+  const buf = new ArrayBuffer(8);
+  new DataView(buf).setFloat64(0, val, false);
+  return ebmlElement(idBytes, new Uint8Array(buf));
+}
+
+function ebmlAscii(idBytes, str) {
+  const bytes = new TextEncoder().encode(str);
+  return ebmlElement(idBytes, bytes);
+}
+
+function muxWebmVideo(encodedChunks, width, height, codecId, totalDurationMs) {
+  const ebmlHeader = ebmlElement([0x1A, 0x45, 0xDF, 0xA3], [
+    ebmlUint([0x42, 0x86], 1),
+    ebmlUint([0x42, 0xF7], 1),
+    ebmlUint([0x42, 0xF2], 4),
+    ebmlUint([0x42, 0xF3], 8),
+    ebmlAscii([0x42, 0x82], 'webm'),
+    ebmlUint([0x42, 0x87], 4),
+    ebmlUint([0x42, 0x85], 2)
+  ]);
+
+  const segmentInfo = ebmlElement([0x15, 0x49, 0xA9, 0x66], [
+    ebmlUint([0x2A, 0xD7, 0xB1], 1000000),
+    ebmlFloat64([0x44, 0x89], Math.max(1, totalDurationMs)),
+    ebmlAscii([0x4D, 0x80], 'PrismPlayground'),
+    ebmlAscii([0x57, 0x41], 'PrismPlayground')
+  ]);
+
+  const videoTrack = ebmlElement([0xE0], [
+    ebmlUint([0xB0], width),
+    ebmlUint([0xBA], height)
+  ]);
+
+  const trackEntry = ebmlElement([0xAE], [
+    ebmlUint([0xD7], 1),
+    ebmlUint([0x73, 0xC5], 1),
+    ebmlUint([0x9C], 0),
+    ebmlAscii([0x22, 0xB5, 0x9C], 'und'),
+    ebmlAscii([0x86], codecId),
+    ebmlUint([0x83], 1),
+    videoTrack
+  ]);
+
+  const tracks = ebmlElement([0x16, 0x54, 0xAE, 0x6B], [trackEntry]);
+
+  const clusters = [];
+  let currentClusterBlocks = [];
+  let clusterStartMs = 0;
+
+  const flushCluster = () => {
+    if (currentClusterBlocks.length === 0) return;
+    clusters.push(ebmlElement([0x1F, 0x43, 0xB6, 0x75], [
+      ebmlUint([0xE7], clusterStartMs),
+      ...currentClusterBlocks
+    ]));
+    currentClusterBlocks = [];
+  };
+
+  for (let i = 0; i < encodedChunks.length; i++) {
+    const ch = encodedChunks[i];
+    const rel = Math.round(ch.timestampMs - clusterStartMs);
+    if (i === 0 || (ch.isKey && rel >= 2000) || rel >= 25000 || rel < 0) {
+      flushCluster();
+      clusterStartMs = Math.max(0, Math.round(ch.timestampMs));
+    }
+    const relTime = Math.max(-32768, Math.min(32767, Math.round(ch.timestampMs - clusterStartMs)));
+    const blockHeader = new Uint8Array(4);
+    blockHeader[0] = 0x81; // Track 1 VINT
+    blockHeader[1] = (relTime >> 8) & 0xFF;
+    blockHeader[2] = relTime & 0xFF;
+    blockHeader[3] = ch.isKey ? 0x80 : 0x00;
+    currentClusterBlocks.push(ebmlElement([0xA3], [blockHeader, ch.data]));
+  }
+  flushCluster();
+
+  const segment = ebmlElement([0x18, 0x53, 0x80, 0x67], [
+    segmentInfo,
+    tracks,
+    ...clusters
+  ]);
+
+  return new Blob([ebmlHeader, segment], { type: 'video/webm' });
+}
+
+function downloadVideoBlob(blob, traceName, ext) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const safeName = (traceName || 'prism-trace')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'prism-trace';
+  a.href = url;
+  a.download = `${safeName}.${ext}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
 function stopVideoRecording() {
   if (!activeVideoRecording) return;
   const rec = activeVideoRecording;
+  rec.cancelled = true;
   activeVideoRecording = null;
   if (rec.timer) {
     clearTimeout(rec.timer);
@@ -2196,6 +2351,132 @@ function stopVideoRecording() {
   }
 }
 
+async function generateVideoInstantWebCodecs(trace) {
+  const { canvas, renderFrame } = createSourceVideoRenderer(trace);
+  const candidates = [
+    { codec: 'vp09.00.10.08', codecId: 'V_VP9' },
+    { codec: 'vp8', codecId: 'V_VP8' }
+  ];
+  let chosen = null;
+  for (const c of candidates) {
+    try {
+      const sup = await VideoEncoder.isConfigSupported({
+        codec: c.codec,
+        width: canvas.width,
+        height: canvas.height,
+        bitrate: 4000000
+      });
+      if (sup && sup.supported) {
+        chosen = c;
+        break;
+      }
+    } catch (_) {}
+  }
+  if (!chosen) return false;
+
+  const btn = document.getElementById('btnRecordVideo');
+  const state = { cancelled: false, timer: null, recorder: null };
+  activeVideoRecording = state;
+
+  const encodedChunks = [];
+  let encoderError = null;
+  const encoder = new VideoEncoder({
+    output: (chunk) => {
+      const buf = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(buf);
+      encodedChunks.push({
+        data: buf,
+        timestampMs: chunk.timestamp / 1000,
+        isKey: chunk.type === 'key'
+      });
+    },
+    error: (err) => {
+      encoderError = err;
+    }
+  });
+
+  encoder.configure({
+    codec: chosen.codec,
+    width: canvas.width,
+    height: canvas.height,
+    bitrate: 4000000
+  });
+
+  const totalSteps = trace.steps.length;
+  const intervalMs = Math.max(16, Math.min(2000, getPlayIntervalMs()));
+  const intervalUs = intervalMs * 1000;
+
+  if (btn) {
+    btn.style.borderColor = 'var(--accent)';
+    btn.style.color = 'var(--accent)';
+  }
+
+  for (let i = 0; i < totalSteps; i++) {
+    if (state.cancelled || encoderError) break;
+    renderFrame(i);
+    const vf = new VideoFrame(canvas, {
+      timestamp: i * intervalUs,
+      duration: intervalUs
+    });
+    encoder.encode(vf, { keyFrame: (i % 30 === 0) });
+    vf.close();
+
+    if (i % 20 === 0 || i === totalSteps - 1 || encoder.encodeQueueSize > 10) {
+      if (btn) {
+        const pct = Math.round(((i + 1) / totalSteps) * 100);
+        btn.textContent = `⚡ ${pct}% (${i + 1}/${totalSteps})`;
+      }
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+
+  if (!state.cancelled && !encoderError && totalSteps > 0) {
+    // Hold the final frame for 600ms so video players display the end state cleanly
+    renderFrame(totalSteps - 1);
+    const holdUs = 600 * 1000;
+    const endVf = new VideoFrame(canvas, {
+      timestamp: totalSteps * intervalUs,
+      duration: holdUs
+    });
+    encoder.encode(endVf, { keyFrame: true });
+    endVf.close();
+    await encoder.flush();
+  }
+
+  try { encoder.close(); } catch (_) {}
+
+  if (activeVideoRecording === state) {
+    activeVideoRecording = null;
+  }
+
+  if (state.cancelled || encoderError || encodedChunks.length === 0) {
+    if (btn) {
+      btn.textContent = '🎬 Video';
+      btn.style.borderColor = '';
+      btn.style.color = '';
+    }
+    return !encoderError;
+  }
+
+  const totalDurationMs = totalSteps * intervalMs + 600;
+  const blob = muxWebmVideo(encodedChunks, canvas.width, canvas.height, chosen.codecId, totalDurationMs);
+  downloadVideoBlob(blob, trace.name, 'webm');
+
+  if (btn) {
+    btn.textContent = '✓ Video Saved!';
+    btn.style.borderColor = 'var(--green)';
+    btn.style.color = 'var(--green)';
+    setTimeout(() => {
+      if (!activeVideoRecording) {
+        btn.textContent = '🎬 Video';
+        btn.style.borderColor = '';
+        btn.style.color = '';
+      }
+    }, 1500);
+  }
+  return true;
+}
+
 async function toggleVideoRecording() {
   if (activeVideoRecording) {
     stopVideoRecording();
@@ -2203,16 +2484,26 @@ async function toggleVideoRecording() {
   }
   if (!currentTrace || !currentTrace.steps || currentTrace.steps.length === 0) return;
 
-  const format = pickSupportedVideoMime();
-  if (!format) {
-    alert('MediaRecorder is not supported in this browser.');
-    return;
-  }
-
   stopPlayback();
   setEditMode(false);
 
   const trace = currentTrace;
+
+  if (typeof VideoEncoder !== 'undefined' && typeof VideoFrame !== 'undefined') {
+    try {
+      const ok = await generateVideoInstantWebCodecs(trace);
+      if (ok) return;
+    } catch (err) {
+      console.warn('WebCodecs instant export failed, falling back to MediaRecorder:', err);
+    }
+  }
+
+  const format = pickSupportedVideoMime();
+  if (!format) {
+    alert('Neither WebCodecs nor MediaRecorder is supported in this browser.');
+    return;
+  }
+
   const totalSteps = trace.steps.length;
   const { canvas, renderFrame } = createSourceVideoRenderer(trace);
 
@@ -2242,18 +2533,7 @@ async function toggleVideoRecording() {
     stream.getTracks().forEach(t => t.stop());
     if (chunks.length === 0) return;
     const blob = new Blob(chunks, { type: format.mime || 'video/webm' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    const safeName = (trace.name || 'prism-trace')
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '') || 'prism-trace';
-    a.href = url;
-    a.download = `${safeName}.${format.ext}`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    downloadVideoBlob(blob, trace.name, format.ext);
   };
 
   const btn = document.getElementById('btnRecordVideo');
@@ -2270,7 +2550,7 @@ async function toggleVideoRecording() {
   requestCanvasFrame();
   recorder.start(100);
 
-  const state = { recorder, timer: null };
+  const state = { cancelled: false, recorder, timer: null };
   activeVideoRecording = state;
   updateButtonProgress(0);
 
