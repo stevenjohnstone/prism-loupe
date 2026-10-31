@@ -113,6 +113,34 @@ HTML_TEMPLATE = <<~'HTML'
     fill: currentColor;
     display: block;
   }
+  .playground-source-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 26px;
+    padding: 0 8px;
+    border-radius: 5px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-decoration: none;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .playground-source-link:hover {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  .playground-source-link svg {
+    width: 14px;
+    height: 14px;
+    fill: currentColor;
+    display: block;
+    flex-shrink: 0;
+  }
   select, button, input[type="file"]::file-selector-button {
     background: var(--panel-alt);
     color: var(--text);
@@ -157,8 +185,14 @@ HTML_TEMPLATE = <<~'HTML'
     padding: 8px 14px;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 8px;
     user-select: none;
+  }
+  .scrubber-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
   }
   .timeline-track {
     position: relative;
@@ -530,28 +564,21 @@ HTML_TEMPLATE = <<~'HTML'
 
 <header>
   <img src="data:image/svg+xml;base64,__RUBY_SVG_BASE64__" alt="Ruby" title="Ruby Prism Playground" class="header-logo">
+  <span style="font-weight:600; font-size:13.5px; color:var(--text); white-space:nowrap;">Ruby Prism Playground</span>
   <div class="version-selector-group">
     <select id="prismVersionSelect" title="Select Prism parser version (re-traces current Ruby snippet in-place)"></select>
     <a id="prismVersionCommitLink" class="github-commit-btn" href="__PRISM_COMMIT_URL__" target="_blank" rel="noopener" aria-label="View Prism commit on GitHub" title="__PRISM_VERSION_TITLE__">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
     </a>
   </div>
-  <button id="btnPlayPause" class="success" style="min-width:68px;" title="Play / Pause automatic playthrough (Spacebar)">&#9654; Play</button>
-  <button id="btnPrev" class="primary" title="Step backward 1 trace event (Left Arrow)">&larr; Step</button>
-  <button id="btnNext" class="primary" title="Step forward 1 trace event (Right Arrow)">Step &rarr;</button>
-  <button id="btnPrevTok" class="primary" title="Jump to previous lexed token (Shift + Left Arrow)">&larr; Token</button>
-  <button id="btnNextTok" class="primary" title="Jump to next lexed token (Shift + Right Arrow)">Token &rarr;</button>
-  <button id="btnPrevAst" class="primary" title="Jump to previous AST node creation/attachment (Shift + N)">&larr; AST</button>
-  <button id="btnNextAst" class="primary" title="Jump to next AST node creation/attachment (Key: N)">AST &rarr;</button>
-  <button id="btnPrevAlloc" class="primary" title="Jump to previous memory allocation (Shift + M)">&larr; Alloc</button>
-  <button id="btnNextAlloc" class="primary" title="Jump to next memory allocation (Key: M)">Alloc &rarr;</button>
-  <button id="btnPrevRewind" class="primary" title="Jump to previous cursor rewind (Shift + R)">&larr; Rewind</button>
-  <button id="btnNextRewind" class="primary" title="Jump to next cursor rewind (Key: R)">Rewind &rarr;</button>
-  <button id="btnJumpUnderflow" class="warn" style="display:none;" title="Jump to corrupted node underflow detection step (Key: U)">⚠ Underflow</button>
-  <button id="btnJumpCrash" class="warn" style="display:none;" title="Jump to intercepted crash step (Key: C)">💥 Crash</button>
-  <span id="stepCounter" style="margin-left:auto; font-family:var(--font-mono); font-size:12px; color:var(--muted); white-space:nowrap;">Step 0 / 0</span>
-  <button id="btnToggleGemini" style="display:none; border-color:var(--purple); color:var(--purple); font-weight:600;" title="Open in-page Gemini assistant drawer">✨ Ask Gemini</button>
-  <button id="btnSettings" title="Settings (Playback speed &amp; local Prism repository path)">&#9881;</button>
+  <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
+    <button id="btnToggleGemini" style="display:none; border-color:var(--purple); color:var(--purple); font-weight:600;" title="Open in-page Gemini assistant drawer">✨ Ask Gemini</button>
+    <a id="playgroundSourceLink" class="playground-source-link" href="__PLAYGROUND_COMMIT_URL__" target="_blank" rel="noopener" title="__PLAYGROUND_TITLE__">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
+      <span>__PLAYGROUND_REPO_SLUG__@<strong style="color:var(--text);font-weight:600;">__PLAYGROUND_SHORT_SHA__</strong></span>
+    </a>
+    <button id="btnSettings" title="Settings (Playback speed &amp; local Prism repository path)">&#9881;</button>
+  </div>
 </header>
 
 <div id="settingsPopover" class="settings-popover">
@@ -582,11 +609,31 @@ HTML_TEMPLATE = <<~'HTML'
     <button id="btnSaveRepoRoot" class="success">Save</button>
     <button id="btnClearRepoRoot">Clear</button>
   </div>
+  <div style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border); font-size:11px; color:var(--muted); display:flex; justify-content:space-between; align-items:center; gap:8px;">
+    <span>Source: <a href="__PLAYGROUND_REPO_URL__" target="_blank" rel="noopener" style="color:var(--accent); text-decoration:none; font-family:var(--font-mono);">__PLAYGROUND_REPO_NAME__ &nearr;</a></span>
+    <span>Build: <a href="__PLAYGROUND_COMMIT_URL__" target="_blank" rel="noopener" style="color:var(--accent); text-decoration:none; font-family:var(--font-mono);">__PLAYGROUND_SHORT_SHA__</a> (__PLAYGROUND_DATE__)</span>
+  </div>
 </div>
 
 <div class="scrubber-bar">
   <div class="timeline-track" id="timelineTrack" title="Drag or click to scrub — Red = Crash / Corrupted Node (Underflow) | Pink = Syntax Error | Amber = Cursor Rewind | Blue = AST Update | Green = Token">
     <div class="timeline-playhead" id="timelinePlayhead"></div>
+  </div>
+  <div class="scrubber-controls">
+    <button id="btnPlayPause" class="success" style="min-width:68px;" title="Play / Pause automatic playthrough (Spacebar)">&#9654; Play</button>
+    <button id="btnPrev" class="primary" title="Step backward 1 trace event (Left Arrow)">&larr; Step</button>
+    <button id="btnNext" class="primary" title="Step forward 1 trace event (Right Arrow)">Step &rarr;</button>
+    <button id="btnPrevTok" class="primary" title="Jump to previous lexed token (Shift + Left Arrow)">&larr; Token</button>
+    <button id="btnNextTok" class="primary" title="Jump to next lexed token (Shift + Right Arrow)">Token &rarr;</button>
+    <button id="btnPrevAst" class="primary" title="Jump to previous AST node creation/attachment (Shift + N)">&larr; AST</button>
+    <button id="btnNextAst" class="primary" title="Jump to next AST node creation/attachment (Key: N)">AST &rarr;</button>
+    <button id="btnPrevAlloc" class="primary" title="Jump to previous memory allocation (Shift + M)">&larr; Alloc</button>
+    <button id="btnNextAlloc" class="primary" title="Jump to next memory allocation (Key: M)">Alloc &rarr;</button>
+    <button id="btnPrevRewind" class="primary" title="Jump to previous cursor rewind (Shift + R)">&larr; Rewind</button>
+    <button id="btnNextRewind" class="primary" title="Jump to next cursor rewind (Key: R)">Rewind &rarr;</button>
+    <button id="btnJumpUnderflow" class="warn" style="display:none;" title="Jump to corrupted node underflow detection step (Key: U)">⚠ Underflow</button>
+    <button id="btnJumpCrash" class="warn" style="display:none;" title="Jump to intercepted crash step (Key: C)">💥 Crash</button>
+    <span id="stepCounter" style="margin-left:auto; font-family:var(--font-mono); font-size:12px; color:var(--muted); white-space:nowrap;">Step 0 / 0</span>
   </div>
 </div>
 
@@ -3518,12 +3565,36 @@ end
 
 primary_info = prism_versions.first
 
+playground_root = File.expand_path("..", __dir__)
+playground_sha = IO.popen(["git", "-C", playground_root, "rev-parse", "HEAD"], err: File::NULL, &:read).strip
+playground_short_sha = IO.popen(["git", "-C", playground_root, "rev-parse", "--short=7", "HEAD"], err: File::NULL, &:read).strip
+playground_date = IO.popen(["git", "-C", playground_root, "show", "-s", "--format=%cs", "HEAD"], err: File::NULL, &:read).strip
+playground_remote = IO.popen(["git", "-C", playground_root, "config", "--get", "remote.origin.url"], err: File::NULL, &:read).strip
+playground_repo_name = if playground_remote =~ %r{github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?$}
+  Regexp.last_match(1)
+else
+  "stevenjohnstone/prism-playground"
+end
+playground_repo_slug = playground_repo_name.split("/").last || "prism-playground"
+playground_repo_url = "https://github.com/#{playground_repo_name}"
+playground_short_sha = "local" if playground_short_sha.empty?
+playground_date = Time.now.strftime("%Y-%m-%d") if playground_date.empty?
+playground_commit_url = playground_sha.empty? ? playground_repo_url : "#{playground_repo_url}/commit/#{playground_sha}"
+playground_title = "#{playground_repo_name} built from commit #{playground_short_sha} (#{playground_date}) — click to view project source on GitHub"
+
 html = HTML_TEMPLATE
   .sub("__RUBY_SVG_BASE64__") { ruby_svg_b64 }
   .sub("__PRISM_VERSION__") { primary_info["version"] }
   .sub("__PRISM_SHORT_SHA__") { primary_info["short_sha"] }
   .sub("__PRISM_COMMIT_URL__") { primary_info["url"] }
   .sub("__PRISM_VERSION_TITLE__") { prism_version_title }
+  .gsub("__PLAYGROUND_REPO_NAME__") { playground_repo_name }
+  .gsub("__PLAYGROUND_REPO_SLUG__") { playground_repo_slug }
+  .gsub("__PLAYGROUND_REPO_URL__") { playground_repo_url }
+  .gsub("__PLAYGROUND_SHORT_SHA__") { playground_short_sha }
+  .gsub("__PLAYGROUND_DATE__") { playground_date }
+  .gsub("__PLAYGROUND_COMMIT_URL__") { playground_commit_url }
+  .gsub("__PLAYGROUND_TITLE__") { playground_title }
   .sub("__PRISM_BUILD_INFO_JSON__") { JSON.generate(primary_info) }
   .sub("__PRISM_VERSIONS_JSON__") { JSON.generate(prism_versions) }
   .sub("__PRESETS_JSON__") { JSON.generate(presets) }
