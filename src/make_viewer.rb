@@ -12,7 +12,8 @@ def load_jsonl(path, name)
   end
   meta = lines.first
   steps = lines.drop(1)
-  { "name" => name, "source" => meta["source"], "steps" => steps }
+  leak_summary = steps.pop if steps.last && steps.last["summary"]
+  { "name" => name, "source" => meta["source"], "steps" => steps, "leak_summary" => leak_summary }
 end
 
 PRISM_DIR = ARGV[0] || "vendor/prism"
@@ -324,6 +325,7 @@ HTML_TEMPLATE = <<~'HTML'
   .kind-PARSE_ENTER, .kind-PARSE_EXIT { background: rgba(139, 148, 158, 0.15); color: var(--muted); border: 1px solid var(--border); }
   .kind-NODE_NEW, .kind-NODE_LIST_APPEND { background: rgba(88, 166, 255, 0.2); color: var(--accent); border: 1px solid var(--accent); }
   .kind-ERROR { background: rgba(247, 120, 186, 0.22); color: var(--pink); border: 1px solid var(--pink); }
+  .kind-TEARDOWN { background: rgba(57, 197, 207, 0.2); color: var(--cyan); border: 1px solid var(--cyan); }
   .kind-CRASH { background: var(--red); color: #fff; border: 1px solid #ff7b72; font-weight: 700; }
   .card {
     background: var(--panel);
@@ -1024,6 +1026,10 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
 
   const meta = lines[0] || { source: rubyCode };
   const steps = lines.slice(1);
+  let leakSummary = null;
+  if (steps.length > 0 && steps[steps.length - 1] && steps[steps.length - 1].summary) {
+    leakSummary = steps.pop();
+  }
   const lastStep = steps[steps.length - 1];
 
   if (trappedError && (!lastStep || lastStep.kind !== 'CRASH')) {
@@ -1056,7 +1062,7 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
   }
 
   const dt = (performance.now() - t0).toFixed(1);
-  loadTrace({ name: label, source: meta.source, steps }, false);
+  loadTrace({ name: label, source: meta.source, steps, leak_summary: leakSummary }, false);
   if (updateUrlCode) {
     updateBrowserUrlWithCode(rubyCode);
   } else {
@@ -1160,10 +1166,13 @@ function formatBytes(b) {
 }
 
 function preprocessTrace(trace) {
+  if (trace.steps && trace.steps.length > 0 && trace.steps[trace.steps.length - 1] && trace.steps[trace.steps.length - 1].summary) {
+    trace.leak_summary = trace.steps.pop();
+  }
   let lastAst = [];
   let lastChangedNodeId = -1;
   let prevCurrStart = 0;
-  let prevAstU = 0, prevMetaU = 0, prevScratchU = 0, prevTotalU = 0;
+  let prevAstU = 0, prevMetaU = 0, prevScratchU = 0, prevTotalU = 0, prevXallocU = 0;
   const prevUnderflowById = new Map();
   trace._crashIdx = -1;
   trace._underflowIdx = -1;
@@ -1171,6 +1180,7 @@ function preprocessTrace(trace) {
   trace._underflowEvents = [];
   trace._underflowFirstStepByNode = {};
   trace._peakMemUsed = 0;
+  trace._peakXallocUsed = (trace.leak_summary && trace.leak_summary.peak_bytes) ? trace.leak_summary.peak_bytes : 0;
   trace._hasArena = false;
   trace.steps.forEach((s, i) => {
     const newUnderflows = [];
@@ -1215,26 +1225,34 @@ function preprocessTrace(trace) {
     if (s.curr[0] >= 0) prevCurrStart = s.curr[0];
     if (s.kind === 'CRASH') trace._crashIdx = i;
 
-    const m = s.mem || { ast: [0, 0, 0], meta: [0, 0, 0], scratch: [0, 0, 0], lo: [0, 0], cp: [0, 0] };
+    const m = s.mem || { ast: [0, 0, 0], meta: [0, 0, 0], scratch: [0, 0, 0], lo: [0, 0], cp: [0, 0], xalloc: [0, 0, 0, 0] };
     const astU = m.ast[0] || 0;
     const metaU = m.meta[0] || 0;
     const scratchU = m.scratch[0] || 0;
     const totalU = astU + metaU + scratchU;
     const totalCap = (m.ast[1] || 0) + (m.meta[1] || 0) + (m.scratch[1] || 0);
+    const xallocArr = m.xalloc || [0, 0, 0, 0];
+    const xLive = xallocArr[0] || 0;
+    const xPeak = xallocArr[1] || 0;
 
     s._astDelta = i > 0 ? Math.max(0, astU - prevAstU) : 0;
     s._metaDelta = i > 0 ? Math.max(0, metaU - prevMetaU) : 0;
     s._scratchDelta = i > 0 ? Math.max(0, scratchU - prevScratchU) : 0;
-    s._memDelta = i > 0 ? Math.max(0, totalU - prevTotalU) : 0;
+    s._xallocDelta = i > 0 ? (xLive - prevXallocU) : xLive;
+    const arenaDelta = i > 0 ? Math.max(0, totalU - prevTotalU) : 0;
+    s._memDelta = totalCap > 0 ? arenaDelta : Math.max(0, s._xallocDelta);
     s._memTotalUsed = totalU;
     s._memTotalCap = totalCap;
     if (totalCap > 0) trace._hasArena = true;
     if (totalU > trace._peakMemUsed) trace._peakMemUsed = totalU;
+    if (xPeak > trace._peakXallocUsed) trace._peakXallocUsed = xPeak;
+    if (xLive > trace._peakXallocUsed) trace._peakXallocUsed = xLive;
 
     prevAstU = astU;
     prevMetaU = metaU;
     prevScratchU = scratchU;
     prevTotalU = totalU;
+    prevXallocU = xLive;
   });
 }
 
@@ -1741,28 +1759,59 @@ function traceHasArena() {
 
 function renderMemoryTelemetry(step) {
   const hasArena = traceHasArena();
-  const m = step.mem || { ast: [0, 0, 0], meta: [0, 0, 0], scratch: [0, 0, 0], lo: [0, 0], cp: [0, 0] };
+  const m = step.mem || { ast: [0, 0, 0], meta: [0, 0, 0], scratch: [0, 0, 0], lo: [0, 0], cp: [0, 0], xalloc: [0, 0, 0, 0] };
   const badge = document.getElementById('memCardBadge');
   const paneTitle = document.getElementById('astPaneTitle');
   const cardTitle = document.getElementById('memCardTitle');
-  const prevAllocBtn = document.getElementById('btnPrevAlloc');
-  const nextAllocBtn = document.getElementById('btnNextAlloc');
   if (paneTitle) {
     paneTitle.textContent = hasArena ? 'Live Arenas, Memory & AST Assembly' : 'Live Memory & AST Assembly';
   }
   if (cardTitle) {
-    cardTitle.textContent = hasArena ? 'Arena Memory Telemetry (Used / Capacity)' : 'Parser Table Telemetry';
+    cardTitle.textContent = hasArena ? 'Arena & Heap Memory Telemetry' : 'Heap Memory Telemetry (PRISM_XALLOCATOR)';
   }
-  if (prevAllocBtn) prevAllocBtn.style.display = hasArena ? '' : 'none';
-  if (nextAllocBtn) nextAllocBtn.style.display = hasArena ? '' : 'none';
 
   const [loSize, loCap] = m.lo || [0, 0];
   const [cpSize, cpCap] = m.cp || [0, 0];
+  const [xLive, xPeakStep, xAllocs, xFrees] = m.xalloc || [0, 0, 0, 0];
+  const xPeak = Math.max(xPeakStep || 0, (currentTrace && currentTrace._peakXallocUsed) || 0, xLive || 0);
+  const xPct = xPeak > 0 ? Math.min(100, (xLive / xPeak) * 100).toFixed(1) : 0;
+  const xDelta = step._xallocDelta || 0;
+  const xDeltaPill = xDelta > 0
+    ? `<span class="mem-delta-pill">+${formatBytes(xDelta)}</span>`
+    : (xDelta < 0 ? `<span class="mem-delta-pill" style="background:rgba(88,166,255,0.18);color:var(--accent);">-${formatBytes(Math.abs(xDelta))}</span>` : '');
+
+  const leak = currentTrace && currentTrace.leak_summary;
+  let leakBadgeHtml = '';
+  if (leak) {
+    if (leak.leaked_bytes > 0) {
+      leakBadgeHtml = `<span style="color:var(--red);font-weight:700;" title="${leak.leaked_blocks} unfreed block(s) remaining after parser teardown">⚠ Leak: ${formatBytes(leak.leaked_bytes)} (${leak.leaked_blocks} blk)</span>`;
+    } else if (step.kind === 'TEARDOWN') {
+      leakBadgeHtml = `<span style="color:var(--green);font-weight:600;" title="All ${leak.alloc_count} xmalloc/xcalloc/xrealloc allocations (${formatBytes(leak.total_bytes)}) freed cleanly on teardown">✓ 0 B leaked (${leak.alloc_count}/${leak.free_count} freed)</span>`;
+    } else {
+      leakBadgeHtml = `<span style="color:var(--green);font-weight:600;" title="Step to TEARDOWN (final step) to see all ${leak.alloc_count} allocations freed">✓ 0 B leaked on teardown</span>`;
+    }
+  }
+
+  const xallocRowHtml = `
+    <div class="mem-row">
+      <div class="mem-row-header">
+        <span><span class="swatch" style="background:var(--green);margin-right:5px;"></span>Heap (<code>xmalloc</code> / <code>xfree</code>)${xDeltaPill}</span>
+        <span style="color:var(--muted)">
+          <strong style="color:var(--text)">${formatBytes(xLive)}</strong> / peak ${formatBytes(xPeak)}
+          (${xAllocs} alloc / ${xFrees} free)
+        </span>
+      </div>
+      <div class="mem-bar-bg">
+        <div class="mem-bar-fill" style="width:${xPct}%;background:var(--green);"></div>
+      </div>
+    </div>
+  `;
 
   if (!hasArena) {
-    badge.innerHTML = `<span style="color:var(--muted)">malloc/free (pre-arena)</span>`;
+    badge.innerHTML = leakBadgeHtml || `<span style="color:var(--muted)">peak: ${formatBytes(xPeak)}</span>`;
     document.getElementById('memBreakdownBox').innerHTML = `
-      <div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:11px;color:var(--muted);">
+      ${xallocRowHtml}
+      <div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:11px;color:var(--muted);padding-top:4px;border-top:1px solid var(--border);">
         <span><code>line_offsets</code>: <strong style="color:var(--text)">${loSize}</strong>/${loCap} (${loSize * 4} B)</span>
         <span><code>constant_pool</code>: <strong style="color:var(--text)">${cpSize}</strong>/${cpCap}</span>
       </div>
@@ -1772,7 +1821,7 @@ function renderMemoryTelemetry(step) {
 
   badge.innerHTML = step._memDelta > 0
     ? `<span class="mem-delta-pill">+${formatBytes(step._memDelta)} this step</span>`
-    : `<span style="color:var(--muted)">peak: ${formatBytes(currentTrace._peakMemUsed || 0)}</span>`;
+    : (leakBadgeHtml || `<span style="color:var(--muted)">peak: ${formatBytes(currentTrace._peakMemUsed || 0)}</span>`);
 
   const makeArenaRow = (label, arr, delta, color) => {
     const [used, cap, blocks] = arr;
@@ -1798,10 +1847,11 @@ function renderMemoryTelemetry(step) {
     ${makeArenaRow('AST Arena (<code>parser-&gt;arena</code>)', m.ast, step._astDelta, 'var(--accent)')}
     ${makeArenaRow('Metadata Arena (<code>metadata_arena</code>)', m.meta, step._metaDelta, 'var(--purple)')}
     ${makeArenaRow('Scratch Arena (<code>scratch_arena</code>)', m.scratch, step._scratchDelta, 'var(--cyan)')}
+    ${xallocRowHtml}
     <div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:11px;color:var(--muted);padding-top:4px;border-top:1px solid var(--border);">
       <span><code>line_offsets</code>: <strong style="color:var(--text)">${loSize}</strong>/${loCap} (${loSize * 4} B)</span>
       <span><code>constant_pool</code>: <strong style="color:var(--text)">${cpSize}</strong>/${cpCap}</span>
-      <span>Total: <strong style="color:var(--text)">${formatBytes(step._memTotalUsed)}</strong>/${formatBytes(step._memTotalCap)}</span>
+      <span>Arena: <strong style="color:var(--text)">${formatBytes(step._memTotalUsed)}</strong>/${formatBytes(step._memTotalCap)}</span>
     </div>
   `;
 }
@@ -1822,6 +1872,19 @@ function renderAstForest(step) {
   const underflowCount = nodes.filter(n => n.underflow || n.end < n.start).length;
 
   if (nodes.length === 0) {
+    if (step.kind === 'TEARDOWN') {
+      const d = step.detail || (currentTrace && currentTrace.leak_summary) || {};
+      const leaked = d.leaked_bytes || 0;
+      const blocks = d.leaked_blocks || 0;
+      const allocs = d.alloc_count || 0;
+      const frees = d.free_count || 0;
+      document.getElementById('astSummary').innerHTML = '0 nodes (torn down)';
+      treeBox.innerHTML = leaked > 0
+        ? `<span style="color:var(--red);font-weight:700;">⚠ Parser &amp; AST torn down with memory leak: ${formatBytes(leaked)} unfreed across ${blocks} block(s) (${allocs} alloc / ${frees} free)</span>`
+        : `<span style="color:var(--green);font-weight:600;">✓ Parser &amp; AST torn down cleanly — 0 B leaked (${allocs}/${frees} allocations freed)</span>`;
+      orphansBox.innerHTML = '<span style="color:var(--muted)">(arena freed)</span>';
+      return;
+    }
     document.getElementById('astSummary').innerHTML = '0 allocated node(s)';
     treeBox.innerHTML = '<span style="color:var(--muted)">(no AST nodes allocated yet)</span>';
     orphansBox.innerHTML = '<span style="color:var(--muted)">—</span>';

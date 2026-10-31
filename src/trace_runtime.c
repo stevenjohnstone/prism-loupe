@@ -14,6 +14,101 @@ int g_trace_crashed = 0;
 static uint64_t g_last_ast_hash = 0;
 static prism_trace_crash_cb_t g_trace_crash_cb = NULL;
 
+static int g_trace_xalloc_tracking = 0;
+static size_t g_trace_xalloc_live_bytes = 0;
+static size_t g_trace_xalloc_peak_bytes = 0;
+static size_t g_trace_xalloc_total_bytes = 0;
+static size_t g_trace_xalloc_alloc_count = 0;
+static size_t g_trace_xalloc_free_count = 0;
+static size_t g_trace_xalloc_live_blocks = 0;
+
+typedef struct {
+    size_t size;
+    size_t tracked;
+} prism_trace_alloc_hdr_t;
+
+static void *
+alloc_with_tracking(size_t s, size_t tracked) {
+    prism_trace_alloc_hdr_t *hdr = (prism_trace_alloc_hdr_t *) malloc(sizeof(prism_trace_alloc_hdr_t) + (s > 0 ? s : 1));
+    if (hdr == NULL) return NULL;
+    hdr->size = s;
+    hdr->tracked = tracked;
+    if (tracked) {
+        g_trace_xalloc_live_bytes += s;
+        g_trace_xalloc_total_bytes += s;
+        g_trace_xalloc_alloc_count++;
+        g_trace_xalloc_live_blocks++;
+        if (g_trace_xalloc_live_bytes > g_trace_xalloc_peak_bytes) {
+            g_trace_xalloc_peak_bytes = g_trace_xalloc_live_bytes;
+        }
+    }
+    return (void *)(hdr + 1);
+}
+
+__attribute__((noinline)) void *
+prism_trace_xmalloc(size_t s) {
+    size_t tracked = (g_trace_xalloc_tracking && !g_trace_in_hook) ? 1 : 0;
+    return alloc_with_tracking(s, tracked);
+}
+
+__attribute__((noinline)) void
+prism_trace_xfree(void *ptr) {
+    if (ptr == NULL) return;
+    if (g_trace_parser != NULL) {
+        for (uint32_t i = 1; i <= g_trace_node_count; i++) {
+            if (g_trace_nodes[i] == (const pm_node_t *) ptr) {
+                g_trace_nodes[i] = NULL;
+                break;
+            }
+        }
+    }
+    prism_trace_alloc_hdr_t *hdr = ((prism_trace_alloc_hdr_t *) ptr) - 1;
+    if (hdr->tracked) {
+        if (g_trace_xalloc_live_bytes >= hdr->size) {
+            g_trace_xalloc_live_bytes -= hdr->size;
+        } else {
+            g_trace_xalloc_live_bytes = 0;
+        }
+        if (g_trace_xalloc_live_blocks > 0) {
+            g_trace_xalloc_live_blocks--;
+        }
+        g_trace_xalloc_free_count++;
+    }
+    free(hdr);
+}
+
+__attribute__((noinline)) void *
+prism_trace_xcalloc(size_t n, size_t s) {
+    size_t total = n * s;
+    void *ptr = prism_trace_xmalloc(total);
+    if (ptr != NULL && total > 0) {
+        memset(ptr, 0, total);
+    }
+    return ptr;
+}
+
+__attribute__((noinline)) void *
+prism_trace_xrealloc(void *ptr, size_t s) {
+    if (ptr == NULL) {
+        return prism_trace_xmalloc(s);
+    }
+    if (s == 0) {
+        prism_trace_xfree(ptr);
+        return NULL;
+    }
+    prism_trace_alloc_hdr_t *old_hdr = ((prism_trace_alloc_hdr_t *) ptr) - 1;
+    size_t old_size = old_hdr->size;
+    size_t tracked = old_hdr->tracked;
+    void *new_ptr = alloc_with_tracking(s, tracked);
+    if (new_ptr == NULL) return NULL;
+    size_t copy_size = old_size < s ? old_size : s;
+    if (copy_size > 0) {
+        memcpy(new_ptr, ptr, copy_size);
+    }
+    prism_trace_xfree(ptr);
+    return new_ptr;
+}
+
 #if !PRISM_TRACE_HAS_BUFFER_NEW
 #define pm_buffer_cleanup(buf_) pm_buffer_free(buf_)
 
@@ -65,6 +160,13 @@ prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps) {
     g_trace_in_hook = 0;
     g_trace_crashed = 0;
     g_last_ast_hash = 0;
+    g_trace_xalloc_tracking = 0;
+    g_trace_xalloc_live_bytes = 0;
+    g_trace_xalloc_peak_bytes = 0;
+    g_trace_xalloc_total_bytes = 0;
+    g_trace_xalloc_alloc_count = 0;
+    g_trace_xalloc_free_count = 0;
+    g_trace_xalloc_live_blocks = 0;
 }
 
 static void
@@ -377,7 +479,7 @@ prism_trace_emit_event(
 
     pm_buffer_append_format(
         out,
-        ",\"mem\":{\"ast\":[%zu,%zu,%zu],\"meta\":[%zu,%zu,%zu],\"scratch\":[%zu,%zu,%zu],\"lo\":[%zu,%zu],\"cp\":[%" PRIu32 ",%" PRIu32 "]}",
+        ",\"mem\":{\"ast\":[%zu,%zu,%zu],\"meta\":[%zu,%zu,%zu],\"scratch\":[%zu,%zu,%zu],\"lo\":[%zu,%zu],\"cp\":[%" PRIu32 ",%" PRIu32 "],\"xalloc\":[%zu,%zu,%zu,%zu]}",
         ast_u, ast_c, ast_b,
         meta_u, meta_c, meta_b,
         scr_u, scr_c, scr_b,
@@ -386,7 +488,9 @@ prism_trace_emit_event(
 #else
         parser->newline_list.size, lo_cap,
 #endif
-        parser->constant_pool.size, parser->constant_pool.capacity
+        parser->constant_pool.size, parser->constant_pool.capacity,
+        g_trace_xalloc_live_bytes, g_trace_xalloc_peak_bytes,
+        g_trace_xalloc_alloc_count, g_trace_xalloc_free_count
     );
 
     if (detail_json != NULL) {
@@ -569,6 +673,12 @@ prism_trace_run_to_buffer(
     buf_append_json_escaped(out_buf, source, size);
     pm_buffer_append_format(out_buf, ",\"length\":%zu}\n", size);
 
+    g_trace_xalloc_tracking = 1;
+
+    uint32_t saved_line_offsets[128];
+    size_t saved_n_lines = 0;
+    size_t saved_errors = 0;
+
 #if PRISM_TRACE_HAS_ARENA
     pm_arena_t arena = { 0 };
     pm_parser_t parser;
@@ -577,6 +687,12 @@ prism_trace_run_to_buffer(
 
     pm_node_t *root = pm_parse(&parser);
     (void) root;
+
+    saved_errors = parser.error_list.size;
+    saved_n_lines = parser.line_offsets.size > 128 ? 128 : parser.line_offsets.size;
+    for (size_t i = 0; i < saved_n_lines; i++) {
+        saved_line_offsets[i] = parser.line_offsets.offsets[i];
+    }
 
     g_trace_buf = NULL;
     g_trace_parser = NULL;
@@ -590,6 +706,19 @@ prism_trace_run_to_buffer(
 
     pm_node_t *root = pm_parse(&parser);
 
+    saved_errors = parser.error_list.size;
+#if PRISM_TRACE_HAS_LINE_OFFSETS
+    saved_n_lines = parser.line_offsets.size > 128 ? 128 : parser.line_offsets.size;
+    for (size_t i = 0; i < saved_n_lines; i++) {
+        saved_line_offsets[i] = parser.line_offsets.offsets[i];
+    }
+#else
+    saved_n_lines = parser.newline_list.size > 128 ? 128 : parser.newline_list.size;
+    for (size_t i = 0; i < saved_n_lines; i++) {
+        saved_line_offsets[i] = (uint32_t) parser.newline_list.offsets[i];
+    }
+#endif
+
     g_trace_buf = NULL;
     g_trace_parser = NULL;
 
@@ -598,4 +727,52 @@ prism_trace_run_to_buffer(
     }
     pm_parser_free(&parser);
 #endif
+
+    g_trace_xalloc_tracking = 0;
+
+    if (!g_trace_crashed && g_trace_step < g_trace_max_steps) {
+        pm_buffer_append_format(
+            out_buf,
+            "{\"step\":%" PRIu64 ",\"kind\":\"TEARDOWN\",\"func\":\"%s\",\"line\":0,"
+            "\"prev\":[%zu,%zu,\"PM_TOKEN_EOF\"],\"curr\":[%zu,%zu,\"PM_TOKEN_EOF\"],"
+            "\"next_start\":-1,\"heredoc_end\":-1,\"lex_state\":\"NONE\","
+            "\"lex_modes\":[],\"contexts\":[],\"call_stack\":[],\"line_offsets\":[",
+            g_trace_step++,
+#if PRISM_TRACE_HAS_ARENA
+            "pm_parser_cleanup + pm_arena_cleanup",
+#else
+            "pm_node_destroy + pm_parser_free",
+#endif
+            size, size, size, size
+        );
+        for (size_t i = 0; i < saved_n_lines; i++) {
+            if (i > 0) pm_buffer_append_byte(out_buf, ',');
+            pm_buffer_append_format(out_buf, "%" PRIu32, saved_line_offsets[i]);
+        }
+        pm_buffer_append_format(
+            out_buf,
+            "],\"errors\":%zu,"
+            "\"mem\":{\"ast\":[0,0,0],\"meta\":[0,0,0],\"scratch\":[0,0,0],\"lo\":[0,0],\"cp\":[0,0],"
+            "\"xalloc\":[%zu,%zu,%zu,%zu]},"
+            "\"detail\":{\"leaked_bytes\":%zu,\"leaked_blocks\":%zu,\"peak_bytes\":%zu,\"total_bytes\":%zu,\"alloc_count\":%zu,\"free_count\":%zu},"
+            "\"ast\":[]}\n",
+            saved_errors,
+            g_trace_xalloc_live_bytes, g_trace_xalloc_peak_bytes,
+            g_trace_xalloc_alloc_count, g_trace_xalloc_free_count,
+            g_trace_xalloc_live_bytes, g_trace_xalloc_live_blocks,
+            g_trace_xalloc_peak_bytes, g_trace_xalloc_total_bytes,
+            g_trace_xalloc_alloc_count, g_trace_xalloc_free_count
+        );
+    }
+
+    pm_buffer_append_format(
+        out_buf,
+        "{\"summary\":true,\"leaked_bytes\":%zu,\"leaked_blocks\":%zu,\"peak_bytes\":%zu,\"total_bytes\":%zu,\"alloc_count\":%zu,\"free_count\":%zu}\n",
+        g_trace_xalloc_live_bytes,
+        g_trace_xalloc_live_blocks,
+        g_trace_xalloc_peak_bytes,
+        g_trace_xalloc_total_bytes,
+        g_trace_xalloc_alloc_count,
+        g_trace_xalloc_free_count
+    );
 }

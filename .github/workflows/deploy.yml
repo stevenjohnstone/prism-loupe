@@ -40,9 +40,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: build/wasm_cache
-          key: prism-wasm-cache-${{ hashFiles('src/instrument.rb', 'src/trace_runtime.c', 'src/trace_runtime.h', 'src/trace_main.c') }}-${{ github.run_id }}
+          key: prism-wasm-cache-${{ hashFiles('src/instrument.rb', 'src/trace_runtime.c', 'src/trace_runtime.h', 'src/trace_main.c', 'src/prism_xallocator.h') }}-${{ github.run_id }}
           restore-keys: |
-            prism-wasm-cache-${{ hashFiles('src/instrument.rb', 'src/trace_runtime.c', 'src/trace_runtime.h', 'src/trace_main.c') }}-
+            prism-wasm-cache-${{ hashFiles('src/instrument.rb', 'src/trace_runtime.c', 'src/trace_runtime.h', 'src/trace_main.c', 'src/prism_xallocator.h') }}-
 
       - name: Build Prism Playground (Presets + WebAssembly + HTML)
         run: ./scripts/build.sh

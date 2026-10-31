@@ -95,7 +95,7 @@ echo "==> Prism version(s) to build: ${REFS_TO_BUILD[*]}"
 rm -rf "$BUILD_DIR/versions"
 mkdir -p "$BUILD_DIR/versions" "$BUILD_DIR/wasm_cache"
 
-INSTRUMENT_HASH="$(shasum -a 256 "$ROOT_DIR/src/instrument.rb" "$ROOT_DIR/src/trace_runtime.c" "$ROOT_DIR/src/trace_runtime.h" | shasum -a 256 | awk '{print $1}' | cut -c1-16)"
+INSTRUMENT_HASH="$(shasum -a 256 "$ROOT_DIR/src/instrument.rb" "$ROOT_DIR/src/trace_runtime.c" "$ROOT_DIR/src/trace_runtime.h" "$ROOT_DIR/src/prism_xallocator.h" | shasum -a 256 | awk '{print $1}' | cut -c1-16)"
 
 build_prism_version() {
   local idx="$1"
@@ -166,7 +166,7 @@ build_prism_version() {
       cp "$ver_dir/trace_node.c" "$BUILD_DIR/trace_node.c"
       cp "$ver_dir/trace_compat.h" "$BUILD_DIR/trace_compat.h"
       echo "==> Compiling native prism_trace CLI ($ref)..."
-      ${CC:-cc} -O0 -g -std=c99 -D_POSIX_C_SOURCE=200809L \
+      ${CC:-cc} -O0 -g -std=c99 -D_POSIX_C_SOURCE=200809L -DPRISM_XALLOCATOR \
         -I"$ver_dir" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
         "$ver_dir/trace_prism.c" \
         "$ver_dir/trace_node.c" \
@@ -183,7 +183,7 @@ build_prism_version() {
       else
         echo "==> Building WebAssembly module for Prism $ref ($short_sha)..."
         "${WASI_SDK_PATH}/bin/clang" --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
-          -DPRISM_EXPORT_SYMBOLS -DPRISM_EXCLUDE_PRETTYPRINT -DPRISM_EXCLUDE_JSON \
+          -DPRISM_EXPORT_SYMBOLS -DPRISM_EXCLUDE_PRETTYPRINT -DPRISM_EXCLUDE_JSON -DPRISM_XALLOCATOR \
           -D_WASI_EMULATED_MMAN -lwasi-emulated-mman \
           -I"$ver_dir" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
           -std=c99 \
