@@ -256,6 +256,62 @@ collect_direct_child(const pm_node_t *child, void *data) {
 }
 #endif
 
+static const pm_string_t *
+node_unescaped_string(const pm_node_t *n) {
+    if (n == NULL) return NULL;
+    switch (PM_NODE_TYPE(n)) {
+        case PM_STRING_NODE:
+            return &((const pm_string_node_t *) n)->unescaped;
+        case PM_X_STRING_NODE:
+            return &((const pm_x_string_node_t *) n)->unescaped;
+        default:
+            return NULL;
+    }
+}
+
+static int
+node_string_locs(
+    const pm_node_t *n,
+    const pm_location_t **open_loc,
+    const pm_location_t **content_loc,
+    const pm_location_t **close_loc
+) {
+    *open_loc = NULL;
+    *content_loc = NULL;
+    *close_loc = NULL;
+    if (n == NULL) return 0;
+    switch (PM_NODE_TYPE(n)) {
+        case PM_STRING_NODE: {
+            const pm_string_node_t *s = (const pm_string_node_t *) n;
+            *open_loc = &s->opening_loc;
+            *content_loc = &s->content_loc;
+            *close_loc = &s->closing_loc;
+            return 1;
+        }
+        case PM_X_STRING_NODE: {
+            const pm_x_string_node_t *s = (const pm_x_string_node_t *) n;
+            *open_loc = &s->opening_loc;
+            *content_loc = &s->content_loc;
+            *close_loc = &s->closing_loc;
+            return 1;
+        }
+        case PM_INTERPOLATED_STRING_NODE: {
+            const pm_interpolated_string_node_t *s = (const pm_interpolated_string_node_t *) n;
+            *open_loc = &s->opening_loc;
+            *close_loc = &s->closing_loc;
+            return 1;
+        }
+        case PM_INTERPOLATED_X_STRING_NODE: {
+            const pm_interpolated_x_string_node_t *s = (const pm_interpolated_x_string_node_t *) n;
+            *open_loc = &s->opening_loc;
+            *close_loc = &s->closing_loc;
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}
+
 static uint64_t
 compute_ast_hash(void) {
     uint64_t h = 14695981039346656037ULL;
@@ -267,6 +323,33 @@ compute_ast_hash(void) {
         h ^= (uint64_t)n->node_id; h *= 1099511628211ULL;
         h ^= (uint64_t)n_start; h *= 1099511628211ULL;
         h ^= (uint64_t)n_len; h *= 1099511628211ULL;
+        const pm_location_t *oloc = NULL, *cloc = NULL, *clloc = NULL;
+        if (node_string_locs(n, &oloc, &cloc, &clloc)) {
+            if (oloc != NULL) {
+                h ^= (uint64_t)loc_start_offset(g_trace_parser, oloc); h *= 1099511628211ULL;
+                h ^= (uint64_t)loc_length_bytes(oloc); h *= 1099511628211ULL;
+            }
+            if (cloc != NULL) {
+                h ^= (uint64_t)loc_start_offset(g_trace_parser, cloc); h *= 1099511628211ULL;
+                h ^= (uint64_t)loc_length_bytes(cloc); h *= 1099511628211ULL;
+            }
+            if (clloc != NULL) {
+                h ^= (uint64_t)loc_start_offset(g_trace_parser, clloc); h *= 1099511628211ULL;
+                h ^= (uint64_t)loc_length_bytes(clloc); h *= 1099511628211ULL;
+            }
+        }
+        const pm_string_t *unesc = node_unescaped_string(n);
+        if (unesc != NULL) {
+            size_t ulen = pm_string_length(unesc);
+            const uint8_t *usrc = pm_string_source(unesc);
+            h ^= (uint64_t)ulen; h *= 1099511628211ULL;
+            if (usrc != NULL) {
+                size_t cap = ulen < 64 ? ulen : 64;
+                for (size_t k = 0; k < cap; k++) {
+                    h ^= (uint64_t)usrc[k]; h *= 1099511628211ULL;
+                }
+            }
+        }
         direct_children_t dc = { .count = 0 };
         pm_visit_child_nodes(n, collect_direct_child, &dc);
         h ^= (uint64_t)dc.count; h *= 1099511628211ULL;
@@ -526,9 +609,44 @@ prism_trace_emit_event(
             int underflow = ((uint64_t)n_start + (uint64_t)n_len > src_len) ? 1 : 0;
 
             pm_buffer_append_format(out,
-                    "{\"id\":%" PRIu32 ",\"type\":\"%s\",\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"len\":%" PRIu32 ",\"underflow\":%s,\"children\":[",
+                    "{\"id\":%" PRIu32 ",\"type\":\"%s\",\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"len\":%" PRIu32 ",\"underflow\":%s",
                     n->node_id, tname, n_start, wrapped_end, n_len,
                     underflow ? "true" : "false");
+            const pm_string_t *unesc = node_unescaped_string(n);
+            if (unesc != NULL) {
+                size_t ulen = pm_string_length(unesc);
+                const uint8_t *usrc = pm_string_source(unesc);
+                if (usrc != NULL) {
+                    size_t cap = ulen < 48 ? ulen : 48;
+                    PM_BUFFER_APPEND_LITERAL(out, ",\"val\":");
+                    buf_append_json_escaped(out, usrc, cap);
+                }
+            }
+            const pm_location_t *oloc = NULL, *cloc = NULL, *clloc = NULL;
+            if (node_string_locs(n, &oloc, &cloc, &clloc)) {
+                if (oloc != NULL) {
+                    uint32_t o_start = loc_start_offset(parser, oloc);
+                    uint32_t o_len = loc_length_bytes(oloc);
+                    if (o_len > 0 && (uint64_t)o_start + (uint64_t)o_len <= src_len) {
+                        pm_buffer_append_format(out, ",\"o_loc\":[%" PRIu32 ",%" PRIu32 "]", o_start, o_start + o_len);
+                    }
+                }
+                if (cloc != NULL) {
+                    uint32_t c_start = loc_start_offset(parser, cloc);
+                    uint32_t c_len = loc_length_bytes(cloc);
+                    if ((uint64_t)c_start + (uint64_t)c_len <= src_len) {
+                        pm_buffer_append_format(out, ",\"c_loc\":[%" PRIu32 ",%" PRIu32 "]", c_start, c_start + c_len);
+                    }
+                }
+                if (clloc != NULL) {
+                    uint32_t cl_start = loc_start_offset(parser, clloc);
+                    uint32_t cl_len = loc_length_bytes(clloc);
+                    if (cl_len > 0 && (uint64_t)cl_start + (uint64_t)cl_len <= src_len) {
+                        pm_buffer_append_format(out, ",\"cl_loc\":[%" PRIu32 ",%" PRIu32 "]", cl_start, cl_start + cl_len);
+                    }
+                }
+            }
+            PM_BUFFER_APPEND_LITERAL(out, ",\"children\":[");
             for (size_t j = 0; j < dc.count; j++) {
                 if (j > 0) pm_buffer_append_byte(out, ',');
                 pm_buffer_append_format(out, "%" PRIu32, dc.ids[j]);

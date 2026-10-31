@@ -1168,6 +1168,7 @@ function preprocessTrace(trace) {
   let prevCurrStart = 0;
   let prevAstU = 0, prevMetaU = 0, prevScratchU = 0, prevTotalU = 0, prevXallocU = 0;
   const prevUnderflowById = new Map();
+  const prevNodeSigById = new Map();
   trace._crashIdx = -1;
   trace._underflowIdx = -1;
   trace._underflowSteps = [];
@@ -1178,9 +1179,16 @@ function preprocessTrace(trace) {
   trace._hasArena = false;
   trace.steps.forEach((s, i) => {
     const newUnderflows = [];
+    let mutatedNodeId = -1;
     if (s.ast) {
       lastAst = s.ast;
       s.ast.forEach(n => {
+        const sig = `${n.start}:${n.end}:${n.val ?? ''}:${JSON.stringify([n.o_loc, n.c_loc, n.cl_loc])}:${(n.children || []).join(',')}`;
+        const prevSig = prevNodeSigById.get(n.id);
+        if (prevSig !== sig) {
+          mutatedNodeId = n.id;
+          prevNodeSigById.set(n.id, sig);
+        }
         const isU = Boolean(n.underflow || n.end < n.start);
         const wasU = prevUnderflowById.get(n.id) || false;
         if (isU && !wasU) {
@@ -1205,6 +1213,8 @@ function preprocessTrace(trace) {
       lastChangedNodeId = s.detail.node_id;
     } else if (newUnderflows.length > 0) {
       lastChangedNodeId = newUnderflows[0].id;
+    } else if (mutatedNodeId > 0) {
+      lastChangedNodeId = mutatedNodeId;
     }
     s._astSnapshot = lastAst;
     s._lastChangedNodeId = lastChangedNodeId;
@@ -1394,8 +1404,11 @@ function renderSource(step, autoScroll = false) {
     if (i >= prevS && i < prevE) cell.classList.add('in-prev');
     if (i >= currS && i < currE) cell.classList.add('in-curr');
     else if (currS >= 0 && currS === currE && i === currS) cell.classList.add('curr-caret');
-    if (hoverRange && i >= hoverRange[0] && i < hoverRange[1]) {
-      cell.classList.add('in-ast-hover');
+    if (hoverRange) {
+      const inHover = typeof hoverRange[0] === 'number'
+        ? (i >= hoverRange[0] && i < hoverRange[1])
+        : hoverRange.some(r => r && i >= r[0] && i < r[1]);
+      if (inHover) cell.classList.add('in-ast-hover');
     }
     if (i === focusOffset) {
       focusCell = cell;
@@ -1938,9 +1951,41 @@ function renderAstForest(step) {
     row.className = 'ast-row' +
       (n.id === changedNodeId ? ' just-changed' : '') +
       (isUnderflow ? ' underflow-node' : '');
-    const slice = isUnderflow
-      ? `⚠ UNDERFLOW len=${n.len} (end=${n.end} < start=${n.start})`
-      : JSON.stringify(currentTrace.source.slice(n.start, Math.min(n.end, n.start + 24)));
+    let sliceHtml = '';
+    if (isUnderflow) {
+      const uText = `⚠ UNDERFLOW len=${n.len} (end=${n.end} < start=${n.start})`;
+      sliceHtml = `<span class="ast-slice" style="color:var(--red);font-weight:700;">${escapeHtml(uText)}</span>`;
+    } else if (typeof n.val === 'string') {
+      const openRaw = n.o_loc ? currentTrace.source.slice(n.o_loc[0], n.o_loc[1]) : '';
+      const closeRaw = n.cl_loc ? currentTrace.source.slice(n.cl_loc[0], n.cl_loc[1]) : '';
+      const openVis = openRaw ? JSON.stringify(openRaw).slice(1, -1) : '';
+      const closeVis = closeRaw ? JSON.stringify(closeRaw).slice(1, -1) : '';
+      const valVis = JSON.stringify(n.val.slice(0, 24));
+      const openSpan = openVis
+        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="opening_loc [${n.o_loc[0]}..${n.o_loc[1]}]">${escapeHtml(openVis)}</span>`
+        : '';
+      const cLocLabel = n.c_loc ? `content_loc [${n.c_loc[0]}..${n.c_loc[1]}]` : `loc [${n.start}..${n.end}]`;
+      const contentSpan = `<span class="ast-slice" style="color:var(--green);" title="Unescaped content (${cLocLabel})">${escapeHtml(valVis)}</span>`;
+      const closeSpan = closeVis
+        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="closing_loc [${n.cl_loc[0]}..${n.cl_loc[1]}]">${escapeHtml(closeVis)}</span>`
+        : '';
+      sliceHtml = `${openSpan}${contentSpan}${closeSpan}`;
+    } else if (n.o_loc || n.cl_loc) {
+      const openRaw = n.o_loc ? currentTrace.source.slice(n.o_loc[0], n.o_loc[1]) : '';
+      const closeRaw = n.cl_loc ? currentTrace.source.slice(n.cl_loc[0], n.cl_loc[1]) : '';
+      const openVis = openRaw ? JSON.stringify(openRaw).slice(1, -1) : '';
+      const closeVis = closeRaw ? JSON.stringify(closeRaw).slice(1, -1) : '';
+      const openSpan = openVis
+        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="opening_loc [${n.o_loc[0]}..${n.o_loc[1]}]">${escapeHtml(openVis)}</span>`
+        : '';
+      const closeSpan = closeVis
+        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="closing_loc [${n.cl_loc[0]}..${n.cl_loc[1]}]">${escapeHtml(closeVis)}</span>`
+        : '';
+      sliceHtml = `${openSpan}<span class="ast-slice">…</span>${closeSpan}`;
+    } else {
+      const slice = JSON.stringify(currentTrace.source.slice(n.start, Math.min(n.end, n.start + 24)));
+      sliceHtml = `<span class="ast-slice">${escapeHtml(slice)}</span>`;
+    }
     const jumpPill = (typeof detectIdx === 'number' && detectIdx !== currentIdx)
       ? `<span class="copy-pill ast-jump-underflow" style="border-color:var(--red);color:#ffa198;" title="Jump to step #${currentTrace.steps[detectIdx].step} where this corrupted node was detected">↳ Jump to Step #${currentTrace.steps[detectIdx].step}</span>`
       : '';
@@ -1948,7 +1993,7 @@ function renderAstForest(step) {
       <span class="ast-id">#${n.id}</span>
       <span>${n.type}</span>
       <span class="ast-loc">[${n.start}..${n.end}]</span>
-      <span class="ast-slice" style="${isUnderflow ? 'color:var(--red);font-weight:700;' : ''}">${escapeHtml(slice)}</span>
+      ${sliceHtml}
       ${jumpPill}
     `;
     const jumpEl = row.querySelector('.ast-jump-underflow');
@@ -1958,8 +2003,13 @@ function renderAstForest(step) {
         jumpToStep(detectIdx);
       });
     }
+    const getNodeHoverRanges = () => {
+      if (isUnderflow) return [n.end, n.start];
+      const parts = [n.o_loc, n.c_loc, n.cl_loc].filter(Boolean);
+      return parts.length > 0 ? parts : [n.start, n.end];
+    };
     row.addEventListener('mouseenter', () => {
-      hoverRange = isUnderflow ? [n.end, n.start] : [n.start, n.end];
+      hoverRange = getNodeHoverRanges();
       renderSource(currentTrace.steps[currentIdx]);
     });
     row.addEventListener('mouseleave', () => {
