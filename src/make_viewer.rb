@@ -588,13 +588,14 @@ HTML_TEMPLATE = <<~'HTML'
       <div id="underflowBanner" class="underflow-banner"></div>
       <div id="rewindBanner" class="rewind-banner"></div>
       <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:6px;">
-        <div style="display:flex; align-items:center; justify-content:space-between; gap:5px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:5px; flex-wrap:wrap;">
           <span style="font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:var(--muted);">Source Input</span>
-          <div style="display:flex; align-items:center; gap:5px;">
+          <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
             <button id="btnEditSource" class="success" title="Edit Ruby source in-place (or double-click source buffer)">✎ Edit Code</button>
             <button id="btnRunWasm" class="success" style="display:none;" title="Parse &amp; trace with in-browser Prism Wasm (Cmd/Ctrl + Enter)">▶ Parse &amp; Trace (⌘+Enter)</button>
             <button id="btnCancelEdit" style="display:none;">Cancel</button>
             <button id="btnShareCode" title="Copy a shareable URL with the current Ruby snippet Base64-encoded in ?code=">🔗 Share</button>
+            <button id="btnRecordVideo" title="Record a video of the Ruby source buffer being parsed step-by-step">🎬 Video</button>
             <button id="btnOpenRb" title="Load a .rb file and trace it live">📂 .rb</button>
             <button id="btnOpenJsonl" title="Load a pre-recorded .jsonl trace">📂 .jsonl</button>
             <input type="file" id="rbFileInput" accept=".rb,.txt,*" style="display:none;">
@@ -1079,7 +1080,10 @@ function preprocessTrace(trace) {
 }
 
 function setEditMode(editing) {
-  if (editing) stopPlayback();
+  if (editing) {
+    stopPlayback();
+    if (typeof stopVideoRecording === 'function') stopVideoRecording();
+  }
   const srcBox = document.getElementById('sourceBox');
   const editor = document.getElementById('rubyEditor');
   const btnEdit = document.getElementById('btnEditSource');
@@ -1106,6 +1110,7 @@ function setEditMode(editing) {
 
 function loadTrace(trace, syncEditor = true) {
   stopPlayback();
+  if (typeof stopVideoRecording === 'function') stopVideoRecording();
   setEditMode(false);
   preprocessTrace(trace);
   currentTrace = trace;
@@ -1781,6 +1786,520 @@ document.getElementById('btnShareCode').addEventListener('click', async () => {
   }
   setTimeout(() => { btn.textContent = orig; }, 1400);
 });
+
+let activeVideoRecording = null;
+
+function pickSupportedVideoMime() {
+  if (typeof MediaRecorder === 'undefined') return null;
+  const candidates = [
+    { mime: 'video/webm;codecs=vp9', ext: 'webm' },
+    { mime: 'video/webm;codecs=vp8', ext: 'webm' },
+    { mime: 'video/webm', ext: 'webm' },
+    { mime: 'video/mp4;codecs=avc1', ext: 'mp4' },
+    { mime: 'video/mp4', ext: 'mp4' }
+  ];
+  for (const c of candidates) {
+    if (!MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(c.mime)) {
+      return c;
+    }
+  }
+  return { mime: '', ext: 'webm' };
+}
+
+function getKindBadgeStyle(kind) {
+  switch (kind) {
+    case 'LEX_TOKEN':
+      return { bg: 'rgba(63, 185, 80, 0.22)', fg: '#3fb950', border: '#3fb950' };
+    case 'LEX_STATE':
+      return { bg: 'rgba(57, 197, 207, 0.22)', fg: '#39c5cf', border: '#39c5cf' };
+    case 'LEX_MODE_PUSH':
+    case 'LEX_MODE_POP':
+    case 'ERROR':
+      return { bg: 'rgba(247, 120, 186, 0.22)', fg: '#f778ba', border: '#f778ba' };
+    case 'HEREDOC_FLUSH':
+      return { bg: 'rgba(188, 140, 255, 0.25)', fg: '#bc8cff', border: '#bc8cff' };
+    case 'NODE_NEW':
+    case 'NODE_LIST_APPEND':
+      return { bg: 'rgba(88, 166, 255, 0.22)', fg: '#58a6ff', border: '#58a6ff' };
+    case 'CRASH':
+      return { bg: '#f85149', fg: '#ffffff', border: '#ff7b72' };
+    default:
+      return { bg: 'rgba(139, 148, 158, 0.18)', fg: '#8b949e', border: '#30363d' };
+  }
+}
+
+function buildCanvasSourceModel(src) {
+  const lines = [];
+  let currentCells = [];
+  let lineNum = 1;
+  let lineStartOffset = 0;
+  let colUnit = 0;
+  let maxColUnits = 0;
+  const offsetToPos = new Array(src.length + 1);
+
+  for (let i = 0; i <= src.length; i++) {
+    const ch = i < src.length ? src[i] : 'EOF';
+    let display = ch;
+    let isMeta = false;
+    let units = 1;
+    if (ch === '\n') {
+      display = '\\n';
+      isMeta = true;
+      units = 2;
+    } else if (ch === '\r') {
+      display = '\\r';
+      isMeta = true;
+      units = 2;
+    } else if (ch === 'EOF') {
+      display = '␄';
+      isMeta = true;
+      units = 1;
+    } else if (ch === '\t') {
+      display = '→ ';
+      isMeta = true;
+      units = 2;
+    }
+    const cell = {
+      offset: i,
+      ch,
+      display,
+      isMeta,
+      colUnit,
+      units
+    };
+    offsetToPos[i] = { lineIdx: lines.length, colUnit, units };
+    currentCells.push(cell);
+    colUnit += units;
+    if (colUnit > maxColUnits) maxColUnits = colUnit;
+
+    if (ch === '\n') {
+      lines.push({ lineNum, startOffset: lineStartOffset, cells: currentCells, totalUnits: colUnit });
+      lineNum++;
+      lineStartOffset = i + 1;
+      currentCells = [];
+      colUnit = 0;
+    }
+  }
+  lines.push({ lineNum, startOffset: lineStartOffset, cells: currentCells, totalUnits: colUnit });
+  return { lines, maxColUnits, offsetToPos };
+}
+
+function drawRoundedRect(ctx, x, y, w, h, r) {
+  const radius = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.arcTo(x + w, y, x + w, y + h, radius);
+  ctx.arcTo(x + w, y + h, x, y + h, radius);
+  ctx.arcTo(x, y + h, x, y, radius);
+  ctx.arcTo(x, y, x + w, y, radius);
+  ctx.closePath();
+}
+
+function createSourceVideoRenderer(trace) {
+  const model = buildCanvasSourceModel(trace.source || '');
+  const scale = 2;
+  const fontMono = '13px "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace';
+  const fontSmall = '11px "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace';
+  const fontBold = '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+
+  const measureCanvas = document.createElement('canvas');
+  const mctx = measureCanvas.getContext('2d');
+  mctx.font = fontMono;
+  const charW = Math.ceil(mctx.measureText('M').width) + 2;
+  const lineH = 22;
+
+  const visibleLines = Math.max(5, Math.min(20, model.lines.length));
+  const visibleCols = Math.max(52, Math.min(86, model.maxColUnits + 4));
+
+  const outerPad = 12;
+  const headerH = 42;
+  const footerH = 28;
+  const boxPadX = 10;
+  const boxPadY = 10;
+  const gutterW = 42;
+  const gutterGap = 10;
+
+  let logicalW = outerPad * 2 + boxPadX * 2 + gutterW + gutterGap + visibleCols * charW;
+  let logicalH = outerPad * 2 + headerH + boxPadY * 2 + visibleLines * lineH + footerH;
+  if (logicalW % 2 !== 0) logicalW += 1;
+  if (logicalH % 2 !== 0) logicalH += 1;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = logicalW * scale;
+  canvas.height = logicalH * scale;
+  const ctx = canvas.getContext('2d');
+
+  let scrollLine = 0;
+  let scrollCol = 0;
+
+  function renderFrame(stepIdx) {
+    const steps = trace.steps || [];
+    const step = steps[stepIdx] || steps[0];
+    if (!step) return;
+
+    const [prevS, prevE, prevTok] = step.prev || [-1, -1, ''];
+    const [currS, currE, currTok] = step.curr || [-1, -1, ''];
+
+    let focusOffset = (currE >= 0 ? currE : (currS >= 0 ? currS : (prevE >= 0 ? prevE : 0)));
+    if ((step.kind === 'ERROR' || step.kind === 'NODE_NEW') && step.detail && typeof step.detail.start === 'number') {
+      focusOffset = step.detail.start;
+    }
+    const maxOff = (trace.source || '').length;
+    focusOffset = Math.max(0, Math.min(maxOff, focusOffset));
+    const focusPos = model.offsetToPos[focusOffset] || { lineIdx: 0, colUnit: 0 };
+
+    if (model.lines.length > visibleLines) {
+      const marginLines = Math.max(1, Math.floor(visibleLines * 0.22));
+      if (focusPos.lineIdx < scrollLine + marginLines) {
+        scrollLine = Math.max(0, focusPos.lineIdx - marginLines);
+      } else if (focusPos.lineIdx >= scrollLine + visibleLines - marginLines) {
+        scrollLine = Math.min(model.lines.length - visibleLines, focusPos.lineIdx - visibleLines + marginLines + 1);
+      }
+    } else {
+      scrollLine = 0;
+    }
+
+    if (model.maxColUnits > visibleCols) {
+      const marginCols = Math.max(4, Math.floor(visibleCols * 0.2));
+      if (focusPos.colUnit < scrollCol + marginCols) {
+        scrollCol = Math.max(0, focusPos.colUnit - marginCols);
+      } else if (focusPos.colUnit >= scrollCol + visibleCols - marginCols) {
+        scrollCol = Math.max(0, focusPos.colUnit - visibleCols + marginCols + 2);
+      }
+    } else {
+      scrollCol = 0;
+    }
+
+    ctx.save();
+    ctx.scale(scale, scale);
+
+    // Outer background
+    ctx.fillStyle = '#0d1117';
+    ctx.fillRect(0, 0, logicalW, logicalH);
+
+    // Header bar
+    ctx.fillStyle = '#161b22';
+    ctx.fillRect(0, 0, logicalW, headerH);
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, headerH - 0.5);
+    ctx.lineTo(logicalW, headerH - 0.5);
+    ctx.stroke();
+
+    // Step counter
+    ctx.font = fontBold;
+    ctx.fillStyle = '#e6edf3';
+    ctx.textBaseline = 'middle';
+    const stepText = `Step ${stepIdx + 1} / ${steps.length}`;
+    ctx.fillText(stepText, outerPad, 18);
+    let cursorX = outerPad + ctx.measureText(stepText).width + 10;
+
+    // Kind badge
+    const kStyle = getKindBadgeStyle(step.kind);
+    ctx.font = fontSmall;
+    const kindLabel = step.kind || 'STEP';
+    const kindW = ctx.measureText(kindLabel).width + 12;
+    drawRoundedRect(ctx, cursorX, 8, kindW, 20, 4);
+    ctx.fillStyle = kStyle.bg;
+    ctx.fill();
+    ctx.strokeStyle = kStyle.border;
+    ctx.stroke();
+    ctx.fillStyle = kStyle.fg;
+    ctx.fillText(kindLabel, cursorX + 6, 18.5);
+    cursorX += kindW + 10;
+
+    // Function & detail summary
+    ctx.font = fontSmall;
+    ctx.fillStyle = '#8b949e';
+    let detailSummary = `${step.func || ''}()`;
+    if (step.kind === 'LEX_TOKEN' && currTok) {
+      detailSummary += ` → ${currTok.replace(/^PM_TOKEN_/, '')} [${currS}..${currE}]`;
+    } else if ((step.kind === 'NODE_NEW' || step.kind === 'NODE_LIST_APPEND') && step.detail) {
+      detailSummary += ` → ${(step.detail.type || '').replace(/^PM_/, '')} #${step.detail.node_id ?? '?'} [${step.detail.start ?? '?'}..${step.detail.end ?? '?'}]`;
+    } else if (step.kind === 'ERROR' && step.detail && step.detail.message) {
+      detailSummary += ` → ${step.detail.message}`;
+    }
+    if (step._hasNewUnderflow) {
+      detailSummary += '  ⚠ UNDERFLOW (end < start)';
+    } else if (step._isRewind) {
+      detailSummary += `  ↺ REWIND (${step._rewindDelta}B)`;
+    }
+    ctx.fillText(detailSummary, cursorX, 18.5);
+
+    // Header mini timeline bar
+    const trackY = headerH - 5;
+    ctx.fillStyle = '#090d13';
+    ctx.fillRect(outerPad, trackY, logicalW - outerPad * 2, 3);
+    if (steps.length > 1) {
+      const trackW = logicalW - outerPad * 2;
+      const ratio = stepIdx / (steps.length - 1);
+      ctx.fillStyle = step._hasNewUnderflow || step.kind === 'CRASH'
+        ? '#f85149'
+        : (step._isRewind ? '#d29922' : '#58a6ff');
+      ctx.fillRect(outerPad, trackY, Math.max(2, ratio * trackW), 3);
+    }
+
+    // Source box container
+    const boxX = outerPad;
+    const boxY = headerH + outerPad - 4;
+    const boxW = logicalW - outerPad * 2;
+    const boxH = boxPadY * 2 + visibleLines * lineH;
+
+    drawRoundedRect(ctx, boxX, boxY, boxW, boxH, 6);
+    ctx.fillStyle = '#090d13';
+    ctx.fill();
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Clip to source box
+    ctx.save();
+    drawRoundedRect(ctx, boxX + 1, boxY + 1, boxW - 2, boxH - 2, 5);
+    ctx.clip();
+
+    const codeOriginX = boxX + boxPadX + gutterW + gutterGap;
+    const codeOriginY = boxY + boxPadY;
+
+    // Optional node span highlight on NODE_NEW / NODE_LIST_APPEND
+    const nodeStart = (step.detail && typeof step.detail.start === 'number') ? step.detail.start : -1;
+    const nodeEnd = (step.detail && typeof step.detail.end === 'number') ? step.detail.end : -1;
+    const isNodeStep = (step.kind === 'NODE_NEW' || step.kind === 'NODE_LIST_APPEND') && nodeStart >= 0 && nodeEnd >= 0;
+    const isUnderflowRange = isNodeStep && nodeEnd < nodeStart;
+    const nRangeLo = isNodeStep ? Math.min(nodeStart, nodeEnd) : -1;
+    const nRangeHi = isNodeStep ? Math.max(nodeStart, nodeEnd) : -1;
+
+    for (let v = 0; v < visibleLines; v++) {
+      const lineIdx = scrollLine + v;
+      if (lineIdx >= model.lines.length) break;
+      const lineObj = model.lines[lineIdx];
+      const rowY = codeOriginY + v * lineH;
+      const isActiveLine = (lineIdx === focusPos.lineIdx);
+
+      if (isActiveLine) {
+        ctx.fillStyle = 'rgba(88, 166, 255, 0.08)';
+        ctx.fillRect(boxX + 2, rowY, boxW - 4, lineH);
+        ctx.fillStyle = '#58a6ff';
+        ctx.fillRect(boxX + 2, rowY, 2.5, lineH);
+      }
+
+      // Gutter line number
+      ctx.font = fontSmall;
+      ctx.fillStyle = '#8b949e';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(lineObj.lineNum), boxX + boxPadX + gutterW - 8, rowY + lineH / 2);
+
+      // Gutter divider
+      ctx.strokeStyle = '#30363d';
+      ctx.beginPath();
+      ctx.moveTo(boxX + boxPadX + gutterW - 0.5, rowY);
+      ctx.lineTo(boxX + boxPadX + gutterW - 0.5, rowY + lineH);
+      ctx.stroke();
+
+      // Cells
+      ctx.textAlign = 'center';
+      ctx.font = fontMono;
+      for (const cell of lineObj.cells) {
+        const relCol = cell.colUnit - scrollCol;
+        if (relCol + cell.units < 0 || relCol > visibleCols + 1) continue;
+
+        const cellX = codeOriginX + relCol * charW;
+        const cellW = cell.units * charW;
+        const cellH = lineH - 2;
+        const cellY = rowY + 1;
+        const i = cell.offset;
+
+        if (isNodeStep && i >= nRangeLo && i < nRangeHi) {
+          ctx.fillStyle = isUnderflowRange ? 'rgba(248, 81, 73, 0.22)' : 'rgba(88, 166, 255, 0.14)';
+          ctx.fillRect(cellX, cellY, cellW, cellH);
+        }
+
+        if (i >= prevS && i < prevE) {
+          ctx.fillStyle = 'rgba(210, 153, 34, 0.26)';
+          ctx.fillRect(cellX, cellY, cellW, cellH);
+          ctx.fillStyle = '#d29922';
+          ctx.fillRect(cellX, cellY + cellH - 2, cellW, 2);
+        }
+
+        if (i >= currS && i < currE) {
+          ctx.fillStyle = 'rgba(63, 185, 80, 0.32)';
+          ctx.fillRect(cellX, cellY, cellW, cellH);
+          ctx.fillStyle = '#3fb950';
+          ctx.fillRect(cellX, cellY + cellH - 2, cellW, 2);
+        } else if (currS >= 0 && currS === currE && i === currS) {
+          ctx.fillStyle = 'rgba(63, 185, 80, 0.18)';
+          ctx.fillRect(cellX, cellY, cellW, cellH);
+          ctx.fillStyle = '#3fb950';
+          ctx.fillRect(cellX, cellY, 2, cellH);
+        }
+
+        ctx.fillStyle = cell.isMeta ? '#6e7681' : '#e6edf3';
+        ctx.fillText(cell.display, cellX + cellW / 2, rowY + lineH / 2 + 0.5);
+      }
+    }
+
+    ctx.restore();
+
+    // Footer legend & live token status
+    const footerY = boxY + boxH + (footerH / 2) + 2;
+    ctx.font = fontSmall;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+
+    let fx = outerPad;
+    // Prev token legend
+    ctx.fillStyle = '#d29922';
+    ctx.fillRect(fx, footerY - 4, 8, 8);
+    fx += 12;
+    ctx.fillStyle = '#8b949e';
+    const prevLabel = prevS >= 0 ? `prev [${prevS}..${prevE}] ${(prevTok || '').replace(/^PM_TOKEN_/, '')}` : 'prev: none';
+    ctx.fillText(prevLabel, fx, footerY);
+    fx += ctx.measureText(prevLabel).width + 16;
+
+    // Curr token legend
+    ctx.fillStyle = '#3fb950';
+    ctx.fillRect(fx, footerY - 4, 8, 8);
+    fx += 12;
+    ctx.fillStyle = '#e6edf3';
+    const currLabel = currS >= 0 ? `curr [${currS}..${currE}] ${(currTok || '').replace(/^PM_TOKEN_/, '')}` : 'curr: none';
+    ctx.fillText(currLabel, fx, footerY);
+    fx += ctx.measureText(currLabel).width + 16;
+
+    // Lex mode
+    const topMode = (step.lex_modes && step.lex_modes.length > 0) ? step.lex_modes[0].mode : 'DEFAULT';
+    ctx.fillStyle = '#8b949e';
+    ctx.fillText(`lex_mode: ${topMode}`, fx, footerY);
+
+    ctx.restore();
+  }
+
+  return { canvas, renderFrame };
+}
+
+function stopVideoRecording() {
+  if (!activeVideoRecording) return;
+  const rec = activeVideoRecording;
+  activeVideoRecording = null;
+  if (rec.timer) {
+    clearTimeout(rec.timer);
+    rec.timer = null;
+  }
+  if (rec.recorder && rec.recorder.state !== 'inactive') {
+    try { rec.recorder.stop(); } catch (_) {}
+  }
+  const btn = document.getElementById('btnRecordVideo');
+  if (btn) {
+    btn.textContent = '🎬 Video';
+    btn.style.borderColor = '';
+    btn.style.color = '';
+  }
+}
+
+async function toggleVideoRecording() {
+  if (activeVideoRecording) {
+    stopVideoRecording();
+    return;
+  }
+  if (!currentTrace || !currentTrace.steps || currentTrace.steps.length === 0) return;
+
+  const format = pickSupportedVideoMime();
+  if (!format) {
+    alert('MediaRecorder is not supported in this browser.');
+    return;
+  }
+
+  stopPlayback();
+  setEditMode(false);
+
+  const trace = currentTrace;
+  const totalSteps = trace.steps.length;
+  const { canvas, renderFrame } = createSourceVideoRenderer(trace);
+
+  if (typeof canvas.captureStream !== 'function') {
+    alert('HTMLCanvasElement.captureStream() is not supported in this browser.');
+    return;
+  }
+
+  const stream = canvas.captureStream(30);
+  const videoTrack = stream.getVideoTracks()[0];
+  const requestCanvasFrame = () => {
+    if (videoTrack && typeof videoTrack.requestFrame === 'function') {
+      try { videoTrack.requestFrame(); } catch (_) {}
+    }
+  };
+
+  const recorderOpts = { videoBitsPerSecond: 4000000 };
+  if (format.mime) recorderOpts.mimeType = format.mime;
+  const recorder = new MediaRecorder(stream, recorderOpts);
+  const chunks = [];
+
+  recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) chunks.push(e.data);
+  };
+
+  recorder.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    if (chunks.length === 0) return;
+    const blob = new Blob(chunks, { type: format.mime || 'video/webm' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const safeName = (trace.name || 'prism-trace')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'prism-trace';
+    a.href = url;
+    a.download = `${safeName}.${format.ext}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  };
+
+  const btn = document.getElementById('btnRecordVideo');
+  const updateButtonProgress = (idx) => {
+    if (!btn) return;
+    btn.textContent = `⏹ Stop (${idx + 1}/${totalSteps})`;
+    btn.style.borderColor = 'var(--red)';
+    btn.style.color = '#ff7b72';
+  };
+
+  currentIdx = 0;
+  renderStep();
+  renderFrame(0);
+  requestCanvasFrame();
+  recorder.start(100);
+
+  const state = { recorder, timer: null };
+  activeVideoRecording = state;
+  updateButtonProgress(0);
+
+  const stepAdvance = () => {
+    if (activeVideoRecording !== state) return;
+    if (currentIdx < totalSteps - 1) {
+      currentIdx++;
+      renderStep();
+      renderFrame(currentIdx);
+      requestCanvasFrame();
+      updateButtonProgress(currentIdx);
+      const delayMs = Math.max(16, Math.min(2000, getPlayIntervalMs()));
+      state.timer = setTimeout(stepAdvance, delayMs);
+    } else {
+      renderFrame(currentIdx);
+      requestCanvasFrame();
+      state.timer = setTimeout(() => {
+        if (activeVideoRecording === state) {
+          stopVideoRecording();
+        }
+      }, 650);
+    }
+  };
+
+  const initialDelayMs = Math.max(80, Math.min(400, getPlayIntervalMs()));
+  state.timer = setTimeout(stepAdvance, initialDelayMs);
+}
+
+document.getElementById('btnRecordVideo').addEventListener('click', toggleVideoRecording);
 
 document.getElementById('btnOpenJsonl').addEventListener('click', () => {
   document.getElementById('fileInput').click();
