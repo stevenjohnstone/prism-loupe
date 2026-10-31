@@ -32,7 +32,7 @@ HTML_TEMPLATE = <<~'HTML'
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Prism Parse & Lexer Visualizer</title>
+<title>Ruby Prism Playground</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -517,7 +517,7 @@ HTML_TEMPLATE = <<~'HTML'
 <body>
 
 <header>
-  <img src="data:image/svg+xml;base64,__RUBY_SVG_BASE64__" alt="Ruby" title="Prism Parse &amp; Lexer Visualizer" class="header-logo">
+  <img src="data:image/svg+xml;base64,__RUBY_SVG_BASE64__" alt="Ruby" title="Ruby Prism Playground" class="header-logo">
   <a id="prismVersionBadge" class="version-badge" href="__PRISM_COMMIT_URL__" target="_blank" rel="noopener" title="__PRISM_VERSION_TITLE__">
     <span>Prism v__PRISM_VERSION__</span>
     <span class="version-sha">(__PRISM_SHORT_SHA__)</span>
