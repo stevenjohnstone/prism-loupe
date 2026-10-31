@@ -24,7 +24,9 @@ elif [ "$PRISM_DIR" = "$ROOT_DIR/vendor/prism" ] && [ -d "$PRISM_DIR/.git" ]; th
   TARGET_SHA="$(git -C "$PRISM_DIR" rev-parse "$PRISM_REF^{commit}" 2>/dev/null || true)"
   if [ "$CUR_SHA" != "$TARGET_SHA" ] || [ -n "${FORCE_PRISM_CHECKOUT:-}" ]; then
     echo "==> Updating $PRISM_DIR to $PRISM_REF..."
-    git -C "$PRISM_DIR" fetch origin
+    if [ -z "$TARGET_SHA" ] || [ -n "${FORCE_PRISM_CHECKOUT:-}" ]; then
+      git -C "$PRISM_DIR" fetch origin
+    fi
     git -C "$PRISM_DIR" checkout "$PRISM_REF"
     (cd "$PRISM_DIR" && ruby templates/template.rb)
   fi

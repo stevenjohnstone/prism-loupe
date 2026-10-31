@@ -78,6 +78,30 @@ HTML_TEMPLATE = <<~'HTML'
     display: block;
     flex-shrink: 0;
   }
+  .version-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 5px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    text-decoration: none;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .version-badge:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .version-badge .version-sha {
+    color: var(--muted);
+    font-weight: 400;
+  }
   select, button, input[type="file"]::file-selector-button {
     background: var(--panel-alt);
     color: var(--text);
@@ -495,6 +519,10 @@ HTML_TEMPLATE = <<~'HTML'
 
 <header>
   <img src="data:image/svg+xml;base64,__RUBY_SVG_BASE64__" alt="Ruby" title="Prism Parse &amp; Lexer Visualizer" class="header-logo">
+  <a id="prismVersionBadge" class="version-badge" href="__PRISM_COMMIT_URL__" target="_blank" rel="noopener" title="__PRISM_VERSION_TITLE__">
+    <span>Prism v__PRISM_VERSION__</span>
+    <span class="version-sha">(__PRISM_SHORT_SHA__)</span>
+  </a>
   <button id="btnPlayPause" class="success" style="min-width:68px;" title="Play / Pause automatic playthrough at 1 step/s (Spacebar)">&#9654; Play</button>
   <button id="btnPrev" class="primary" title="Step backward 1 trace event (Left Arrow)">&larr; Step</button>
   <button id="btnNext" class="primary" title="Step forward 1 trace event (Right Arrow)">Step &rarr;</button>
@@ -680,6 +708,7 @@ HTML_TEMPLATE = <<~'HTML'
 <script>
 const PRESETS = __PRESETS_JSON__;
 const WASM_BASE64 = "__WASM_BASE64__";
+const PRISM_BUILD_INFO = __PRISM_BUILD_INFO_JSON__;
 const REPO_ROOT_STORAGE = 'prism_trace_repo_root';
 
 function getRepoRoot() {
@@ -759,7 +788,7 @@ async function initWasm() {
     if (instance.exports._initialize) instance.exports._initialize();
     wasmExports = instance.exports;
     if (!statusEl.innerHTML.includes('Crash captured')) {
-      statusEl.innerHTML = '<span style="color:var(--green)">● Wasm ready (in-browser Prism)</span>';
+      statusEl.innerHTML = `<span style="color:var(--green)">● Wasm ready (Prism v${PRISM_BUILD_INFO.version} @ ${PRISM_BUILD_INFO.short_sha})</span>`;
     }
   } catch (err) {
     statusEl.innerHTML = `<span style="color:var(--red)">Wasm init error: ${err.message}</span>`;
@@ -1406,6 +1435,7 @@ function buildGeminiContextMarkdown(step) {
 
   return [
     `# Prism Ruby Parser Trace Context`,
+    `- Prism Version: v${PRISM_BUILD_INFO.version} (${PRISM_BUILD_INFO.describe}, commit ${PRISM_BUILD_INFO.short_sha})`,
     `- Trace Name: ${currentTrace.name}`,
     `- Ruby Source (${currentTrace.source.length} bytes): ${JSON.stringify(currentTrace.source)}`,
     `- Current Step: ${step.step} / ${total - 1}`,
@@ -2023,8 +2053,36 @@ wasm_path = File.join(BUILD_DIR, "prism_trace.wasm")
 wasm_b64 = File.exist?(wasm_path) ? Base64.strict_encode64(File.binread(wasm_path)) : ""
 ruby_svg_b64 = Base64.strict_encode64(File.binread(File.join(PRISM_DIR, "doc/images/ruby.svg")))
 
+version_h_path = File.join(PRISM_DIR, "include/prism/version.h")
+prism_semver = if File.exist?(version_h_path)
+  File.read(version_h_path)[/#define\s+PRISM_VERSION\s+"([^"]+)"/, 1] || "unknown"
+else
+  "unknown"
+end
+prism_sha = IO.popen(["git", "-C", PRISM_DIR, "rev-parse", "HEAD"], err: File::NULL, &:read).strip
+prism_short_sha = IO.popen(["git", "-C", PRISM_DIR, "rev-parse", "--short=9", "HEAD"], err: File::NULL, &:read).strip
+prism_describe = IO.popen(["git", "-C", PRISM_DIR, "describe", "--tags", "--always"], err: File::NULL, &:read).strip
+prism_date = IO.popen(["git", "-C", PRISM_DIR, "show", "-s", "--format=%cs", "HEAD"], err: File::NULL, &:read).strip
+prism_short_sha = "local" if prism_short_sha.empty?
+prism_describe = "v#{prism_semver}" if prism_describe.empty?
+prism_commit_url = prism_sha.empty? ? "https://github.com/ruby/prism" : "https://github.com/ruby/prism/commit/#{prism_sha}"
+prism_version_title = "Built with Prism v#{prism_semver} (#{prism_describe}#{prism_date.empty? ? '' : ", #{prism_date}"}) — click to view commit on GitHub"
+prism_build_info = {
+  "version" => prism_semver,
+  "sha" => prism_sha,
+  "short_sha" => prism_short_sha,
+  "describe" => prism_describe,
+  "date" => prism_date,
+  "url" => prism_commit_url
+}
+
 html = HTML_TEMPLATE
   .sub("__RUBY_SVG_BASE64__") { ruby_svg_b64 }
+  .sub("__PRISM_VERSION__") { prism_semver }
+  .sub("__PRISM_SHORT_SHA__") { prism_short_sha }
+  .sub("__PRISM_COMMIT_URL__") { prism_commit_url }
+  .sub("__PRISM_VERSION_TITLE__") { prism_version_title }
+  .sub("__PRISM_BUILD_INFO_JSON__") { JSON.generate(prism_build_info) }
   .sub("__PRESETS_JSON__") { JSON.generate(presets) }
   .sub("__WASM_BASE64__") { wasm_b64 }
 

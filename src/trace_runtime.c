@@ -515,7 +515,7 @@ prism_trace_run_to_buffer(
 ) {
     prism_trace_reset(out_buf, max_steps > 0 ? (uint64_t) max_steps : 50000);
 
-    PM_BUFFER_APPEND_LITERAL(out_buf, "{\"meta\":true,\"source\":");
+    PM_BUFFER_APPEND_LITERAL(out_buf, "{\"meta\":true,\"prism_version\":\"" PRISM_VERSION "\",\"source\":");
     buf_append_json_escaped(out_buf, source, size);
     pm_buffer_append_format(out_buf, ",\"length\":%zu}\n", size);
 
