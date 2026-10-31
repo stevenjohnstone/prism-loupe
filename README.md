@@ -90,13 +90,16 @@ make serve
 
 ### Building Against a Custom Prism Commit or Local Checkout
 
-You can point the build at any Prism commit, branch, or local directory:
+Default versions are configured in [`PRISM_VERSION`](PRISM_VERSION) using `${VAR:-default}` fallbacks, so you can either edit [`PRISM_VERSION`](PRISM_VERSION) directly or override them via environment variables:
 
 ```bash
-# Build against a specific upstream commit or tag:
-PRISM_REF=v2.1.0 FORCE_PRISM_CHECKOUT=1 make build
+# Build against a specific upstream commit, tag, or branch:
+PRISM_REF=v1.9.0 make build
 
-# Or build against an existing local Prism checkout:
+# Re-fetch and checkout a moving branch ref from origin:
+PRISM_REF=main FORCE_PRISM_CHECKOUT=1 make build
+
+# Or build against an existing local Prism checkout without modifying vendor/prism:
 PRISM_DIR=/path/to/local/prism make build
 ```
 
