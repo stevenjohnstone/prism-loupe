@@ -1099,12 +1099,15 @@ function decodeCodeBase64(b64) {
   return new TextDecoder().decode(bytes);
 }
 
-function buildShareableUrl(rubyCode) {
+function buildShareableUrl(rubyCode, stepIdx = currentIdx) {
   const url = new URL(window.location.href);
   if (PRISM_BUILD_INFO && PRISM_BUILD_INFO.id) {
     url.searchParams.set('version', PRISM_BUILD_INFO.id);
   }
   url.searchParams.set('code', encodeCodeBase64(rubyCode));
+  if (Number.isFinite(stepIdx) && stepIdx >= 0) {
+    url.searchParams.set('step', String(stepIdx));
+  }
   return url.toString();
 }
 
@@ -1121,7 +1124,7 @@ function updateBrowserUrlVersionOnly() {
   } catch (_) {}
 }
 
-function updateBrowserUrlWithCode(rubyCode) {
+function updateBrowserUrlWithCode(rubyCode, stepIdx = null) {
   try {
     if (typeof rubyCode === 'string' && rubyCode.length <= 16384) {
       const url = new URL(window.location.href);
@@ -1129,6 +1132,11 @@ function updateBrowserUrlWithCode(rubyCode) {
         url.searchParams.set('version', PRISM_BUILD_INFO.id);
       }
       url.searchParams.set('code', encodeCodeBase64(rubyCode));
+      if (Number.isFinite(stepIdx) && stepIdx >= 0) {
+        url.searchParams.set('step', String(stepIdx));
+      } else {
+        url.searchParams.delete('step');
+      }
       window.history.replaceState(null, '', url.toString());
     }
   } catch (_) {}
@@ -1923,8 +1931,8 @@ document.getElementById('btnShareCode').addEventListener('click', async () => {
   const editor = document.getElementById('rubyEditor');
   const isEditing = editor.style.display !== 'none';
   const rubyCode = isEditing ? editor.value : (currentTrace ? currentTrace.source : '');
-  const shareUrl = buildShareableUrl(rubyCode);
-  updateBrowserUrlWithCode(rubyCode);
+  const shareUrl = buildShareableUrl(rubyCode, currentIdx);
+  updateBrowserUrlWithCode(rubyCode, currentIdx);
   const btn = document.getElementById('btnShareCode');
   const orig = btn.textContent;
   try {
@@ -3451,19 +3459,19 @@ async function registerWebMcpTools() {
       const decoded = decodeCodeBase64(codeParam);
       document.getElementById('rubyEditor').value = decoded;
       await parseWithWasm(decoded, 'Shared URL Snippet');
-      if (stepParam && currentTrace) {
-        if (stepParam === 'crash' && currentTrace._crashIdx >= 0) {
-          jumpToStep(currentTrace._crashIdx);
-        } else if (stepParam === 'underflow' && currentTrace._underflowIdx >= 0) {
-          jumpToStep(currentTrace._underflowIdx);
-        } else {
-          const n = parseInt(stepParam, 10);
-          if (!Number.isNaN(n)) jumpToStep(n);
-        }
-      }
     } catch (err) {
       document.getElementById('wasmStatus').innerHTML =
         `<span style="color:var(--red)">Invalid ?code= Base64 parameter: ${escapeHtml(err.message)}</span>`;
+    }
+  }
+  if (stepParam && currentTrace) {
+    if (stepParam === 'crash' && currentTrace._crashIdx >= 0) {
+      jumpToStep(currentTrace._crashIdx);
+    } else if (stepParam === 'underflow' && currentTrace._underflowIdx >= 0) {
+      jumpToStep(currentTrace._underflowIdx);
+    } else {
+      const n = parseInt(stepParam, 10);
+      if (!Number.isNaN(n)) jumpToStep(n);
     }
   }
 })();
