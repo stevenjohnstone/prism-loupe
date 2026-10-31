@@ -20,14 +20,6 @@ PRISM_DIR = ARGV[0] || "vendor/prism"
 BUILD_DIR = ARGV[1] || "build"
 OUT_HTML = ARGV[2] || "dist/index.html"
 
-def run_trace(code, name, out_jsonl)
-  FileUtils.mkdir_p(File.dirname(out_jsonl))
-  ok = system(File.join(BUILD_DIR, "prism_trace"), "-e", code, "-o", out_jsonl)
-  raise "Failed to run prism_trace for #{name}" unless ok
-
-  load_jsonl(out_jsonl, name)
-end
-
 HTML_TEMPLATE = <<~'HTML'
 <!DOCTYPE html>
 <html lang="en">
@@ -2958,7 +2950,8 @@ attachTrackScrubber(document.getElementById('timelineTrack'));
 presetSelect.addEventListener('change', async (e) => {
   clearBrowserUrlCodeParam();
   const preset = PRESETS[parseInt(e.target.value, 10)];
-  if (currentPrismVersionIdx === 0) {
+  if (!preset) return;
+  if (preset.steps) {
     loadTrace(preset);
   } else {
     await parseWithWasm(preset.source, preset.name, false);
@@ -2973,7 +2966,11 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
     const lines = reader.result.split(/\r?\n/).filter(Boolean).map(l => JSON.parse(l));
     const meta = lines[0];
     const steps = lines.slice(1);
-    loadTrace({ name: file.name, source: meta.source, steps });
+    let leakSummary = null;
+    if (steps.length > 0 && steps[steps.length - 1] && steps[steps.length - 1].summary) {
+      leakSummary = steps.pop();
+    }
+    loadTrace({ name: file.name, source: meta.source, steps, leak_summary: leakSummary });
   };
   reader.readAsText(file);
 });
@@ -3562,15 +3559,13 @@ async function registerWebMcpTools() {
 }
 
 (async function initFromUrlOrPreset() {
-  loadTrace(PRESETS[0]);
-  await registerWebMcpTools();
   const params = new URLSearchParams(window.location.search);
   const versionParam = params.get('version');
   const codeParam = params.get('code');
   const stepParam = params.get('step');
   const hasCodeParam = (codeParam !== null && codeParam !== '');
   if (versionParam) {
-    await selectPrismVersion(versionParam, !hasCodeParam);
+    await selectPrismVersion(versionParam, false);
   } else {
     await initWasm();
   }
@@ -3583,7 +3578,14 @@ async function registerWebMcpTools() {
       document.getElementById('wasmStatus').innerHTML =
         `<span style="color:var(--red)">Invalid ?code= Base64 parameter: ${escapeHtml(err.message)}</span>`;
     }
+  } else if (PRESETS[0]) {
+    if (PRESETS[0].steps) {
+      loadTrace(PRESETS[0]);
+    } else {
+      await parseWithWasm(PRESETS[0].source, PRESETS[0].name, false);
+    }
   }
+  await registerWebMcpTools();
   if (stepParam && currentTrace) {
     if (stepParam === 'crash' && currentTrace._crashIdx >= 0) {
       jumpToStep(currentTrace._crashIdx);
@@ -3606,41 +3608,41 @@ if File.exist?(File.join(BUILD_DIR, "custom.jsonl"))
 end
 
 presets.concat([
-  run_trace(
-    "x = <<~OUTER + 42\n" \
-    "  hello \#{<<-INNER.strip}\n" \
-    "    world\n" \
-    "  INNER\n" \
-    "  done\n" \
-    "OUTER\n" \
-    "puts x\n",
-    "1. Nested Heredoc + Trailing Opener Expression",
-    File.join(BUILD_DIR, "preset_nested.jsonl")
-  ),
-  run_trace(
-    "-> (a = <<~HEREDOC) { a.upcase }\n" \
-    "  hello lambda\n" \
-    "HEREDOC\n",
-    "2. Stabby Lambda with Heredoc Default Parameter",
-    File.join(BUILD_DIR, "preset_lambda.jsonl")
-  ),
-  run_trace(
-    "def classify(point) = case point\n" \
-    "in { x: (0..10) => x, y: [first, *rest] } if x > 0\n" \
-    "  [x, first, rest]\n" \
-    "else\n" \
-    "  nil\n" \
-    "end\n",
-    "3. Pattern Matching & Endless Method Definition",
-    File.join(BUILD_DIR, "preset_pattern.jsonl")
-  ),
-  run_trace(
-    "words = %w[alpha beta \#{1 + 2}]\n" \
-    "re = /prefix_\#{words.join('|')}/i\n" \
-    "puts re.match?('prefix_alpha')\n",
-    "4. Percent Literals, Regex Interpolation & Calls",
-    File.join(BUILD_DIR, "preset_literals.jsonl")
-  )
+  {
+    "name" => "1. Nested Heredoc + Trailing Opener Expression",
+    "source" =>
+      "x = <<~OUTER + 42\n" \
+      "  hello \#{<<-INNER.strip}\n" \
+      "    world\n" \
+      "  INNER\n" \
+      "  done\n" \
+      "OUTER\n" \
+      "puts x\n"
+  },
+  {
+    "name" => "2. Stabby Lambda with Heredoc Default Parameter",
+    "source" =>
+      "-> (a = <<~HEREDOC) { a.upcase }\n" \
+      "  hello lambda\n" \
+      "HEREDOC\n"
+  },
+  {
+    "name" => "3. Pattern Matching & Endless Method Definition",
+    "source" =>
+      "def classify(point) = case point\n" \
+      "in { x: (0..10) => x, y: [first, *rest] } if x > 0\n" \
+      "  [x, first, rest]\n" \
+      "else\n" \
+      "  nil\n" \
+      "end\n"
+  },
+  {
+    "name" => "4. Percent Literals, Regex Interpolation & Calls",
+    "source" =>
+      "words = %w[alpha beta \#{1 + 2}]\n" \
+      "re = /prefix_\#{words.join('|')}/i\n" \
+      "puts re.match?('prefix_alpha')\n"
+  }
 ])
 
 ruby_svg_b64 = [File.binread(File.join(PRISM_DIR, "doc/images/ruby.svg"))].pack("m0")
@@ -3670,11 +3672,13 @@ if Dir.exist?(versions_root)
     next unless File.exist?(meta_file)
 
     meta = JSON.parse(File.read(meta_file, encoding: "UTF-8"))
-    compat_file = File.join(vdir, "trace_compat.h")
-    meta["has_arena"] = if File.exist?(compat_file)
-      File.read(compat_file).include?("#define PRISM_HAS_ARENA 1")
-    else
-      !meta["version"].to_s.start_with?("1.")
+    unless meta.key?("has_arena")
+      compat_file = File.join(vdir, "trace_compat.h")
+      meta["has_arena"] = if File.exist?(compat_file)
+        File.read(compat_file).include?("#define PRISM_HAS_ARENA 1")
+      else
+        !meta["version"].to_s.start_with?("1.")
+      end
     end
     meta["wasm_b64"] = File.exist?(wasm_file) ? [File.binread(wasm_file)].pack("m0") : ""
     prism_versions << meta

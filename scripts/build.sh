@@ -136,9 +136,8 @@ build_prism_version() {
 
   local cached_wasm="$BUILD_DIR/wasm_cache/prism_trace_${sha}_${INSTRUMENT_HASH}.wasm"
 
-  # We always need native CLI for idx == 0 (to record presets)
   local need_compile=0
-  if [ "$idx" -eq 0 ] || [ ! -f "$cached_wasm" ]; then
+  if [ ! -f "$cached_wasm" ] || [ "${BUILD_CLI:-0}" = "1" ]; then
     need_compile=1
   fi
 
@@ -161,7 +160,7 @@ build_prism_version() {
       fi
     done
 
-    if [ "$idx" -eq 0 ]; then
+    if [ "${BUILD_CLI:-0}" = "1" ] && [ "$idx" -eq 0 ]; then
       cp "$ver_dir/trace_prism.c" "$BUILD_DIR/trace_prism.c"
       cp "$ver_dir/trace_node.c" "$BUILD_DIR/trace_node.c"
       cp "$ver_dir/trace_compat.h" "$BUILD_DIR/trace_compat.h"
@@ -215,8 +214,13 @@ build_prism_version() {
     semver="$(ruby -e 'puts(File.read(ARGV[0])[/#define\s+PRISM_VERSION\s+"([^"]+)"/, 1] || "unknown")' "$PRISM_DIR/include/prism/version.h")"
   fi
 
+  local has_arena="false"
+  if [ -f "$PRISM_DIR/include/prism/arena.h" ]; then
+    has_arena="true"
+  fi
+
   ruby -rjson -e '
-    id, semver, sha, short_sha, describe, date, out = ARGV
+    id, semver, sha, short_sha, describe, date, has_arena, out = ARGV
     url = sha.empty? ? "https://github.com/ruby/prism" : "https://github.com/ruby/prism/commit/#{sha}"
     label = id == "main" ? "main (v#{semver} @ #{short_sha})" : "#{id} (#{short_sha})"
     meta = {
@@ -227,10 +231,11 @@ build_prism_version() {
       "short_sha" => short_sha,
       "describe" => describe,
       "date" => date,
-      "url" => url
+      "url" => url,
+      "has_arena" => (has_arena == "true")
     }
     File.write(out, JSON.pretty_generate(meta))
-  ' "$ref" "$semver" "$sha" "$short_sha" "$describe" "$commit_date" "$ver_dir/meta.json"
+  ' "$ref" "$semver" "$sha" "$short_sha" "$describe" "$commit_date" "$has_arena" "$ver_dir/meta.json"
 }
 
 idx=0
@@ -247,7 +252,6 @@ if [ "${#REFS_TO_BUILD[@]}" -gt 1 ] && [ "$PRISM_DIR" = "$ROOT_DIR/vendor/prism"
   fi
   git -C "$PRISM_DIR" clean -fdx include src
   git -C "$PRISM_DIR" checkout --quiet "$PRIMARY_REF"
-  (cd "$PRISM_DIR" && ruby templates/template.rb)
 fi
 
 # Generate standalone web application in dist/index.html
