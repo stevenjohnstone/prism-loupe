@@ -77,29 +77,41 @@ HTML_TEMPLATE = <<~'HTML'
     display: block;
     flex-shrink: 0;
   }
-  .version-badge {
+  .version-selector-group {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    padding: 3px 8px;
-    border-radius: 5px;
-    background: var(--panel-alt);
-    border: 1px solid var(--border);
-    color: var(--text);
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  #prismVersionSelect {
     font-family: var(--font-mono);
     font-size: 11.5px;
     font-weight: 600;
-    text-decoration: none;
-    white-space: nowrap;
-    flex-shrink: 0;
+    padding: 4px 8px;
   }
-  .version-badge:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-  .version-badge .version-sha {
+  .github-commit-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 5px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
     color: var(--muted);
-    font-weight: 400;
+    text-decoration: none;
+    flex-shrink: 0;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .github-commit-btn:hover {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  .github-commit-btn svg {
+    width: 15px;
+    height: 15px;
+    fill: currentColor;
+    display: block;
   }
   select, button, input[type="file"]::file-selector-button {
     background: var(--panel-alt);
@@ -518,10 +530,11 @@ HTML_TEMPLATE = <<~'HTML'
 
 <header>
   <img src="data:image/svg+xml;base64,__RUBY_SVG_BASE64__" alt="Ruby" title="Ruby Prism Playground" class="header-logo">
-  <div class="version-badge" style="padding:1px 6px; gap:4px;">
-    <span style="color:var(--muted);">Prism</span>
-    <select id="prismVersionSelect" title="Select Prism parser version (re-traces current Ruby snippet in-place)" style="background:transparent; border:none; color:var(--text); font-family:var(--font-mono); font-size:11px; font-weight:600; padding:1px 2px; cursor:pointer; outline:none;"></select>
-    <a id="prismVersionCommitLink" class="version-sha" href="__PRISM_COMMIT_URL__" target="_blank" rel="noopener" title="__PRISM_VERSION_TITLE__" style="text-decoration:none;">(__PRISM_SHORT_SHA__) &#8599;</a>
+  <div class="version-selector-group">
+    <select id="prismVersionSelect" title="Select Prism parser version (re-traces current Ruby snippet in-place)"></select>
+    <a id="prismVersionCommitLink" class="github-commit-btn" href="__PRISM_COMMIT_URL__" target="_blank" rel="noopener" aria-label="View Prism commit on GitHub" title="__PRISM_VERSION_TITLE__">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
+    </a>
   </div>
   <button id="btnPlayPause" class="success" style="min-width:68px;" title="Play / Pause automatic playthrough (Spacebar)">&#9654; Play</button>
   <button id="btnPrev" class="primary" title="Step backward 1 trace event (Left Arrow)">&larr; Step</button>
@@ -832,16 +845,17 @@ function updateVersionBadgeUI() {
   }
   if (prismVersionCommitLink) {
     prismVersionCommitLink.href = PRISM_BUILD_INFO.url || 'https://github.com/ruby/prism';
-    prismVersionCommitLink.innerHTML = `(${escapeHtml(PRISM_BUILD_INFO.short_sha)}) &#8599;`;
     const datePart = PRISM_BUILD_INFO.date ? `, ${PRISM_BUILD_INFO.date}` : '';
-    prismVersionCommitLink.title = `Built with Prism v${PRISM_BUILD_INFO.version} (${PRISM_BUILD_INFO.describe}${datePart}) — click to view commit on GitHub`;
+    prismVersionCommitLink.title = `View Prism ${PRISM_BUILD_INFO.id} (${PRISM_BUILD_INFO.short_sha}${datePart}) on GitHub`;
   }
 }
 
 PRISM_VERSIONS.forEach((v) => {
   const opt = document.createElement('option');
   opt.value = v.id;
-  opt.textContent = v.id === 'main' ? `main (v${v.version})` : v.id;
+  opt.textContent = v.id === 'main'
+    ? `Prism main (${v.short_sha})`
+    : `Prism ${v.id} (${v.short_sha})`;
   opt.style.background = '#161b22';
   opt.style.color = '#e6edf3';
   prismVersionSelect.appendChild(opt);
