@@ -518,10 +518,11 @@ HTML_TEMPLATE = <<~'HTML'
 
 <header>
   <img src="data:image/svg+xml;base64,__RUBY_SVG_BASE64__" alt="Ruby" title="Ruby Prism Playground" class="header-logo">
-  <a id="prismVersionBadge" class="version-badge" href="__PRISM_COMMIT_URL__" target="_blank" rel="noopener" title="__PRISM_VERSION_TITLE__">
-    <span>Prism v__PRISM_VERSION__</span>
-    <span class="version-sha">(__PRISM_SHORT_SHA__)</span>
-  </a>
+  <div class="version-badge" style="padding:1px 6px; gap:4px;">
+    <span style="color:var(--muted);">Prism</span>
+    <select id="prismVersionSelect" title="Select Prism parser version (re-traces current Ruby snippet in-place)" style="background:transparent; border:none; color:var(--text); font-family:var(--font-mono); font-size:11px; font-weight:600; padding:1px 2px; cursor:pointer; outline:none;"></select>
+    <a id="prismVersionCommitLink" class="version-sha" href="__PRISM_COMMIT_URL__" target="_blank" rel="noopener" title="__PRISM_VERSION_TITLE__" style="text-decoration:none;">(__PRISM_SHORT_SHA__) &#8599;</a>
+  </div>
   <button id="btnPlayPause" class="success" style="min-width:68px;" title="Play / Pause automatic playthrough (Spacebar)">&#9654; Play</button>
   <button id="btnPrev" class="primary" title="Step backward 1 trace event (Left Arrow)">&larr; Step</button>
   <button id="btnNext" class="primary" title="Step forward 1 trace event (Right Arrow)">Step &rarr;</button>
@@ -723,8 +724,9 @@ HTML_TEMPLATE = <<~'HTML'
 
 <script>
 const PRESETS = __PRESETS_JSON__;
-const WASM_BASE64 = "__WASM_BASE64__";
-const PRISM_BUILD_INFO = __PRISM_BUILD_INFO_JSON__;
+const PRISM_VERSIONS = __PRISM_VERSIONS_JSON__;
+let currentPrismVersionIdx = 0;
+let PRISM_BUILD_INFO = PRISM_VERSIONS[0] || __PRISM_BUILD_INFO_JSON__;
 const REPO_ROOT_STORAGE = 'prism_trace_repo_root';
 const PLAY_INTERVAL_STORAGE = 'prism_trace_play_interval_ms';
 const DEFAULT_PLAY_INTERVAL_MS = 250;
@@ -769,7 +771,7 @@ function setPlayIntervalMs(rawMs) {
   return clamped;
 }
 
-let wasmBytes = null;
+const wasmBytesCache = new Map();
 let wasmExports = null;
 let currentTrace = null;
 let currentIdx = 0;
@@ -820,17 +822,81 @@ PRESETS.forEach((p, i) => {
   presetSelect.appendChild(opt);
 });
 
+const prismVersionSelect = document.getElementById('prismVersionSelect');
+const prismVersionCommitLink = document.getElementById('prismVersionCommitLink');
+
+function updateVersionBadgeUI() {
+  if (!PRISM_BUILD_INFO) return;
+  if (prismVersionSelect) {
+    prismVersionSelect.value = PRISM_BUILD_INFO.id;
+  }
+  if (prismVersionCommitLink) {
+    prismVersionCommitLink.href = PRISM_BUILD_INFO.url || 'https://github.com/ruby/prism';
+    prismVersionCommitLink.innerHTML = `(${escapeHtml(PRISM_BUILD_INFO.short_sha)}) &#8599;`;
+    const datePart = PRISM_BUILD_INFO.date ? `, ${PRISM_BUILD_INFO.date}` : '';
+    prismVersionCommitLink.title = `Built with Prism v${PRISM_BUILD_INFO.version} (${PRISM_BUILD_INFO.describe}${datePart}) — click to view commit on GitHub`;
+  }
+}
+
+PRISM_VERSIONS.forEach((v) => {
+  const opt = document.createElement('option');
+  opt.value = v.id;
+  opt.textContent = v.id === 'main' ? `main (v${v.version})` : v.id;
+  opt.style.background = '#161b22';
+  opt.style.color = '#e6edf3';
+  prismVersionSelect.appendChild(opt);
+});
+updateVersionBadgeUI();
+
+function findPrismVersionIndex(query) {
+  if (!query) return -1;
+  const q = String(query).trim();
+  let idx = PRISM_VERSIONS.findIndex(v => v.id === q);
+  if (idx >= 0) return idx;
+  idx = PRISM_VERSIONS.findIndex(v => v.id === 'v' + q || v.version === q.replace(/^v/, ''));
+  if (idx >= 0) return idx;
+  idx = PRISM_VERSIONS.findIndex(v => v.short_sha === q || (v.sha && v.sha.startsWith(q)));
+  return idx;
+}
+
+async function selectPrismVersion(versionQuery, reparse = true) {
+  const idx = findPrismVersionIndex(versionQuery);
+  if (idx < 0) return false;
+  currentPrismVersionIdx = idx;
+  PRISM_BUILD_INFO = PRISM_VERSIONS[idx];
+  wasmExports = null;
+  updateVersionBadgeUI();
+  updateBrowserUrlVersionOnly();
+  await initWasm();
+  if (reparse && currentTrace) {
+    const editor = document.getElementById('rubyEditor');
+    const isEditing = editor && editor.style.display !== 'none';
+    const src = isEditing ? editor.value : currentTrace.source;
+    const hasCodeInUrl = new URLSearchParams(window.location.search).has('code');
+    await parseWithWasm(src, currentTrace.name, hasCodeInUrl || isEditing);
+  }
+  return true;
+}
+
+prismVersionSelect.addEventListener('change', async (e) => {
+  await selectPrismVersion(e.target.value, true);
+});
+
 async function initWasm() {
   const statusEl = document.getElementById('wasmStatus');
-  if (!WASM_BASE64) {
+  const verObj = PRISM_VERSIONS[currentPrismVersionIdx] || PRISM_BUILD_INFO;
+  const b64 = verObj ? verObj.wasm_b64 : '';
+  if (!b64) {
     statusEl.textContent = 'Wasm: not embedded';
     return;
   }
   try {
-    if (!wasmBytes) {
-      const binStr = atob(WASM_BASE64);
-      wasmBytes = new Uint8Array(binStr.length);
-      for (let i = 0; i < binStr.length; i++) wasmBytes[i] = binStr.charCodeAt(i);
+    let bytes = wasmBytesCache.get(verObj.id);
+    if (!bytes) {
+      const binStr = atob(b64);
+      bytes = new Uint8Array(binStr.length);
+      for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+      wasmBytesCache.set(verObj.id, bytes);
     }
 
     const wasiImport = new Proxy({
@@ -839,18 +905,18 @@ async function initWasm() {
       get: (t, p) => (p in t ? t[p] : () => 0)
     });
 
-    const { instance } = await WebAssembly.instantiate(wasmBytes, { wasi_snapshot_preview1: wasiImport });
+    const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasiImport });
     if (instance.exports._initialize) instance.exports._initialize();
     wasmExports = instance.exports;
     if (!statusEl.innerHTML.includes('Crash captured')) {
-      statusEl.innerHTML = `<span style="color:var(--green)">● Wasm ready (Prism v${PRISM_BUILD_INFO.version} @ ${PRISM_BUILD_INFO.short_sha})</span>`;
+      statusEl.innerHTML = `<span style="color:var(--green)">● Wasm ready (Prism ${escapeHtml(PRISM_BUILD_INFO.id)} @ ${escapeHtml(PRISM_BUILD_INFO.short_sha)})</span>`;
     }
   } catch (err) {
     statusEl.innerHTML = `<span style="color:var(--red)">Wasm init error: ${err.message}</span>`;
   }
 }
 
-async function parseWithWasm(rubyCode, label = 'Live Wasm Parse') {
+async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode = true) {
   if (!wasmExports) {
     await initWasm();
     if (!wasmExports) {
@@ -930,7 +996,11 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse') {
 
   const dt = (performance.now() - t0).toFixed(1);
   loadTrace({ name: label, source: meta.source, steps }, false);
-  updateBrowserUrlWithCode(rubyCode);
+  if (updateUrlCode) {
+    updateBrowserUrlWithCode(rubyCode);
+  } else {
+    updateBrowserUrlVersionOnly();
+  }
 
   const hasCrash = currentTrace._crashIdx >= 0;
   const hasUnderflow = currentTrace._underflowIdx >= 0;
@@ -970,14 +1040,33 @@ function decodeCodeBase64(b64) {
 
 function buildShareableUrl(rubyCode) {
   const url = new URL(window.location.href);
+  if (PRISM_BUILD_INFO && PRISM_BUILD_INFO.id) {
+    url.searchParams.set('version', PRISM_BUILD_INFO.id);
+  }
   url.searchParams.set('code', encodeCodeBase64(rubyCode));
   return url.toString();
+}
+
+function updateBrowserUrlVersionOnly() {
+  try {
+    const url = new URL(window.location.href);
+    if (PRISM_BUILD_INFO && PRISM_BUILD_INFO.id) {
+      if (currentPrismVersionIdx === 0 && !url.searchParams.has('code') && !url.searchParams.has('version')) {
+        return;
+      }
+      url.searchParams.set('version', PRISM_BUILD_INFO.id);
+      window.history.replaceState(null, '', url.toString());
+    }
+  } catch (_) {}
 }
 
 function updateBrowserUrlWithCode(rubyCode) {
   try {
     if (typeof rubyCode === 'string' && rubyCode.length <= 16384) {
       const url = new URL(window.location.href);
+      if (PRISM_BUILD_INFO && PRISM_BUILD_INFO.id) {
+        url.searchParams.set('version', PRISM_BUILD_INFO.id);
+      }
       url.searchParams.set('code', encodeCodeBase64(rubyCode));
       window.history.replaceState(null, '', url.toString());
     }
@@ -2677,9 +2766,14 @@ function attachTrackScrubber(trackEl) {
 }
 attachTrackScrubber(document.getElementById('timelineTrack'));
 
-presetSelect.addEventListener('change', (e) => {
+presetSelect.addEventListener('change', async (e) => {
   clearBrowserUrlCodeParam();
-  loadTrace(PRESETS[parseInt(e.target.value, 10)]);
+  const preset = PRESETS[parseInt(e.target.value, 10)];
+  if (currentPrismVersionIdx === 0) {
+    loadTrace(preset);
+  } else {
+    await parseWithWasm(preset.source, preset.name, false);
+  }
 });
 
 document.getElementById('fileInput').addEventListener('change', (e) => {
@@ -2972,9 +3066,16 @@ function buildTraceSummaryObject() {
     }
   }
   const crashStep = currentTrace._crashIdx >= 0 ? steps[currentTrace._crashIdx] : null;
+  const { wasm_b64, ...cleanBuildInfo } = PRISM_BUILD_INFO || {};
   return {
     name: currentTrace.name,
-    prismBuild: PRISM_BUILD_INFO,
+    prismBuild: cleanBuildInfo,
+    availableVersions: PRISM_VERSIONS.map(v => ({
+      id: v.id,
+      version: v.version,
+      short_sha: v.short_sha,
+      date: v.date
+    })),
     source: currentTrace.source,
     sourceBytes: new TextEncoder().encode(currentTrace.source).length,
     shareUrl: buildShareableUrl(currentTrace.source),
@@ -3053,6 +3154,10 @@ async function registerWebMcpTools() {
             type: 'string',
             description: 'Ruby source code snippet to parse and trace with Prism.'
           },
+          version: {
+            type: 'string',
+            description: `Optional Prism version ID to trace with (${PRISM_VERSIONS.map(v => v.id).join(', ')}).`
+          },
           jumpTo: {
             type: 'string',
             enum: ['start', 'end', 'crash', 'underflow'],
@@ -3062,6 +3167,9 @@ async function registerWebMcpTools() {
         required: ['code']
       },
       handler: async (input) => {
+        if (input && input.version) {
+          await selectPrismVersion(input.version, false);
+        }
         const code = String(input && input.code !== undefined ? input.code : '');
         document.getElementById('rubyEditor').value = code;
         await parseWithWasm(code, 'WebMCP Input');
@@ -3268,10 +3376,16 @@ async function registerWebMcpTools() {
   loadTrace(PRESETS[0]);
   await registerWebMcpTools();
   const params = new URLSearchParams(window.location.search);
+  const versionParam = params.get('version');
   const codeParam = params.get('code');
   const stepParam = params.get('step');
-  await initWasm();
-  if (codeParam !== null && codeParam !== '') {
+  const hasCodeParam = (codeParam !== null && codeParam !== '');
+  if (versionParam) {
+    await selectPrismVersion(versionParam, !hasCodeParam);
+  } else {
+    await initWasm();
+  }
+  if (hasCodeParam) {
     try {
       const decoded = decodeCodeBase64(codeParam);
       document.getElementById('rubyEditor').value = decoded;
@@ -3340,8 +3454,6 @@ presets.concat([
   )
 ])
 
-wasm_path = File.join(BUILD_DIR, "prism_trace.wasm")
-wasm_b64 = File.exist?(wasm_path) ? [File.binread(wasm_path)].pack("m0") : ""
 ruby_svg_b64 = [File.binread(File.join(PRISM_DIR, "doc/images/ruby.svg"))].pack("m0")
 
 version_h_path = File.join(PRISM_DIR, "include/prism/version.h")
@@ -3358,26 +3470,52 @@ prism_short_sha = "local" if prism_short_sha.empty?
 prism_describe = "v#{prism_semver}" if prism_describe.empty?
 prism_commit_url = prism_sha.empty? ? "https://github.com/ruby/prism" : "https://github.com/ruby/prism/commit/#{prism_sha}"
 prism_version_title = "Built with Prism v#{prism_semver} (#{prism_describe}#{prism_date.empty? ? '' : ", #{prism_date}"}) — click to view commit on GitHub"
-prism_build_info = {
-  "version" => prism_semver,
-  "sha" => prism_sha,
-  "short_sha" => prism_short_sha,
-  "describe" => prism_describe,
-  "date" => prism_date,
-  "url" => prism_commit_url
-}
+
+prism_versions = []
+versions_root = File.join(BUILD_DIR, "versions")
+if Dir.exist?(versions_root)
+  Dir.children(versions_root).sort.each do |entry|
+    vdir = File.join(versions_root, entry)
+    meta_file = File.join(vdir, "meta.json")
+    wasm_file = File.join(vdir, "prism_trace.wasm")
+    next unless File.exist?(meta_file)
+
+    meta = JSON.parse(File.read(meta_file, encoding: "UTF-8"))
+    meta["wasm_b64"] = File.exist?(wasm_file) ? [File.binread(wasm_file)].pack("m0") : ""
+    prism_versions << meta
+  end
+end
+
+if prism_versions.empty?
+  wasm_path = File.join(BUILD_DIR, "prism_trace.wasm")
+  wasm_b64 = File.exist?(wasm_path) ? [File.binread(wasm_path)].pack("m0") : ""
+  prism_versions << {
+    "id" => prism_describe,
+    "label" => "#{prism_describe} (#{prism_short_sha})",
+    "version" => prism_semver,
+    "sha" => prism_sha,
+    "short_sha" => prism_short_sha,
+    "describe" => prism_describe,
+    "date" => prism_date,
+    "url" => prism_commit_url,
+    "wasm_b64" => wasm_b64
+  }
+end
+
+primary_info = prism_versions.first
 
 html = HTML_TEMPLATE
   .sub("__RUBY_SVG_BASE64__") { ruby_svg_b64 }
-  .sub("__PRISM_VERSION__") { prism_semver }
-  .sub("__PRISM_SHORT_SHA__") { prism_short_sha }
-  .sub("__PRISM_COMMIT_URL__") { prism_commit_url }
+  .sub("__PRISM_VERSION__") { primary_info["version"] }
+  .sub("__PRISM_SHORT_SHA__") { primary_info["short_sha"] }
+  .sub("__PRISM_COMMIT_URL__") { primary_info["url"] }
   .sub("__PRISM_VERSION_TITLE__") { prism_version_title }
-  .sub("__PRISM_BUILD_INFO_JSON__") { JSON.generate(prism_build_info) }
+  .sub("__PRISM_BUILD_INFO_JSON__") { JSON.generate(primary_info) }
+  .sub("__PRISM_VERSIONS_JSON__") { JSON.generate(prism_versions) }
   .sub("__PRESETS_JSON__") { JSON.generate(presets) }
-  .sub("__WASM_BASE64__") { wasm_b64 }
 
 out_html = OUT_HTML
 FileUtils.mkdir_p(File.dirname(out_html))
 File.write(out_html, html, encoding: "UTF-8")
-puts "Generated standalone interactive viewer at #{out_html} (embedded Wasm: #{wasm_b64.bytesize} base64 chars)"
+version_labels = prism_versions.map { |v| "#{v['id']}@#{v['short_sha']}" }.join(", ")
+puts "Generated standalone interactive viewer at #{out_html} (embedded versions: #{version_labels})"

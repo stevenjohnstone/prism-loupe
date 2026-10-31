@@ -25,12 +25,17 @@ jobs:
         id: pages
         uses: actions/configure-pages@v6
 
-      - name: Cache WASI SDK
+      - name: Cache WASI SDK & Wasm Builds
         id: cache-wasi
         uses: actions/cache@v6
         with:
-          path: vendor/wasi-sdk
-          key: wasi-sdk-33.0-linux-x86_64
+          path: |
+            vendor/wasi-sdk
+            build/wasm_cache
+          key: wasi-sdk-33.0-linux-x86_64-${{ hashFiles('src/instrument.rb', 'src/trace_runtime.c', 'src/trace_runtime.h', 'src/trace_main.c') }}
+          restore-keys: |
+            wasi-sdk-33.0-linux-x86_64-
+            wasi-sdk-33.0-linux-x86_64
 
       - name: Build Prism Playground (Presets + WebAssembly + HTML)
         run: ./scripts/build.sh

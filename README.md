@@ -11,7 +11,7 @@ An interactive, single-file, in-browser C99 parser, lexer, and AST execution vis
 ### 1. In-Browser WebAssembly Tracing
 - **Live Ruby Editing**: Double-click the Ruby source buffer (or click **`✎ Edit Code`**) and press **`⌘+Enter` / `Ctrl+Enter`** to parse and trace any Ruby snippet directly in the browser via an embedded WASI WebAssembly build of Prism (`build/prism_trace.wasm`).
 - **Fine-Grained Execution Events**: Records every `PARSE_ENTER`, `PARSE_EXIT`, `LEX_TOKEN`, `LEX_MODE_PUSH`, `LEX_MODE_POP`, `LEX_STATE`, `HEREDOC_FLUSH`, `NODE_NEW`, `NODE_LIST_APPEND`, `ERROR`, and `CRASH` transition while preserving exact upstream C source filenames and line numbers.
-- **Version & Commit Provenance**: Displays the exact upstream `ruby/prism` semantic version and commit SHA badge in the header, linking directly to the corresponding commit on GitHub.
+- **Multi-Version In-Browser Switcher**: Includes an interactive header selector for the last two minor releases of the current major version, the final release of the previous major version, and `main` (e.g. `v2.1.0`, `v2.0.0`, `v1.9.0`, and `main`), each linked to its exact commit on GitHub. Switching versions swaps the in-memory Wasm module and re-traces the active snippet in-place.
 - **File Import**: Load `.rb` source files directly into the in-browser Wasm tracer (`📂 .rb`) or inspect pre-recorded `.jsonl` trace files (`📂 .jsonl`).
 
 ### 2. Interactive Timeline, Navigation & Playback
@@ -44,7 +44,7 @@ An interactive, single-file, in-browser C99 parser, lexer, and AST execution vis
   - Live bottom-up AST forest distinguishing active candidate roots from superseded/orphaned nodes, with hover-to-highlight source spans and warnings for inverted node locations (`end < start`).
 
 ### 4. Shareable URLs & Instant Video Export
-- **Shareable Links (`?code=`)**: Click **`🔗 Share`** to copy a URL with the current Ruby snippet Base64-encoded in the `?code=` query parameter (and optional `&step=<n|underflow|crash>` deep-linking). Opening the URL automatically decodes and traces the snippet in Wasm.
+- **Shareable Links (`?version=` & `?code=`)**: Click **`🔗 Share`** to copy a URL with the selected Prism version (`?version=`) and current Ruby snippet Base64-encoded in `?code=` (plus optional `&step=<n|underflow|crash>` deep-linking). Opening the URL automatically selects the requested Prism version, decodes the snippet, and traces it in Wasm.
 - **Instant Playthrough Video Export (`🎬 Video`)**: Click **`🎬 Video`** in the Source Input toolbar to generate a high-DPI `.webm` video of the Ruby source buffer being lexed and parsed step-by-step.
   - Uses the browser's **WebCodecs API** (`VideoEncoder` + `VideoFrame`) and a built-in WebM/EBML muxer to encode the entire playthrough faster-than-realtime (e.g., ~200 steps in under a second), paced to your configured playback interval (with automatic fallback to `MediaRecorder`).
 
@@ -70,11 +70,11 @@ make build
 ```
 
 This runs `./scripts/build.sh`, which:
-1. Clones `ruby/prism` at the commit specified in [`PRISM_VERSION`](PRISM_VERSION) into `vendor/prism` and runs `ruby templates/template.rb`.
+1. Clones `ruby/prism` into `vendor/prism` and automatically discovers the target versions to embed: the last two minor releases of the current major version, the last release of the previous major version, and `main` (currently `v2.1.0`, `v2.0.0`, `v1.9.0`, and `main`).
 2. Downloads `wasi-sdk` into `vendor/wasi-sdk` (if not already present).
-3. Instruments `src/prism.c` and `src/node.c` via [`src/instrument.rb`](src/instrument.rb) while preserving exact `#line` directives.
-4. Builds both the native CLI (`build/prism_trace`) and the in-browser WebAssembly reactor (`build/prism_trace.wasm`).
-5. Generates the self-contained single-page application at `dist/index.html` via [`src/make_viewer.rb`](src/make_viewer.rb).
+3. For each target version, runs `ruby templates/template.rb`, instruments `src/prism.c` and `src/node.c` via [`src/instrument.rb`](src/instrument.rb) (preserving exact `#line` directives and generating compatibility macros in `trace_compat.h`), and compiles its WebAssembly reactor (`build/versions/<idx>/prism_trace.wasm`, cached in `build/wasm_cache/`).
+4. Builds the native CLI (`build/prism_trace`) for the default (latest) release.
+5. Generates the self-contained single-page application at `dist/index.html` via [`src/make_viewer.rb`](src/make_viewer.rb) with all compiled Wasm modules embedded.
 
 To regenerate `dist/index.html` after editing only [`src/make_viewer.rb`](src/make_viewer.rb):
 
@@ -88,16 +88,19 @@ To start a local HTTP server on `http://localhost:8080`:
 make serve
 ```
 
-### Building Against a Custom Prism Commit or Local Checkout
+### Building Custom Prism Versions or Local Checkouts
 
-Default versions are configured in [`PRISM_VERSION`](PRISM_VERSION) using `${VAR:-default}` fallbacks, so you can either edit [`PRISM_VERSION`](PRISM_VERSION) directly or override them via environment variables:
+By default, `./scripts/build.sh` builds the last two minor releases of the current major version, the final release of the previous major version, and `main`. You can override this via environment variables:
 
 ```bash
-# Build against a specific upstream commit, tag, or branch:
+# Build a custom space-separated list of upstream refs/tags/commits:
+PRISM_REFS="v2.1.0 v1.9.0 main" make build
+
+# Or build a single specific upstream commit, tag, or branch:
 PRISM_REF=v1.9.0 make build
 
-# Re-fetch and checkout a moving branch ref from origin:
-PRISM_REF=main FORCE_PRISM_CHECKOUT=1 make build
+# Re-fetch and checkout moving branch refs from origin:
+FORCE_PRISM_CHECKOUT=1 make build
 
 # Or build against an existing local Prism checkout without modifying vendor/prism:
 PRISM_DIR=/path/to/local/prism make build

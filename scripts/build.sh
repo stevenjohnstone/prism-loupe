@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Load default Prism repo/ref and WASI SDK version
+# Load default Prism repo and WASI SDK version
 source "$ROOT_DIR/PRISM_VERSION"
 
 PRISM_DIR="${PRISM_DIR:-$ROOT_DIR/vendor/prism}"
@@ -13,33 +13,17 @@ DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 
 mkdir -p "$BUILD_DIR" "$DIST_DIR"
 
-# 1. Ensure Prism checkout exists and is at the desired ref (unless custom PRISM_DIR was passed)
+# 1. Ensure Prism checkout exists
 if [ ! -d "$PRISM_DIR/.git" ] && [ ! -f "$PRISM_DIR/src/prism.c" ]; then
   echo "==> Cloning Prism ($PRISM_REPO) into $PRISM_DIR..."
   mkdir -p "$(dirname "$PRISM_DIR")"
   git clone "$PRISM_REPO" "$PRISM_DIR"
-  git -C "$PRISM_DIR" checkout "$PRISM_REF"
-elif [ "$PRISM_DIR" = "$ROOT_DIR/vendor/prism" ] && [ -d "$PRISM_DIR/.git" ]; then
-  CUR_SHA="$(git -C "$PRISM_DIR" rev-parse HEAD)"
-  TARGET_SHA="$(git -C "$PRISM_DIR" rev-parse "$PRISM_REF^{commit}" 2>/dev/null || true)"
-  if [ "$CUR_SHA" != "$TARGET_SHA" ] || [ -n "${FORCE_PRISM_CHECKOUT:-}" ]; then
-    echo "==> Updating $PRISM_DIR to $PRISM_REF..."
-    if [ -z "$TARGET_SHA" ] || [ -n "${FORCE_PRISM_CHECKOUT:-}" ]; then
-      git -C "$PRISM_DIR" fetch origin
-    fi
-    git -C "$PRISM_DIR" clean -fdx include src
-    git -C "$PRISM_DIR" checkout "$PRISM_REF"
-    (cd "$PRISM_DIR" && ruby templates/template.rb)
-  fi
+elif [ "$PRISM_DIR" = "$ROOT_DIR/vendor/prism" ] && [ -d "$PRISM_DIR/.git" ] && [ -n "${FORCE_PRISM_CHECKOUT:-}" ]; then
+  echo "==> Fetching latest tags and branches from origin in $PRISM_DIR..."
+  git -C "$PRISM_DIR" fetch --tags origin
 fi
 
-# 2. Generate Prism template files (src/node.c, include/prism/ast.h, etc.) if missing
-if [ ! -f "$PRISM_DIR/src/node.c" ] || [ ! -f "$PRISM_DIR/include/prism/ast.h" ]; then
-  echo "==> Running templates/template.rb in $PRISM_DIR..."
-  (cd "$PRISM_DIR" && ruby templates/template.rb)
-fi
-
-# 3. Locate or download WASI SDK for in-browser WebAssembly compilation
+# 2. Locate or download WASI SDK for in-browser WebAssembly compilation
 if [ -z "${WASI_SDK_PATH:-}" ]; then
   if [ -x "$ROOT_DIR/vendor/wasi-sdk/bin/clang" ]; then
     WASI_SDK_PATH="$ROOT_DIR/vendor/wasi-sdk"
@@ -72,53 +56,201 @@ if [ -z "${WASI_SDK_PATH:-}" ]; then
   fi
 fi
 
-# 4. Instrument Prism's src/prism.c and src/node.c
-echo "==> Instrumenting Prism sources from $PRISM_DIR..."
-ruby "$ROOT_DIR/src/instrument.rb" "$PRISM_DIR" "$BUILD_DIR"
-
-# Collect supporting Prism C files (excluding src/prism.c and src/node.c which are replaced by instrumented copies)
-PRISM_SUPPORT_SRCS=()
-for f in "$PRISM_DIR"/src/*.c "$PRISM_DIR"/src/util/*.c; do
-  [ -e "$f" ] || continue
-  base="$(basename "$f")"
-  if [ "$base" != "prism.c" ] && [ "$base" != "node.c" ]; then
-    PRISM_SUPPORT_SRCS+=("$f")
-  fi
-done
-
-# 5. Compile native trace CLI (used to generate built-in presets)
-echo "==> Compiling native prism_trace CLI..."
-${CC:-cc} -O0 -g -std=c99 -D_POSIX_C_SOURCE=200809L \
-  -I"$BUILD_DIR" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
-  "$BUILD_DIR/trace_prism.c" \
-  "$BUILD_DIR/trace_node.c" \
-  "$ROOT_DIR/src/trace_runtime.c" \
-  "$ROOT_DIR/src/trace_main.c" \
-  "${PRISM_SUPPORT_SRCS[@]}" \
-  -o "$BUILD_DIR/prism_trace"
-
-# 6. Compile WebAssembly trace reactor module for live in-browser tracing
-if [ -n "${WASI_SDK_PATH:-}" ] && [ -x "${WASI_SDK_PATH}/bin/clang" ]; then
-  echo "==> Building in-browser WebAssembly module with ${WASI_SDK_PATH}..."
-  "${WASI_SDK_PATH}/bin/clang" --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
-    -DPRISM_EXPORT_SYMBOLS -DPRISM_EXCLUDE_PRETTYPRINT -DPRISM_EXCLUDE_JSON \
-    -D_WASI_EMULATED_MMAN -lwasi-emulated-mman \
-    -I"$BUILD_DIR" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
-    -std=c99 \
-    -Wl,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer \
-    -Wl,-z,stack-size=8388608 \
-    -Wl,--gc-sections -Wl,--strip-all -Wl,--no-entry -mexec-model=reactor \
-    -Oz -g0 -fdata-sections -ffunction-sections \
-    -o "$BUILD_DIR/prism_trace.wasm" \
-    "$BUILD_DIR/trace_prism.c" \
-    "$BUILD_DIR/trace_node.c" \
-    "$ROOT_DIR/src/trace_runtime.c" \
-    "${PRISM_SUPPORT_SRCS[@]}"
+# 3. Determine which Prism version(s) to build
+REFS_TO_BUILD=()
+if [ "$PRISM_DIR" != "$ROOT_DIR/vendor/prism" ]; then
+  REFS_TO_BUILD=("local")
+elif [ -n "${PRISM_REF:-}" ]; then
+  REFS_TO_BUILD=("$PRISM_REF")
+elif [ -n "${PRISM_REFS:-}" ]; then
+  read -r -a REFS_TO_BUILD <<< "$PRISM_REFS"
 else
-  echo "⚠ Warning: WASI SDK not found; viewer will be generated with presets only (no live in-browser Wasm)."
+  # Auto-select: last 2 minor releases in current major + last release from previous major + main
+  AUTO_REFS="$(ruby -e '
+    tags = `git -C "#{ARGV[0]}" tag -l`.lines.map(&:strip)
+    parsed = tags.filter_map do |t|
+      if t =~ /\Av(\d+)\.(\d+)\.(\d+)\z/
+        [$1.to_i, $2.to_i, $3.to_i, t]
+      end
+    end
+    by_minor = {}
+    parsed.sort.each { |maj, min, pat, t| by_minor[[maj, min]] = t }
+    majors = by_minor.keys.map(&:first).uniq.sort
+    selected = []
+    if (cur_maj = majors.last)
+      cur_minors = by_minor.select { |(maj, _), _| maj == cur_maj }.sort_by(&:first).map(&:last)
+      selected.concat(cur_minors.last(2).reverse)
+      prev_maj = cur_maj - 1
+      prev_minors = by_minor.select { |(maj, _), _| maj == prev_maj }.sort_by(&:first).map(&:last)
+      selected << prev_minors.last if prev_minors.any?
+    end
+    selected << "main"
+    puts selected.uniq.join(" ")
+  ' "$PRISM_DIR")"
+  read -r -a REFS_TO_BUILD <<< "$AUTO_REFS"
 fi
 
-# 7. Generate standalone web application in dist/index.html
+echo "==> Prism version(s) to build: ${REFS_TO_BUILD[*]}"
+
+rm -rf "$BUILD_DIR/versions"
+mkdir -p "$BUILD_DIR/versions" "$BUILD_DIR/wasm_cache"
+
+INSTRUMENT_HASH="$(shasum -a 256 "$ROOT_DIR/src/instrument.rb" "$ROOT_DIR/src/trace_runtime.c" "$ROOT_DIR/src/trace_runtime.h" | shasum -a 256 | awk '{print $1}' | cut -c1-16)"
+
+build_prism_version() {
+  local idx="$1"
+  local ref="$2"
+  local ver_dir="$BUILD_DIR/versions/$(printf "%02d" "$idx")"
+  mkdir -p "$ver_dir"
+
+  if [ "$PRISM_DIR" = "$ROOT_DIR/vendor/prism" ] && [ -d "$PRISM_DIR/.git" ]; then
+    local target_ref="$ref"
+    if [ "$ref" = "main" ] && git -C "$PRISM_DIR" rev-parse --verify --quiet origin/main >/dev/null; then
+      target_ref="origin/main"
+    fi
+    local cur_sha
+    cur_sha="$(git -C "$PRISM_DIR" rev-parse HEAD)"
+    local target_sha
+    target_sha="$(git -C "$PRISM_DIR" rev-parse "${target_ref}^{commit}" 2>/dev/null || true)"
+    if [ -z "$target_sha" ]; then
+      echo "==> Fetching $ref from origin..."
+      git -C "$PRISM_DIR" fetch origin "$ref"
+      target_sha="$(git -C "$PRISM_DIR" rev-parse "FETCH_HEAD^{commit}")"
+      target_ref="$target_sha"
+    fi
+    if [ "$cur_sha" != "$target_sha" ]; then
+      echo "==> Checking out Prism $ref ($target_sha)..."
+      git -C "$PRISM_DIR" clean -fdx include src
+      git -C "$PRISM_DIR" checkout --quiet "$target_ref"
+    fi
+  fi
+
+  local sha
+  sha="$(git -C "$PRISM_DIR" rev-parse HEAD 2>/dev/null || echo "")"
+  local short_sha
+  short_sha="$(git -C "$PRISM_DIR" rev-parse --short=9 HEAD 2>/dev/null || echo "local")"
+  local describe
+  describe="$(git -C "$PRISM_DIR" describe --tags --always 2>/dev/null || echo "$ref")"
+  local commit_date
+  commit_date="$(git -C "$PRISM_DIR" show -s --format=%cs HEAD 2>/dev/null || echo "")"
+
+  local cached_wasm="$BUILD_DIR/wasm_cache/prism_trace_${sha}_${INSTRUMENT_HASH}.wasm"
+
+  # We always need native CLI for idx == 0 (to record presets)
+  local need_compile=0
+  if [ "$idx" -eq 0 ] || [ ! -f "$cached_wasm" ]; then
+    need_compile=1
+  fi
+
+  if [ "$need_compile" -eq 1 ]; then
+    if [ ! -f "$PRISM_DIR/src/node.c" ] || [ ! -f "$PRISM_DIR/include/prism/ast.h" ]; then
+      echo "==> Running templates/template.rb for Prism $ref..."
+      (cd "$PRISM_DIR" && ruby templates/template.rb)
+    fi
+
+    echo "==> Instrumenting Prism $ref ($short_sha)..."
+    ruby "$ROOT_DIR/src/instrument.rb" "$PRISM_DIR" "$ver_dir"
+
+    local support_srcs=()
+    for f in "$PRISM_DIR"/src/*.c "$PRISM_DIR"/src/util/*.c; do
+      [ -e "$f" ] || continue
+      local base
+      base="$(basename "$f")"
+      if [ "$base" != "prism.c" ] && [ "$base" != "node.c" ]; then
+        support_srcs+=("$f")
+      fi
+    done
+
+    if [ "$idx" -eq 0 ]; then
+      cp "$ver_dir/trace_prism.c" "$BUILD_DIR/trace_prism.c"
+      cp "$ver_dir/trace_node.c" "$BUILD_DIR/trace_node.c"
+      cp "$ver_dir/trace_compat.h" "$BUILD_DIR/trace_compat.h"
+      echo "==> Compiling native prism_trace CLI ($ref)..."
+      ${CC:-cc} -O0 -g -std=c99 -D_POSIX_C_SOURCE=200809L \
+        -I"$ver_dir" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
+        "$ver_dir/trace_prism.c" \
+        "$ver_dir/trace_node.c" \
+        "$ROOT_DIR/src/trace_runtime.c" \
+        "$ROOT_DIR/src/trace_main.c" \
+        "${support_srcs[@]}" \
+        -o "$BUILD_DIR/prism_trace"
+    fi
+
+    if [ -n "${WASI_SDK_PATH:-}" ] && [ -x "${WASI_SDK_PATH}/bin/clang" ]; then
+      if [ -f "$cached_wasm" ]; then
+        echo "==> Using cached WebAssembly module for Prism $ref ($short_sha)"
+        cp "$cached_wasm" "$ver_dir/prism_trace.wasm"
+      else
+        echo "==> Building WebAssembly module for Prism $ref ($short_sha)..."
+        "${WASI_SDK_PATH}/bin/clang" --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
+          -DPRISM_EXPORT_SYMBOLS -DPRISM_EXCLUDE_PRETTYPRINT -DPRISM_EXCLUDE_JSON \
+          -D_WASI_EMULATED_MMAN -lwasi-emulated-mman \
+          -I"$ver_dir" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
+          -std=c99 \
+          -Wl,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer \
+          -Wl,-z,stack-size=8388608 \
+          -Wl,--gc-sections -Wl,--strip-all -Wl,--no-entry -mexec-model=reactor \
+          -Oz -g0 -fdata-sections -ffunction-sections \
+          -o "$ver_dir/prism_trace.wasm" \
+          "$ver_dir/trace_prism.c" \
+          "$ver_dir/trace_node.c" \
+          "$ROOT_DIR/src/trace_runtime.c" \
+          "${support_srcs[@]}"
+        if [ -n "$sha" ]; then
+          cp "$ver_dir/prism_trace.wasm" "$cached_wasm"
+        fi
+      fi
+    fi
+  else
+    echo "==> Using cached WebAssembly module for Prism $ref ($short_sha)"
+    cp "$cached_wasm" "$ver_dir/prism_trace.wasm"
+  fi
+
+  if [ "$idx" -eq 0 ] && [ -f "$ver_dir/prism_trace.wasm" ]; then
+    cp "$ver_dir/prism_trace.wasm" "$BUILD_DIR/prism_trace.wasm"
+  fi
+
+  local semver="unknown"
+  if [ -f "$PRISM_DIR/include/prism/version.h" ]; then
+    semver="$(ruby -e 'puts(File.read(ARGV[0])[/#define\s+PRISM_VERSION\s+"([^"]+)"/, 1] || "unknown")' "$PRISM_DIR/include/prism/version.h")"
+  fi
+
+  ruby -rjson -e '
+    id, semver, sha, short_sha, describe, date, out = ARGV
+    url = sha.empty? ? "https://github.com/ruby/prism" : "https://github.com/ruby/prism/commit/#{sha}"
+    label = id == "main" ? "main (v#{semver} @ #{short_sha})" : "#{id} (#{short_sha})"
+    meta = {
+      "id" => id,
+      "label" => label,
+      "version" => semver,
+      "sha" => sha,
+      "short_sha" => short_sha,
+      "describe" => describe,
+      "date" => date,
+      "url" => url
+    }
+    File.write(out, JSON.pretty_generate(meta))
+  ' "$ref" "$semver" "$sha" "$short_sha" "$describe" "$commit_date" "$ver_dir/meta.json"
+}
+
+idx=0
+for ref in "${REFS_TO_BUILD[@]}"; do
+  build_prism_version "$idx" "$ref"
+  idx=$((idx + 1))
+done
+
+# Restore vendor/prism to the primary ref if multiple refs were built
+if [ "${#REFS_TO_BUILD[@]}" -gt 1 ] && [ "$PRISM_DIR" = "$ROOT_DIR/vendor/prism" ] && [ -d "$PRISM_DIR/.git" ]; then
+  PRIMARY_REF="${REFS_TO_BUILD[0]}"
+  if [ "$PRIMARY_REF" = "main" ] && git -C "$PRISM_DIR" rev-parse --verify --quiet origin/main >/dev/null; then
+    PRIMARY_REF="origin/main"
+  fi
+  git -C "$PRISM_DIR" clean -fdx include src
+  git -C "$PRISM_DIR" checkout --quiet "$PRIMARY_REF"
+  (cd "$PRISM_DIR" && ruby templates/template.rb)
+fi
+
+# Generate standalone web application in dist/index.html
 echo "==> Generating web application in $DIST_DIR/index.html..."
 ruby "$ROOT_DIR/src/make_viewer.rb" "$PRISM_DIR" "$BUILD_DIR" "$DIST_DIR/index.html"
 touch "$DIST_DIR/.nojekyll"
