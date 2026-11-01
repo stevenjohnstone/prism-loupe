@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require "cgi"
 require "fileutils"
 require "json"
 
@@ -22,6 +23,14 @@ OUT_HTML = ARGV[2] || "dist/index.html"
 
 HTML_TEMPLATE = <<~'HTML'
 <!DOCTYPE html>
+<!--
+  Ruby Prism Loupe
+  __LOUPE_LICENSE_TEXT__
+
+  ----------------------------------------------------------------------------
+  Embedded & Hosted Ruby Prism Parser (https://github.com/ruby/prism)
+  __PRISM_LICENSE_TEXT__
+-->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -610,6 +619,14 @@ HTML_TEMPLATE = <<~'HTML'
     <span>Source: <a href="__PLAYGROUND_REPO_URL__" target="_blank" rel="noopener" style="color:var(--accent); text-decoration:none; font-family:var(--font-mono);">__PLAYGROUND_REPO_NAME__ &nearr;</a></span>
     <span>Build: <a href="__PLAYGROUND_COMMIT_URL__" target="_blank" rel="noopener" style="color:var(--accent); text-decoration:none; font-family:var(--font-mono);">__PLAYGROUND_SHORT_SHA__</a> (__PLAYGROUND_DATE__)</span>
   </div>
+  <details style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border); font-size:11px; color:var(--muted);">
+    <summary style="cursor:pointer; user-select:none; color:var(--text); font-weight:500;">Licenses (MIT &mdash; Prism Loupe &amp; Ruby Prism)</summary>
+    <div style="margin-top:6px; max-height:200px; overflow-y:auto; background:#090d13; border:1px solid var(--border); border-radius:4px; padding:8px; font-family:var(--font-mono); font-size:10.5px; line-height:1.45; white-space:pre-wrap; color:var(--muted);"><strong>Ruby Prism Loupe (MIT License)</strong>
+__LOUPE_LICENSE_HTML__
+
+<strong>Ruby Prism (MIT License &mdash; <a href="https://github.com/ruby/prism/blob/main/LICENSE.md" target="_blank" rel="noopener" style="color:var(--accent);">ruby/prism</a>)</strong>
+__PRISM_LICENSE_HTML__</div>
+  </details>
 </div>
 
 <div class="scrubber-bar">
@@ -3840,7 +3857,16 @@ playground_date = Time.now.strftime("%Y-%m-%d") if playground_date.empty?
 playground_commit_url = playground_sha.empty? ? playground_repo_url : "#{playground_repo_url}/commit/#{playground_sha}"
 playground_title = "#{playground_repo_name} built from commit #{playground_short_sha} (#{playground_date}) — click to view project source on GitHub"
 
+loupe_license_path = File.join(playground_root, "LICENSE")
+loupe_license_text = File.exist?(loupe_license_path) ? File.read(loupe_license_path, encoding: "UTF-8").strip : "MIT License\n\nCopyright (c) 2026 Steven Johnstone"
+prism_license_path = File.join(PRISM_DIR, "LICENSE.md")
+prism_license_text = File.exist?(prism_license_path) ? File.read(prism_license_path, encoding: "UTF-8").strip : "Copyright 2022-present, Ruby developers (MIT License)"
+
 html = HTML_TEMPLATE
+  .sub("__LOUPE_LICENSE_TEXT__") { loupe_license_text }
+  .sub("__PRISM_LICENSE_TEXT__") { prism_license_text }
+  .sub("__LOUPE_LICENSE_HTML__") { CGI.escapeHTML(loupe_license_text) }
+  .sub("__PRISM_LICENSE_HTML__") { CGI.escapeHTML(prism_license_text) }
   .sub("__LOUPE_FAVICON_BASE64__") { loupe_favicon_b64 }
   .sub("__RUBY_SVG_BASE64__") { ruby_svg_b64 }
   .sub("__PRISM_VERSION__") { primary_info["version"] }

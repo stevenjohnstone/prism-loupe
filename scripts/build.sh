@@ -156,6 +156,7 @@ build_prism_version() {
     rm -rf "$ver_src_dir"
     mkdir -p "$ver_src_dir/trace_src"
     cp -R "$PRISM_DIR/src" "$PRISM_DIR/include" "$ver_src_dir/"
+    [ -f "$PRISM_DIR/LICENSE.md" ] && cp "$PRISM_DIR/LICENSE.md" "$ver_src_dir/LICENSE.md"
     cp "$ver_dir/trace_prism.c" "$ver_dir/trace_node.c" "$ver_dir/trace_compat.h" \
        "$ROOT_DIR/src/trace_runtime.c" "$ROOT_DIR/src/trace_runtime.h" "$ROOT_DIR/src/prism_xallocator.h" \
        "$ver_src_dir/trace_src/"
@@ -225,6 +226,7 @@ build_prism_version() {
   else
     echo "==> Using cached WebAssembly module for Prism $ref ($short_sha)"
     cp "$cached_wasm" "$ver_dir/prism_trace.wasm"
+    [ -f "$PRISM_DIR/LICENSE.md" ] && [ -d "$ver_src_dir" ] && cp "$PRISM_DIR/LICENSE.md" "$ver_src_dir/LICENSE.md"
   fi
 
   if [ "$idx" -eq 0 ] && [ -f "$ver_dir/prism_trace.wasm" ]; then
@@ -282,5 +284,6 @@ fi
 # Generate standalone web application in dist/index.html
 echo "==> Generating web application in $DIST_DIR/index.html..."
 ruby "$ROOT_DIR/src/make_viewer.rb" "$PRISM_DIR" "$BUILD_DIR" "$DIST_DIR/index.html"
+[ -f "$ROOT_DIR/LICENSE" ] && cp "$ROOT_DIR/LICENSE" "$DIST_DIR/LICENSE"
 touch "$DIST_DIR/.nojekyll"
 echo "==> Done! Open $DIST_DIR/index.html in your browser."
