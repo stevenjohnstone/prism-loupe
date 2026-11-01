@@ -660,11 +660,26 @@ prism_trace_emit_event(
     g_trace_in_hook = 0;
 }
 
+#if defined(__wasm__)
+__attribute__((import_module("env"), import_name("prism_host_debugger")))
+extern void prism_host_debugger(const char *reason, const char *expr, const char *file, int line, const char *func);
+#endif
+
 void
 prism_trace_emit_crash(const char *reason, const char *expr, const char *file, int line, const char *func) {
     if (g_trace_crashed) return;
     g_trace_crashed = 1;
     g_trace_in_hook = 0;
+
+    if (file != NULL) {
+        const char *src_pos = strstr(file, "src/");
+        const char *inc_pos = strstr(file, "include/");
+        if (src_pos != NULL) {
+            file = src_pos;
+        } else if (inc_pos != NULL) {
+            file = inc_pos;
+        }
+    }
 
     if (g_trace_buf != NULL && g_trace_parser != NULL) {
         if (g_trace_step >= g_trace_max_steps) {
@@ -692,6 +707,16 @@ prism_trace_emit_crash(const char *reason, const char *expr, const char *file, i
         );
         pm_buffer_cleanup(&detail_buf);
     }
+
+#if defined(__wasm__)
+    prism_host_debugger(
+        reason ? reason : "CRASH",
+        expr ? expr : "",
+        file ? file : "",
+        line,
+        func ? func : ""
+    );
+#endif
 
     if (g_trace_crash_cb != NULL) {
         g_trace_crash_cb();

@@ -134,7 +134,8 @@ build_prism_version() {
   local commit_date
   commit_date="$(git -C "$PRISM_DIR" show -s --format=%cs HEAD 2>/dev/null || echo "")"
 
-  local cached_wasm="$BUILD_DIR/wasm_cache/prism_trace_${sha}_${INSTRUMENT_HASH}.wasm"
+  local dbg_mode="${DEBUG_WASM:-1}"
+  local cached_wasm="$BUILD_DIR/wasm_cache/prism_trace_${sha}_${INSTRUMENT_HASH}_dwarf5_${dbg_mode}.wasm"
 
   local need_compile=0
   if [ ! -f "$cached_wasm" ] || [ "${BUILD_CLI:-0}" = "1" ]; then
@@ -181,20 +182,27 @@ build_prism_version() {
         cp "$cached_wasm" "$ver_dir/prism_trace.wasm"
       else
         echo "==> Building WebAssembly module for Prism $ref ($short_sha)..."
-        "${WASI_SDK_PATH}/bin/clang" --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
-          -DPRISM_EXPORT_SYMBOLS -DPRISM_EXCLUDE_PRETTYPRINT -DPRISM_EXCLUDE_JSON -DPRISM_XALLOCATOR \
-          -D_WASI_EMULATED_MMAN -lwasi-emulated-mman \
-          -I"$ver_dir" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
-          -std=c99 \
-          -Wl,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer \
-          -Wl,-z,stack-size=8388608 \
-          -Wl,--gc-sections -Wl,--strip-all -Wl,--no-entry -mexec-model=reactor \
-          -Oz -g0 -fdata-sections -ffunction-sections \
-          -o "$ver_dir/prism_trace.wasm" \
-          "$ver_dir/trace_prism.c" \
-          "$ver_dir/trace_node.c" \
-          "$ROOT_DIR/src/trace_runtime.c" \
-          "${support_srcs[@]}"
+        local wasm_opt_flags=(-O0 -gdwarf-5 -gembed-source)
+        if [ "$dbg_mode" = "0" ]; then
+          wasm_opt_flags=(-Wl,--strip-debug -Oz -fdata-sections -ffunction-sections)
+        fi
+        (
+          cd "$PRISM_DIR" && \
+          "${WASI_SDK_PATH}/bin/clang" --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
+            -DPRISM_EXPORT_SYMBOLS -DPRISM_EXCLUDE_PRETTYPRINT -DPRISM_EXCLUDE_JSON -DPRISM_XALLOCATOR \
+            -D_WASI_EMULATED_MMAN -lwasi-emulated-mman \
+            -I"$ver_dir" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
+            -std=c99 \
+            -Wl,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer \
+            -Wl,-z,stack-size=8388608 \
+            -Wl,--gc-sections -Wl,--no-entry -mexec-model=reactor \
+            "${wasm_opt_flags[@]}" \
+            -o "$ver_dir/prism_trace.wasm" \
+            "$ver_dir/trace_prism.c" \
+            "$ver_dir/trace_node.c" \
+            "$ROOT_DIR/src/trace_runtime.c" \
+            "${support_srcs[@]}"
+        )
         if [ -n "$sha" ]; then
           cp "$ver_dir/prism_trace.wasm" "$cached_wasm"
         fi
@@ -252,6 +260,9 @@ if [ "${#REFS_TO_BUILD[@]}" -gt 1 ] && [ "$PRISM_DIR" = "$ROOT_DIR/vendor/prism"
   fi
   git -C "$PRISM_DIR" clean -fdx include src
   git -C "$PRISM_DIR" checkout --quiet "$PRIMARY_REF"
+  if [ "${DEBUG_WASM:-1}" = "1" ]; then
+    (cd "$PRISM_DIR" && ruby templates/template.rb)
+  fi
 fi
 
 # Generate standalone web application in dist/index.html

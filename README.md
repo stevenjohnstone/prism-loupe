@@ -53,6 +53,13 @@ An interactive, single-file, in-browser C99 parser, lexer, and AST execution vis
 - **Antigravity IDE Deep Links**: Configure your local Prism repository path in **`⚙` (Settings)** to enable **`↗ Antigravity IDE`** links (`antigravity-ide://file/<repo>/<file>:<line>`) on every trace step and call stack frame, while automatically copying the step's structured markdown context to your clipboard.
 - **Gemini Context Sync**: Continuously updates a structured `<aside id="geminiPageContext">` DOM summary for Chrome's built-in Gemini side panel, plus an in-page **`✨ Ask Gemini`** drawer for other browsers.
 
+### 6. Browser DevTools & Source-Level Wasm Crash Debugging
+- **Automatic `debugger;` Breakpoint on Crash**: When an assertion fails (`assert(...)`) inside the WebAssembly build of Prism, [`prism_trace_emit_crash`](src/trace_runtime.c) flushes the final `CRASH` event to the trace buffer and invokes the imported JS host hook `env.prism_host_debugger(...)` right before trapping (`__builtin_trap()`).
+- **Live Stack & Memory Inspection**: If browser DevTools is open when a crash occurs, execution automatically pauses on `debugger;` while the live C/Wasm call stack and linear memory (`wasmExports.memory.buffer`) are still intact. Metadata and the decoded symbolic stack trace are also saved to `window._lastPrismWasmCrash`.
+- **Full DWARF v5 Symbols & Embedded C Source by Default**: Every embedded `.wasm` binary is compiled with `-O0 -gdwarf-5 -gembed-source`, preserving uninlined C stack frames, local variable locations, and the full C source text directly inside the Wasm DWARF sections.
+  - **Without extensions**: Chrome DevTools displays human-readable C function names on every Wasm stack frame (`pm_line_offset_list_append_slow`, `parser_lex`, `parse_heredoc`, etc.).
+  - **With the [C/C++ DevTools Support (DWARF)](https://chromewebstore.google.com/detail/cc++-devtools-support-dwa/pdcpmagijalfljmkmjngeonclgbbannb) Chrome extension**: Clicking any Wasm frame in the DevTools **Sources** panel opens the exact C source line (`src/prism.c`, `src/line_offset_list.c`, etc.) and lets you inspect C structs, pointers, and local variables (`parser`, `list`, `cursor`) — even on the hosted GitHub Pages deployment without a local checkout.
+
 ---
 
 ## Building Locally
@@ -104,6 +111,9 @@ FORCE_PRISM_CHECKOUT=1 make build
 
 # Or build against an existing local Prism checkout without modifying vendor/prism:
 PRISM_DIR=/path/to/local/prism make build
+
+# Build size-optimized Wasm modules (-Oz -Wl,--strip-debug) without DWARF debug info:
+DEBUG_WASM=0 make build
 ```
 
 ---

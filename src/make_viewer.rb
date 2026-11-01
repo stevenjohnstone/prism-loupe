@@ -962,7 +962,39 @@ async function initWasm() {
       get: (t, p) => (p in t ? t[p] : () => 0)
     });
 
-    const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasiImport });
+    const readWasmCString = (ptr) => {
+      if (!ptr || !wasmExports || !wasmExports.memory) return '';
+      const mem = new Uint8Array(wasmExports.memory.buffer);
+      let end = ptr;
+      while (end < mem.length && mem[end] !== 0) end++;
+      return new TextDecoder().decode(mem.subarray(ptr, end));
+    };
+
+    const envImport = {
+      prism_host_debugger: (reasonPtr, exprPtr, filePtr, line, funcPtr) => {
+        const crashReason = readWasmCString(reasonPtr);
+        const crashExpr = readWasmCString(exprPtr);
+        const crashFile = readWasmCString(filePtr);
+        const crashLine = line;
+        const crashFunc = readWasmCString(funcPtr);
+        const crashStack = (new Error(`Prism ${crashReason}: ${crashExpr} at ${crashFile}:${crashLine} (${crashFunc})`)).stack;
+        window._lastPrismWasmCrash = {
+          reason: crashReason,
+          expr: crashExpr,
+          file: crashFile,
+          line: crashLine,
+          func: crashFunc,
+          stack: crashStack
+        };
+        // eslint-disable-next-line no-debugger
+        debugger;
+      }
+    };
+
+    const { instance } = await WebAssembly.instantiate(bytes, {
+      wasi_snapshot_preview1: wasiImport,
+      env: envImport
+    });
     if (instance.exports._initialize) instance.exports._initialize();
     wasmExports = instance.exports;
     if (!statusEl.innerHTML.includes('Crash captured')) {
