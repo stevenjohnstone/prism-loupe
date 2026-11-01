@@ -135,10 +135,12 @@ build_prism_version() {
   commit_date="$(git -C "$PRISM_DIR" show -s --format=%cs HEAD 2>/dev/null || echo "")"
 
   local dbg_mode="${DEBUG_WASM:-1}"
-  local cached_wasm="$BUILD_DIR/wasm_cache/prism_trace_${sha}_${INSTRUMENT_HASH}_dwarf5_${dbg_mode}.wasm"
+  local ci_tag="${GITHUB_ACTIONS:-local}"
+  local cached_wasm="$BUILD_DIR/wasm_cache/prism_trace_${sha}_${INSTRUMENT_HASH}_src_${dbg_mode}_${ci_tag}.wasm"
+  local ver_src_dir="$DIST_DIR/sources/$ref"
 
   local need_compile=0
-  if [ ! -f "$cached_wasm" ] || [ "${BUILD_CLI:-0}" = "1" ]; then
+  if [ ! -f "$cached_wasm" ] || [ "${BUILD_CLI:-0}" = "1" ] || [ ! -f "$ver_src_dir/src/node.c" ]; then
     need_compile=1
   fi
 
@@ -151,13 +153,22 @@ build_prism_version() {
     echo "==> Instrumenting Prism $ref ($short_sha)..."
     ruby "$ROOT_DIR/src/instrument.rb" "$PRISM_DIR" "$ver_dir"
 
+    rm -rf "$ver_src_dir"
+    mkdir -p "$ver_src_dir/trace_src"
+    cp -R "$PRISM_DIR/src" "$PRISM_DIR/include" "$ver_src_dir/"
+    cp "$ver_dir/trace_prism.c" "$ver_dir/trace_node.c" "$ver_dir/trace_compat.h" \
+       "$ROOT_DIR/src/trace_runtime.c" "$ROOT_DIR/src/trace_runtime.h" "$ROOT_DIR/src/prism_xallocator.h" \
+       "$ver_src_dir/trace_src/"
+
     local support_srcs=()
+    local rel_support_srcs=()
     for f in "$PRISM_DIR"/src/*.c "$PRISM_DIR"/src/util/*.c; do
       [ -e "$f" ] || continue
       local base
       base="$(basename "$f")"
       if [ "$base" != "prism.c" ] && [ "$base" != "node.c" ]; then
         support_srcs+=("$f")
+        rel_support_srcs+=("${f#"$PRISM_DIR"/}")
       fi
     done
 
@@ -182,26 +193,29 @@ build_prism_version() {
         cp "$cached_wasm" "$ver_dir/prism_trace.wasm"
       else
         echo "==> Building WebAssembly module for Prism $ref ($short_sha)..."
-        local wasm_opt_flags=(-O0 -gdwarf-5 -gembed-source)
+        local wasm_opt_flags=(-O0 -g)
+        if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+          wasm_opt_flags+=(-fdebug-prefix-map="$DIST_DIR=/prism-loupe")
+        fi
         if [ "$dbg_mode" = "0" ]; then
           wasm_opt_flags=(-Wl,--strip-debug -Oz -fdata-sections -ffunction-sections)
         fi
         (
-          cd "$PRISM_DIR" && \
+          cd "$ver_src_dir" && \
           "${WASI_SDK_PATH}/bin/clang" --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
             -DPRISM_EXPORT_SYMBOLS -DPRISM_EXCLUDE_PRETTYPRINT -DPRISM_EXCLUDE_JSON -DPRISM_XALLOCATOR \
             -D_WASI_EMULATED_MMAN -lwasi-emulated-mman \
-            -I"$ver_dir" -I"$PRISM_DIR/include" -I"$PRISM_DIR/src" -I"$ROOT_DIR/src" \
+            -Itrace_src -Iinclude -Isrc \
             -std=c99 \
             -Wl,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer \
             -Wl,-z,stack-size=8388608 \
             -Wl,--gc-sections -Wl,--no-entry -mexec-model=reactor \
             "${wasm_opt_flags[@]}" \
             -o "$ver_dir/prism_trace.wasm" \
-            "$ver_dir/trace_prism.c" \
-            "$ver_dir/trace_node.c" \
-            "$ROOT_DIR/src/trace_runtime.c" \
-            "${support_srcs[@]}"
+            trace_src/trace_prism.c \
+            trace_src/trace_node.c \
+            trace_src/trace_runtime.c \
+            "${rel_support_srcs[@]}"
         )
         if [ -n "$sha" ]; then
           cp "$ver_dir/prism_trace.wasm" "$cached_wasm"
