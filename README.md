@@ -1,8 +1,8 @@
-# Prism Playground — Interactive Parser & Lexer Trace Visualizer
+# Prism Loupe — Interactive Parser & Lexer Trace Visualizer
 
 An interactive, single-file, in-browser C99 parser, lexer, and AST execution visualizer for the [Prism Ruby parser](https://github.com/ruby/prism).
 
-**Live Demo:** [https://stevenjohnstone.github.io/prism-playground/](https://stevenjohnstone.github.io/prism-playground/)
+**Live Demo:** [https://stevenjohnstone.github.io/prism-loupe/](https://stevenjohnstone.github.io/prism-loupe/)
 
 ---
 

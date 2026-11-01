@@ -25,7 +25,7 @@ HTML_TEMPLATE = <<~'HTML'
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Ruby Prism Playground</title>
+<title>Ruby Prism Loupe</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -559,8 +559,8 @@ HTML_TEMPLATE = <<~'HTML'
 <body>
 
 <header>
-  <img src="data:image/svg+xml;base64,__RUBY_SVG_BASE64__" alt="Ruby" title="Ruby Prism Playground" class="header-logo">
-  <span style="font-weight:600; font-size:13.5px; color:var(--text); white-space:nowrap;">Ruby Prism Playground</span>
+  <img src="data:image/svg+xml;base64,__RUBY_SVG_BASE64__" alt="Ruby" title="Ruby Prism Loupe" class="header-logo">
+  <span style="font-weight:600; font-size:13.5px; color:var(--text); white-space:nowrap;">Ruby Prism Loupe</span>
   <div class="version-selector-group">
     <select id="prismVersionSelect" title="Select Prism parser version (re-traces current Ruby snippet in-place)"></select>
     <a id="prismVersionCommitLink" class="github-commit-btn" href="__PRISM_COMMIT_URL__" target="_blank" rel="noopener" aria-label="View Prism commit on GitHub" title="__PRISM_VERSION_TITLE__">
@@ -2575,8 +2575,8 @@ function muxWebmVideo(encodedChunks, width, height, codecId, totalDurationMs) {
   const segmentInfo = ebmlElement([0x15, 0x49, 0xA9, 0x66], [
     ebmlUint([0x2A, 0xD7, 0xB1], 1000000),
     ebmlFloat64([0x44, 0x89], Math.max(1, totalDurationMs)),
-    ebmlAscii([0x4D, 0x80], 'PrismPlayground'),
-    ebmlAscii([0x57, 0x41], 'PrismPlayground')
+    ebmlAscii([0x4D, 0x80], 'PrismLoupe'),
+    ebmlAscii([0x57, 0x41], 'PrismLoupe')
   ]);
 
   const videoTrack = ebmlElement([0xE0], [
@@ -3761,9 +3761,9 @@ playground_remote = IO.popen(["git", "-C", playground_root, "config", "--get", "
 playground_repo_name = if playground_remote =~ %r{github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?$}
   Regexp.last_match(1)
 else
-  "stevenjohnstone/prism-playground"
+  "stevenjohnstone/prism-loupe"
 end
-playground_repo_slug = playground_repo_name.split("/").last || "prism-playground"
+playground_repo_slug = playground_repo_name.split("/").last || "prism-loupe"
 playground_repo_url = "https://github.com/#{playground_repo_name}"
 playground_short_sha = "local" if playground_short_sha.empty?
 playground_date = Time.now.strftime("%Y-%m-%d") if playground_date.empty?

@@ -1,4 +1,4 @@
-name: Deploy Prism Playground to GitHub Pages
+name: Deploy Prism Loupe to GitHub Pages
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout prism-playground
+      - name: Checkout prism-loupe
         uses: actions/checkout@v7
 
       - name: Setup Pages
@@ -44,7 +44,7 @@ jobs:
           restore-keys: |
             prism-wasm-cache-${{ hashFiles('src/instrument.rb', 'src/trace_runtime.c', 'src/trace_runtime.h', 'src/trace_main.c', 'src/prism_xallocator.h') }}-
 
-      - name: Build Prism Playground (Presets + WebAssembly + HTML)
+      - name: Build Prism Loupe (WebAssembly + HTML)
         run: ./scripts/build.sh
 
       - name: Upload Pages artifact
