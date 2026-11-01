@@ -26,6 +26,7 @@ HTML_TEMPLATE = <<~'HTML'
 <head>
 <meta charset="utf-8">
 <title>Ruby Prism Loupe</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,__LOUPE_FAVICON_BASE64__">
 <style>
   :root {
     --bg: #0d1117;
@@ -3728,6 +3729,43 @@ presets.concat([
 ])
 
 ruby_svg_b64 = [File.binread(File.join(PRISM_DIR, "doc/images/ruby.svg"))].pack("m0")
+loupe_favicon_svg = <<~SVG
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+    <defs>
+      <linearGradient id="caseGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#30363d"/>
+        <stop offset="100%" stop-color="#161b22"/>
+      </linearGradient>
+      <linearGradient id="rimGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#f0c674"/>
+        <stop offset="50%" stop-color="#d29922"/>
+        <stop offset="100%" stop-color="#9e6a03"/>
+      </linearGradient>
+      <radialGradient id="lensGrad" cx="38%" cy="35%" r="65%">
+        <stop offset="0%" stop-color="#1c2938"/>
+        <stop offset="100%" stop-color="#0d1117"/>
+      </radialGradient>
+    </defs>
+    <!-- Jeweler's loupe teardrop swing-out housing -->
+    <path d="M 38 24 C 50 28 60 40 59 51 C 58 58 51 60 44 58 C 33 55 24 44 21 34 Z" fill="url(#caseGrad)" stroke="#8b949e" stroke-width="2.5" stroke-linejoin="round"/>
+    <!-- Pivot rivet on housing -->
+    <circle cx="49.5" cy="49.5" r="3.2" fill="#d29922" stroke="#0d1117" stroke-width="1.2"/>
+    <!-- Outer brass/gold loupe bezel -->
+    <circle cx="25" cy="25" r="21" fill="url(#rimGrad)" stroke="#0d1117" stroke-width="1.5"/>
+    <!-- Dark optical glass lens -->
+    <circle cx="25" cy="25" r="16.8" fill="url(#lensGrad)" stroke="#58a6ff" stroke-width="0.9" stroke-opacity="0.45"/>
+    <!-- Magnified faceted Ruby prism inside lens -->
+    <polygon points="18,18 32,18 36,24 25,36 14,24" fill="#da3633"/>
+    <polygon points="18,18 25,18 29,24 21,24" fill="#ff7b72"/>
+    <polygon points="25,18 32,18 36,24 29,24" fill="#f85149"/>
+    <polygon points="14,24 21,24 25,36" fill="#f85149"/>
+    <polygon points="21,24 29,24 25,36" fill="#ff7b72" fill-opacity="0.85"/>
+    <polygon points="29,24 36,24 25,36" fill="#b62324"/>
+    <!-- Lens specular glare arc -->
+    <path d="M 13.5 19 A 13 13 0 0 1 28 12.2" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" stroke-opacity="0.65"/>
+  </svg>
+SVG
+loupe_favicon_b64 = [loupe_favicon_svg.strip].pack("m0")
 
 version_h_path = File.join(PRISM_DIR, "include/prism/version.h")
 prism_semver = if File.exist?(version_h_path)
@@ -3803,6 +3841,7 @@ playground_commit_url = playground_sha.empty? ? playground_repo_url : "#{playgro
 playground_title = "#{playground_repo_name} built from commit #{playground_short_sha} (#{playground_date}) — click to view project source on GitHub"
 
 html = HTML_TEMPLATE
+  .sub("__LOUPE_FAVICON_BASE64__") { loupe_favicon_b64 }
   .sub("__RUBY_SVG_BASE64__") { ruby_svg_b64 }
   .sub("__PRISM_VERSION__") { primary_info["version"] }
   .sub("__PRISM_SHORT_SHA__") { primary_info["short_sha"] }
