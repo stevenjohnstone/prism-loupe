@@ -1019,7 +1019,7 @@ async function initWasm() {
       statusEl.innerHTML = `<span style="color:var(--green)">● Wasm ready (Prism ${escapeHtml(PRISM_BUILD_INFO.id)} @ ${escapeHtml(PRISM_BUILD_INFO.short_sha)})</span>`;
     }
   } catch (err) {
-    statusEl.innerHTML = `<span style="color:var(--red)">Wasm init error: ${err.message}</span>`;
+    statusEl.innerHTML = `<span style="color:var(--red)">Wasm init error: ${escapeHtml(err && err.message ? err.message : err)}</span>`;
   }
 }
 
@@ -1118,14 +1118,14 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
 
   if (hasCrash) {
     document.getElementById('wasmStatus').innerHTML =
-      `<span style="color:var(--red);font-weight:700;">💥 Crash captured at step ${steps.length - 1} (${dt} ms) — Wasm reset</span>`;
+      `<span style="color:var(--red);font-weight:700;">💥 Crash captured at step ${ steps.length - 1 } (${escapeHtml(dt)} ms) — Wasm reset</span>`;
   } else if (hasUnderflow) {
     const uStep = currentTrace.steps[currentTrace._underflowIdx];
     document.getElementById('wasmStatus').innerHTML =
-      `<span style="color:var(--red);font-weight:700;">⚠ Corrupted node (underflow) at step ${uStep.step} (${dt} ms)</span>`;
+      `<span style="color:var(--red);font-weight:700;">⚠ Corrupted node (underflow) at step ${escapeHtml(uStep.step)} (${escapeHtml(dt)} ms)</span>`;
   } else {
     document.getElementById('wasmStatus').innerHTML =
-      `<span style="color:var(--green)">● Traced ${steps.length} steps in ${dt} ms</span>`;
+      `<span style="color:var(--green)">● Traced ${steps.length} steps in ${escapeHtml(dt)} ms</span>`;
   }
 }
 
@@ -1204,9 +1204,10 @@ function clearBrowserUrlCodeParam() {
 }
 
 function formatBytes(b) {
-  if (b < 1024) return `${b} B`;
-  if (b < 1024 * 1024) return `${(b / 1024).toFixed(2)} KB`;
-  return `${(b / (1024 * 1024)).toFixed(2)} MB`;
+  const n = Number(b) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(2)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 function preprocessTrace(trace) {
@@ -1400,7 +1401,16 @@ function renderTimeline() {
 }
 
 function escapeHtml(str) {
-  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeCssToken(str) {
+  return String(str ?? '').replace(/[^A-Za-z0-9_-]/g, '');
 }
 
 function stepSourceFile(step) {
@@ -1572,7 +1582,7 @@ function renderStep() {
     btnCrash.style.display = 'inline-block';
     btnCrash.disabled = (currentIdx === currentTrace._crashIdx);
     const jumpBtn = currentIdx !== currentTrace._crashIdx
-      ? `<button class="warn" style="margin-left:8px;padding:2px 7px;" onclick="jumpToStep(${currentTrace._crashIdx})">Jump to Crash Step #${crashStep.step}</button>`
+      ? `<button class="warn" style="margin-left:8px;padding:2px 7px;" data-jump-step="${Number(currentTrace._crashIdx)}">Jump to Crash Step #${escapeHtml(crashStep.step)}</button>`
       : `<span class="badge kind-CRASH" style="margin-left:8px;">AT CRASH POINT</span>`;
     cb.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -1580,9 +1590,12 @@ function renderStep() {
         ${jumpBtn}
       </div>
       <div style="margin-top:4px;color:var(--text);">
-        <code>assert(${escapeHtml(cd.expr || '')})</code> failed in <code>${escapeHtml(cd.func || crashStep.func)}()</code> at <code>${escapeHtml(cFile)}:${cd.line || crashStep.line}</code>
+        <code>assert(${escapeHtml(cd.expr || '')})</code> failed in <code>${escapeHtml(cd.func || crashStep.func)}()</code> at <code>${escapeHtml(cFile)}:${escapeHtml(cd.line || crashStep.line)}</code>
       </div>
     `;
+    cb.querySelectorAll('[data-jump-step]').forEach(btn => {
+      btn.addEventListener('click', () => jumpToStep(Number(btn.getAttribute('data-jump-step'))));
+    });
   } else {
     cb.style.display = 'none';
     btnCrash.style.display = 'none';
@@ -1601,12 +1614,12 @@ function renderStep() {
     const nextUStep = currentTrace.steps[nextUStepIdx];
     let headerActionHtml = '';
     if (!atUnderflowStep) {
-      headerActionHtml = `<button class="warn" style="margin-left:8px;padding:2px 7px;" onclick="jumpToStep(${nextUStepIdx})">Jump to Detection Step #${nextUStep.step}</button>`;
+      headerActionHtml = `<button class="warn" style="margin-left:8px;padding:2px 7px;" data-jump-step="${Number(nextUStepIdx)}">Jump to Detection Step #${escapeHtml(nextUStep.step)}</button>`;
     } else if (uSteps.length > 1) {
       headerActionHtml = `
         <span style="display:inline-flex;align-items:center;gap:6px;margin-left:8px;">
-          <span class="badge kind-CRASH">AT DETECTION STEP #${step.step}</span>
-          <button class="warn" style="padding:2px 7px;" onclick="jumpToStep(${nextUStepIdx})">Next Underflow (#${nextUStep.step}) &rarr;</button>
+          <span class="badge kind-CRASH">AT DETECTION STEP #${escapeHtml(step.step)}</span>
+          <button class="warn" style="padding:2px 7px;" data-jump-step="${Number(nextUStepIdx)}">Next Underflow (#${escapeHtml(nextUStep.step)}) &rarr;</button>
         </span>
       `;
     } else {
@@ -1616,11 +1629,11 @@ function renderStep() {
       const caller = ev.callStack.length > 0 ? ev.callStack[ev.callStack.length - 1] : null;
       const callerStr = (caller && caller !== ev.func) ? ` via <code>${escapeHtml(caller)}()</code>` : '';
       const stepBtn = (uEvents.length > 1 && currentIdx !== ev.stepIdx)
-        ? ` <button class="warn" style="padding:1px 6px;font-size:11px;margin-left:4px;" onclick="jumpToStep(${ev.stepIdx})">Step #${ev.step}</button>`
+        ? ` <button class="warn" style="padding:1px 6px;font-size:11px;margin-left:4px;" data-jump-step="${Number(ev.stepIdx)}">Step #${escapeHtml(ev.step)}</button>`
         : '';
       return `
         <div style="margin-top:4px;color:var(--text);">
-          Node <code>#${ev.node.id} ${escapeHtml(ev.node.type)}</code> underflowed (<code>start=${ev.node.start}, end=${ev.node.end}, len=${ev.node.len}</code>) in <code>${escapeHtml(ev.func)}()</code>${callerStr} at <code>${escapeHtml(ev.file)}:${ev.line}</code>${stepBtn}
+          Node <code>#${escapeHtml(ev.node.id)} ${escapeHtml(ev.node.type)}</code> underflowed (<code>start=${escapeHtml(ev.node.start)}, end=${escapeHtml(ev.node.end)}, len=${escapeHtml(ev.node.len)}</code>) in <code>${escapeHtml(ev.func)}()</code>${callerStr} at <code>${escapeHtml(ev.file)}:${escapeHtml(ev.line)}</code>${stepBtn}
         </div>
       `;
     }).join('');
@@ -1631,6 +1644,9 @@ function renderStep() {
       </div>
       ${itemsHtml}
     `;
+    ub.querySelectorAll('[data-jump-step]').forEach(btn => {
+      btn.addEventListener('click', () => jumpToStep(Number(btn.getAttribute('data-jump-step'))));
+    });
   } else {
     ub.style.display = 'none';
     btnUnderflow.style.display = 'none';
@@ -1687,20 +1703,20 @@ function renderStep() {
   if (repoRoot) {
     const absFile = `${repoRoot}/${srcFile}`.replace(/\/+/g, '/');
     const agyHref = `antigravity-ide://file${absFile.startsWith('/') ? '' : '/'}${absFile}:${step.line}`;
-    agyPillHtml = ` <a id="btnOpenAgyIde" class="copy-pill" href="${escapeHtml(agyHref)}" style="text-decoration:none;" title="Open ${escapeHtml(absFile)}:${step.line} in Antigravity IDE and copy trace context to clipboard">↗ Antigravity IDE</a>`;
+    agyPillHtml = ` <a id="btnOpenAgyIde" class="copy-pill" href="${escapeHtml(agyHref)}" style="text-decoration:none;" title="Open ${escapeHtml(absFile)}:${escapeHtml(step.line)} in Antigravity IDE and copy trace context to clipboard">↗ Antigravity IDE</a>`;
   }
   const tg = document.getElementById('transitionGrid');
   tg.innerHTML = `
-    <div class="kv-key">Event Kind</div><div><span class="badge kind-${step.kind}">${step.kind}</span></div>
+    <div class="kv-key">Event Kind</div><div><span class="badge kind-${safeCssToken(step.kind)}">${escapeHtml(step.kind)}</span></div>
     <div class="kv-key">Location</div><div>
-      <code>${srcFile}:${step.line}</code> in <code>${step.func}()</code>${agyPillHtml}
+      <code>${escapeHtml(srcFile)}:${escapeHtml(step.line)}</code> in <code>${escapeHtml(step.func)}()</code>${agyPillHtml}
     </div>
-    <div class="kv-key">lex_state</div><div><span class="badge kind-LEX_STATE">${step.lex_state}</span></div>
-    <div class="kv-key" style="color:var(--green)">current token</div><div id="kvCurrTok"><code style="color:var(--green)">${step.curr[2]}</code> [${step.curr[0]}..${step.curr[1]}] <code>${escapeHtml(JSON.stringify(currSlice))}</code></div>
-    <div class="kv-key" style="color:var(--amber)">previous token</div><div id="kvPrevTok"><code style="color:var(--amber)">${step.prev[2]}</code> [${step.prev[0]}..${step.prev[1]}] <code>${escapeHtml(JSON.stringify(prevSlice))}</code></div>
-    <div class="kv-key">next_start</div><div id="kvNextStart">${step.next_start >= 0 ? '<code>offset ' + step.next_start + '</code>' : '<span style="color:var(--muted)">NULL</span>'}</div>
-    <div class="kv-key">heredoc_end</div><div id="kvHeredocEnd">${step.heredoc_end >= 0 ? '<code>offset ' + step.heredoc_end + '</code>' : '<span style="color:var(--muted)">NULL</span>'}</div>
-    <div class="kv-key">Errors</div><div>${step.errors}</div>
+    <div class="kv-key">lex_state</div><div><span class="badge kind-LEX_STATE">${escapeHtml(step.lex_state)}</span></div>
+    <div class="kv-key" style="color:var(--green)">current token</div><div id="kvCurrTok"><code style="color:var(--green)">${escapeHtml(step.curr[2])}</code> [${escapeHtml(step.curr[0])}..${escapeHtml(step.curr[1])}] <code>${escapeHtml(JSON.stringify(currSlice))}</code></div>
+    <div class="kv-key" style="color:var(--amber)">previous token</div><div id="kvPrevTok"><code style="color:var(--amber)">${escapeHtml(step.prev[2])}</code> [${escapeHtml(step.prev[0])}..${escapeHtml(step.prev[1])}] <code>${escapeHtml(JSON.stringify(prevSlice))}</code></div>
+    <div class="kv-key">next_start</div><div id="kvNextStart">${step.next_start >= 0 ? '<code>offset ' + escapeHtml(step.next_start) + '</code>' : '<span style="color:var(--muted)">NULL</span>'}</div>
+    <div class="kv-key">heredoc_end</div><div id="kvHeredocEnd">${step.heredoc_end >= 0 ? '<code>offset ' + escapeHtml(step.heredoc_end) + '</code>' : '<span style="color:var(--muted)">NULL</span>'}</div>
+    <div class="kv-key">Errors</div><div>${escapeHtml(step.errors)}</div>
     <div class="kv-key">Detail</div><div><code>${escapeHtml(detailStr)}</code></div>
   `;
   const agyPill = document.getElementById('btnOpenAgyIde');
@@ -1724,7 +1740,7 @@ function renderStep() {
   lmBox.innerHTML = '';
   step.lex_modes.forEach((m, idx) => {
     const div = document.createElement('div');
-    div.className = `stack-frame mode-${m.mode}`;
+    div.className = `stack-frame mode-${safeCssToken(m.mode)}`;
     let extra = '';
     if (m.mode === 'HEREDOC') {
       extra = `ident=${JSON.stringify(m.ident)} indent=${m.indent} next_start=${m.next_start >= 0 ? m.next_start : 'NULL'}`;
@@ -1735,7 +1751,15 @@ function renderStep() {
     } else if (m.mode === 'STRING' || m.mode === 'LIST') {
       extra = `term='${String.fromCharCode(m.term || 0)}' interp=${m.interp} nest=${m.nesting}`;
     }
-    div.innerHTML = `<span style="white-space:nowrap;">${idx === 0 ? '▸ ' : ''}${m.mode}</span><span style="color:var(--muted);text-align:right;">${escapeHtml(extra)}</span>`;
+    const modeSpan = document.createElement('span');
+    modeSpan.style.whiteSpace = 'nowrap';
+    modeSpan.textContent = `${idx === 0 ? '▸ ' : ''}${m.mode}`;
+    const extraSpan = document.createElement('span');
+    extraSpan.style.color = 'var(--muted)';
+    extraSpan.style.textAlign = 'right';
+    extraSpan.textContent = extra;
+    div.appendChild(modeSpan);
+    div.appendChild(extraSpan);
     lmBox.appendChild(div);
   });
 
@@ -1748,7 +1772,13 @@ function renderStep() {
   [...step.call_stack].reverse().forEach((fn, idx) => {
     const div = document.createElement('div');
     div.className = 'stack-frame';
-    div.innerHTML = `<span>${idx === 0 ? '▸ ' : ''}${fn}()</span><span style="color:var(--muted)">#${step.call_stack.length - idx}</span>`;
+    const fnSpan = document.createElement('span');
+    fnSpan.textContent = `${idx === 0 ? '▸ ' : ''}${fn}()`;
+    const depthSpan = document.createElement('span');
+    depthSpan.style.color = 'var(--muted)';
+    depthSpan.textContent = `#${step.call_stack.length - idx}`;
+    div.appendChild(fnSpan);
+    div.appendChild(depthSpan);
     csBox.appendChild(div);
   });
 
@@ -1841,11 +1871,11 @@ function renderMemoryTelemetry(step) {
   let leakBadgeHtml = '';
   if (leak) {
     if (leak.leaked_bytes > 0) {
-      leakBadgeHtml = `<span style="color:var(--red);font-weight:700;" title="${leak.leaked_blocks} unfreed block(s) remaining after parser teardown">⚠ Leak: ${formatBytes(leak.leaked_bytes)} (${leak.leaked_blocks} blk)</span>`;
+      leakBadgeHtml = `<span style="color:var(--red);font-weight:700;" title="${escapeHtml(leak.leaked_blocks)} unfreed block(s) remaining after parser teardown">⚠ Leak: ${formatBytes(leak.leaked_bytes)} (${escapeHtml(leak.leaked_blocks)} blk)</span>`;
     } else if (step.kind === 'TEARDOWN') {
-      leakBadgeHtml = `<span style="color:var(--green);font-weight:600;" title="All ${leak.alloc_count} xmalloc/xcalloc/xrealloc allocations (${formatBytes(leak.total_bytes)}) freed cleanly on teardown">✓ 0 B leaked (${leak.alloc_count}/${leak.free_count} freed)</span>`;
+      leakBadgeHtml = `<span style="color:var(--green);font-weight:600;" title="All ${escapeHtml(leak.alloc_count)} xmalloc/xcalloc/xrealloc allocations (${formatBytes(leak.total_bytes)}) freed cleanly on teardown">✓ 0 B leaked (${escapeHtml(leak.alloc_count)}/${escapeHtml(leak.free_count)} freed)</span>`;
     } else {
-      leakBadgeHtml = `<span style="color:var(--green);font-weight:600;" title="Step to TEARDOWN (final step) to see all ${leak.alloc_count} allocations freed">✓ 0 B leaked on teardown</span>`;
+      leakBadgeHtml = `<span style="color:var(--green);font-weight:600;" title="Step to TEARDOWN (final step) to see all ${escapeHtml(leak.alloc_count)} allocations freed">✓ 0 B leaked on teardown</span>`;
     }
   }
 
@@ -1855,7 +1885,7 @@ function renderMemoryTelemetry(step) {
         <span><span class="swatch" style="background:var(--green);margin-right:5px;"></span>Heap${xDeltaPill}</span>
         <span style="color:var(--muted)">
           <strong style="color:var(--text)">${formatBytes(xLive)}</strong> / ${formatBytes(xPeak)} peak
-          (${xAllocs} alloc, ${xFrees} free)
+          (${escapeHtml(xAllocs)} alloc, ${escapeHtml(xFrees)} free)
         </span>
       </div>
       <div class="mem-bar-bg">
@@ -1869,8 +1899,8 @@ function renderMemoryTelemetry(step) {
     document.getElementById('memBreakdownBox').innerHTML = `
       ${xallocRowHtml}
       <div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:11px;color:var(--muted);padding-top:4px;border-top:1px solid var(--border);">
-        <span><code>line_offsets</code>: <strong style="color:var(--text)">${loSize}</strong>/${loCap} (${loSize * 4} B)</span>
-        <span><code>constant_pool</code>: <strong style="color:var(--text)">${cpSize}</strong>/${cpCap}</span>
+        <span><code>line_offsets</code>: <strong style="color:var(--text)">${escapeHtml(loSize)}</strong>/${escapeHtml(loCap)} (${Number(loSize) * 4} B)</span>
+        <span><code>constant_pool</code>: <strong style="color:var(--text)">${escapeHtml(cpSize)}</strong>/${escapeHtml(cpCap)}</span>
       </div>
     `;
     return;
@@ -1890,7 +1920,7 @@ function renderMemoryTelemetry(step) {
           <span><span class="swatch" style="background:${color};margin-right:5px;"></span>${label}${dPill}</span>
           <span style="color:var(--muted)">
             <strong style="color:var(--text)">${formatBytes(used)}</strong> / ${formatBytes(cap)}
-            (${blocks} blk${blocks === 1 ? '' : 's'}, ${pct}%)
+            (${escapeHtml(blocks)} blk${blocks === 1 ? '' : 's'}, ${pct}%)
           </span>
         </div>
         <div class="mem-bar-bg">
@@ -1906,8 +1936,8 @@ function renderMemoryTelemetry(step) {
     ${makeArenaRow('Scratch Arena (<code>scratch_arena</code>)', m.scratch, step._scratchDelta, 'var(--cyan)')}
     ${xallocRowHtml}
     <div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:11px;color:var(--muted);padding-top:4px;border-top:1px solid var(--border);">
-      <span><code>line_offsets</code>: <strong style="color:var(--text)">${loSize}</strong>/${loCap} (${loSize * 4} B)</span>
-      <span><code>constant_pool</code>: <strong style="color:var(--text)">${cpSize}</strong>/${cpCap}</span>
+      <span><code>line_offsets</code>: <strong style="color:var(--text)">${escapeHtml(loSize)}</strong>/${escapeHtml(loCap)} (${Number(loSize) * 4} B)</span>
+      <span><code>constant_pool</code>: <strong style="color:var(--text)">${escapeHtml(cpSize)}</strong>/${escapeHtml(cpCap)}</span>
       <span>Arena: <strong style="color:var(--text)">${formatBytes(step._memTotalUsed)}</strong>/${formatBytes(step._memTotalCap)}</span>
     </div>
   `;
@@ -1937,8 +1967,8 @@ function renderAstForest(step) {
       const frees = d.free_count || 0;
       document.getElementById('astSummary').innerHTML = '0 nodes (torn down)';
       treeBox.innerHTML = leaked > 0
-        ? `<span style="color:var(--red);font-weight:700;">⚠ Parser &amp; AST torn down with memory leak: ${formatBytes(leaked)} unfreed across ${blocks} block(s) (${allocs} alloc / ${frees} free)</span>`
-        : `<span style="color:var(--green);font-weight:600;">✓ Parser &amp; AST torn down cleanly — 0 B leaked (${allocs}/${frees} allocations freed)</span>`;
+        ? `<span style="color:var(--red);font-weight:700;">⚠ Parser &amp; AST torn down with memory leak: ${formatBytes(leaked)} unfreed across ${escapeHtml(blocks)} block(s) (${escapeHtml(allocs)} alloc / ${escapeHtml(frees)} free)</span>`
+        : `<span style="color:var(--green);font-weight:600;">✓ Parser &amp; AST torn down cleanly — 0 B leaked (${escapeHtml(allocs)}/${escapeHtml(frees)} allocations freed)</span>`;
       orphansBox.innerHTML = '<span style="color:var(--muted)">(arena freed)</span>';
       return;
     }
@@ -2012,12 +2042,12 @@ function renderAstForest(step) {
       const closeVis = closeRaw ? JSON.stringify(closeRaw).slice(1, -1) : '';
       const valVis = JSON.stringify(n.val.slice(0, 24));
       const openSpan = openVis
-        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="opening_loc [${n.o_loc[0]}..${n.o_loc[1]}]">${escapeHtml(openVis)}</span>`
+        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="opening_loc [${escapeHtml(n.o_loc[0])}..${escapeHtml(n.o_loc[1])}]">${escapeHtml(openVis)}</span>`
         : '';
-      const cLocLabel = n.c_loc ? `content_loc [${n.c_loc[0]}..${n.c_loc[1]}]` : `loc [${n.start}..${n.end}]`;
+      const cLocLabel = n.c_loc ? `content_loc [${escapeHtml(n.c_loc[0])}..${escapeHtml(n.c_loc[1])}]` : `loc [${escapeHtml(n.start)}..${escapeHtml(n.end)}]`;
       const contentSpan = `<span class="ast-slice" style="color:var(--green);" title="Unescaped content (${cLocLabel})">${escapeHtml(valVis)}</span>`;
       const closeSpan = closeVis
-        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="closing_loc [${n.cl_loc[0]}..${n.cl_loc[1]}]">${escapeHtml(closeVis)}</span>`
+        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="closing_loc [${escapeHtml(n.cl_loc[0])}..${escapeHtml(n.cl_loc[1])}]">${escapeHtml(closeVis)}</span>`
         : '';
       sliceHtml = `${openSpan}${contentSpan}${closeSpan}`;
     } else if (n.o_loc || n.cl_loc) {
@@ -2026,10 +2056,10 @@ function renderAstForest(step) {
       const openVis = openRaw ? JSON.stringify(openRaw).slice(1, -1) : '';
       const closeVis = closeRaw ? JSON.stringify(closeRaw).slice(1, -1) : '';
       const openSpan = openVis
-        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="opening_loc [${n.o_loc[0]}..${n.o_loc[1]}]">${escapeHtml(openVis)}</span>`
+        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="opening_loc [${escapeHtml(n.o_loc[0])}..${escapeHtml(n.o_loc[1])}]">${escapeHtml(openVis)}</span>`
         : '';
       const closeSpan = closeVis
-        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="closing_loc [${n.cl_loc[0]}..${n.cl_loc[1]}]">${escapeHtml(closeVis)}</span>`
+        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="closing_loc [${escapeHtml(n.cl_loc[0])}..${escapeHtml(n.cl_loc[1])}]">${escapeHtml(closeVis)}</span>`
         : '';
       sliceHtml = `${openSpan}<span class="ast-slice">…</span>${closeSpan}`;
     } else {
@@ -2037,12 +2067,12 @@ function renderAstForest(step) {
       sliceHtml = `<span class="ast-slice">${escapeHtml(slice)}</span>`;
     }
     const jumpPill = (typeof detectIdx === 'number' && detectIdx !== currentIdx)
-      ? `<span class="copy-pill ast-jump-underflow" style="border-color:var(--red);color:#ffa198;" title="Jump to step #${currentTrace.steps[detectIdx].step} where this corrupted node was detected">↳ Jump to Step #${currentTrace.steps[detectIdx].step}</span>`
+      ? `<span class="copy-pill ast-jump-underflow" style="border-color:var(--red);color:#ffa198;" title="Jump to step #${escapeHtml(currentTrace.steps[detectIdx].step)} where this corrupted node was detected">↳ Jump to Step #${escapeHtml(currentTrace.steps[detectIdx].step)}</span>`
       : '';
     row.innerHTML = `
-      <span class="ast-id">#${n.id}</span>
-      <span>${n.type}</span>
-      <span class="ast-loc">[${n.start}..${n.end}]</span>
+      <span class="ast-id">#${escapeHtml(n.id)}</span>
+      <span>${escapeHtml(n.type)}</span>
+      <span class="ast-loc">[${escapeHtml(n.start)}..${escapeHtml(n.end)}]</span>
       ${sliceHtml}
       ${jumpPill}
     `;
