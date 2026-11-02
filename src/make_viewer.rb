@@ -1016,10 +1016,10 @@ async function initWasm() {
     if (instance.exports._initialize) instance.exports._initialize();
     wasmExports = instance.exports;
     if (!statusEl.innerHTML.includes('Crash captured')) {
-      statusEl.innerHTML = `<span style="color:var(--green)">● Wasm ready (Prism ${escapeHtml(PRISM_BUILD_INFO.id)} @ ${escapeHtml(PRISM_BUILD_INFO.short_sha)})</span>`;
+      setSafeHtml(statusEl, safeHtml`<span style="color:var(--green)">● Wasm ready (Prism ${PRISM_BUILD_INFO.id} @ ${PRISM_BUILD_INFO.short_sha})</span>`);
     }
   } catch (err) {
-    statusEl.innerHTML = `<span style="color:var(--red)">Wasm init error: ${escapeHtml(err && err.message ? err.message : err)}</span>`;
+    setSafeHtml(statusEl, safeHtml`<span style="color:var(--red)">Wasm init error: ${err && err.message ? err.message : err}</span>`);
   }
 }
 
@@ -1117,15 +1117,21 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
   const hasUnderflow = currentTrace._underflowIdx >= 0;
 
   if (hasCrash) {
-    document.getElementById('wasmStatus').innerHTML =
-      `<span style="color:var(--red);font-weight:700;">💥 Crash captured at step ${ steps.length - 1 } (${escapeHtml(dt)} ms) — Wasm reset</span>`;
+    setSafeHtml(
+      document.getElementById('wasmStatus'),
+      safeHtml`<span style="color:var(--red);font-weight:700;">💥 Crash captured at step ${steps.length - 1} (${dt} ms) — Wasm reset</span>`
+    );
   } else if (hasUnderflow) {
     const uStep = currentTrace.steps[currentTrace._underflowIdx];
-    document.getElementById('wasmStatus').innerHTML =
-      `<span style="color:var(--red);font-weight:700;">⚠ Corrupted node (underflow) at step ${escapeHtml(uStep.step)} (${escapeHtml(dt)} ms)</span>`;
+    setSafeHtml(
+      document.getElementById('wasmStatus'),
+      safeHtml`<span style="color:var(--red);font-weight:700;">⚠ Corrupted node (underflow) at step ${uStep.step} (${dt} ms)</span>`
+    );
   } else {
-    document.getElementById('wasmStatus').innerHTML =
-      `<span style="color:var(--green)">● Traced ${steps.length} steps in ${escapeHtml(dt)} ms</span>`;
+    setSafeHtml(
+      document.getElementById('wasmStatus'),
+      safeHtml`<span style="color:var(--green)">● Traced ${steps.length} steps in ${dt} ms</span>`
+    );
   }
 }
 
@@ -1409,16 +1415,57 @@ function escapeHtml(str) {
     .replace(/'/g, '&#39;');
 }
 
+class RawHtml {
+  constructor(html) {
+    this.html = String(html ?? '');
+  }
+}
+
+function rawHtml(html) {
+  return new RawHtml(html);
+}
+
+function safeHtml(strings, ...values) {
+  let out = strings[0];
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (v instanceof RawHtml) {
+      out += v.html;
+    } else if (Array.isArray(v)) {
+      out += v.map(item => (item instanceof RawHtml ? item.html : escapeHtml(item))).join('');
+    } else {
+      out += escapeHtml(v);
+    }
+    out += strings[i + 1];
+  }
+  return new RawHtml(out);
+}
+
+function setSafeHtml(el, rendered) {
+  if (!el) return;
+  el.innerHTML = (rendered instanceof RawHtml) ? rendered.html : escapeHtml(rendered);
+}
+
 function safeCssToken(str) {
   return String(str ?? '').replace(/[^A-Za-z0-9_-]/g, '');
 }
 
+function sanitizeRelSourcePath(rawPath) {
+  const cleaned = String(rawPath ?? '')
+    .replace(/\\/g, '/')
+    .replace(/[^A-Za-z0-9_./-]/g, '');
+  const parts = cleaned.split('/').filter(p => p && p !== '.' && p !== '..');
+  if (parts.length === 0) return 'src/prism.c';
+  const rel = parts.join('/');
+  return rel.includes('/') ? rel : ('src/' + rel);
+}
+
 function stepSourceFile(step) {
-  if (step.detail && step.detail.file) {
-    const f = step.detail.file;
-    return f.includes('/') ? f : ('src/' + f);
+  if (step && step.detail && step.detail.file) {
+    return sanitizeRelSourcePath(step.detail.file);
   }
-  if (step.func.startsWith('pm_') && step.func.endsWith('_new')) return 'src/node.c';
+  const fn = String((step && step.func) || '');
+  if (fn.startsWith('pm_') && fn.endsWith('_new')) return 'src/node.c';
   return 'src/prism.c';
 }
 
@@ -1582,17 +1629,17 @@ function renderStep() {
     btnCrash.style.display = 'inline-block';
     btnCrash.disabled = (currentIdx === currentTrace._crashIdx);
     const jumpBtn = currentIdx !== currentTrace._crashIdx
-      ? `<button class="warn" style="margin-left:8px;padding:2px 7px;" data-jump-step="${Number(currentTrace._crashIdx)}">Jump to Crash Step #${escapeHtml(crashStep.step)}</button>`
-      : `<span class="badge kind-CRASH" style="margin-left:8px;">AT CRASH POINT</span>`;
-    cb.innerHTML = `
+      ? safeHtml`<button class="warn" style="margin-left:8px;padding:2px 7px;" data-jump-step="${Number(currentTrace._crashIdx)}">Jump to Crash Step #${crashStep.step}</button>`
+      : safeHtml`<span class="badge kind-CRASH" style="margin-left:8px;">AT CRASH POINT</span>`;
+    setSafeHtml(cb, safeHtml`
       <div style="display:flex;justify-content:space-between;align-items:center;">
-        <strong>💥 PRISM CRASH INTERCEPTED (${escapeHtml(cd.reason || 'CRASH')})</strong>
+        <strong>💥 PRISM CRASH INTERCEPTED (${cd.reason || 'CRASH'})</strong>
         ${jumpBtn}
       </div>
       <div style="margin-top:4px;color:var(--text);">
-        <code>assert(${escapeHtml(cd.expr || '')})</code> failed in <code>${escapeHtml(cd.func || crashStep.func)}()</code> at <code>${escapeHtml(cFile)}:${escapeHtml(cd.line || crashStep.line)}</code>
+        <code>assert(${cd.expr || ''})</code> failed in <code>${cd.func || crashStep.func}()</code> at <code>${cFile}:${cd.line || crashStep.line}</code>
       </div>
-    `;
+    `);
     cb.querySelectorAll('[data-jump-step]').forEach(btn => {
       btn.addEventListener('click', () => jumpToStep(Number(btn.getAttribute('data-jump-step'))));
     });
@@ -1612,38 +1659,38 @@ function renderStep() {
     const atUnderflowStep = uSteps.includes(currentIdx);
     const nextUStepIdx = uSteps.find(idx => idx > currentIdx) ?? uSteps[0];
     const nextUStep = currentTrace.steps[nextUStepIdx];
-    let headerActionHtml = '';
+    let headerActionHtml = rawHtml('');
     if (!atUnderflowStep) {
-      headerActionHtml = `<button class="warn" style="margin-left:8px;padding:2px 7px;" data-jump-step="${Number(nextUStepIdx)}">Jump to Detection Step #${escapeHtml(nextUStep.step)}</button>`;
+      headerActionHtml = safeHtml`<button class="warn" style="margin-left:8px;padding:2px 7px;" data-jump-step="${Number(nextUStepIdx)}">Jump to Detection Step #${nextUStep.step}</button>`;
     } else if (uSteps.length > 1) {
-      headerActionHtml = `
+      headerActionHtml = safeHtml`
         <span style="display:inline-flex;align-items:center;gap:6px;margin-left:8px;">
-          <span class="badge kind-CRASH">AT DETECTION STEP #${escapeHtml(step.step)}</span>
-          <button class="warn" style="padding:2px 7px;" data-jump-step="${Number(nextUStepIdx)}">Next Underflow (#${escapeHtml(nextUStep.step)}) &rarr;</button>
+          <span class="badge kind-CRASH">AT DETECTION STEP #${step.step}</span>
+          <button class="warn" style="padding:2px 7px;" data-jump-step="${Number(nextUStepIdx)}">Next Underflow (#${nextUStep.step}) &rarr;</button>
         </span>
       `;
     } else {
-      headerActionHtml = `<span class="badge kind-CRASH" style="margin-left:8px;">AT DETECTION STEP</span>`;
+      headerActionHtml = safeHtml`<span class="badge kind-CRASH" style="margin-left:8px;">AT DETECTION STEP</span>`;
     }
     const itemsHtml = uEvents.map(ev => {
       const caller = ev.callStack.length > 0 ? ev.callStack[ev.callStack.length - 1] : null;
-      const callerStr = (caller && caller !== ev.func) ? ` via <code>${escapeHtml(caller)}()</code>` : '';
+      const callerStr = (caller && caller !== ev.func) ? safeHtml` via <code>${caller}()</code>` : rawHtml('');
       const stepBtn = (uEvents.length > 1 && currentIdx !== ev.stepIdx)
-        ? ` <button class="warn" style="padding:1px 6px;font-size:11px;margin-left:4px;" data-jump-step="${Number(ev.stepIdx)}">Step #${escapeHtml(ev.step)}</button>`
-        : '';
-      return `
+        ? safeHtml` <button class="warn" style="padding:1px 6px;font-size:11px;margin-left:4px;" data-jump-step="${Number(ev.stepIdx)}">Step #${ev.step}</button>`
+        : rawHtml('');
+      return safeHtml`
         <div style="margin-top:4px;color:var(--text);">
-          Node <code>#${escapeHtml(ev.node.id)} ${escapeHtml(ev.node.type)}</code> underflowed (<code>start=${escapeHtml(ev.node.start)}, end=${escapeHtml(ev.node.end)}, len=${escapeHtml(ev.node.len)}</code>) in <code>${escapeHtml(ev.func)}()</code>${callerStr} at <code>${escapeHtml(ev.file)}:${escapeHtml(ev.line)}</code>${stepBtn}
+          Node <code>#${ev.node.id} ${ev.node.type}</code> underflowed (<code>start=${ev.node.start}, end=${ev.node.end}, len=${ev.node.len}</code>) in <code>${ev.func}()</code>${callerStr} at <code>${ev.file}:${ev.line}</code>${stepBtn}
         </div>
       `;
-    }).join('');
-    ub.innerHTML = `
+    });
+    setSafeHtml(ub, safeHtml`
       <div style="display:flex;justify-content:space-between;align-items:center;">
         <strong>⚠ CORRUPTED AST NODE DETECTED (${uEvents.length === 1 ? 'LOCATION UNDERFLOW' : uEvents.length + ' LOCATION UNDERFLOWS'})</strong>
         ${headerActionHtml}
       </div>
       ${itemsHtml}
-    `;
+    `);
     ub.querySelectorAll('[data-jump-step]').forEach(btn => {
       btn.addEventListener('click', () => jumpToStep(Number(btn.getAttribute('data-jump-step'))));
     });
@@ -1690,7 +1737,7 @@ function renderStep() {
   });
   const loStatus = document.getElementById('lineOffsetStatus');
   if (badOffsets > 0) {
-    loStatus.innerHTML = `<span style="color:var(--red);font-weight:700;">⚠ ${badOffsets} duplicate/out-of-order newline offset(s)!</span>`;
+    setSafeHtml(loStatus, safeHtml`<span style="color:var(--red);font-weight:700;">⚠ ${badOffsets} duplicate/out-of-order newline offset(s)!</span>`);
   } else {
     loStatus.textContent = `${step.line_offsets.length} line(s)`;
   }
@@ -1699,26 +1746,37 @@ function renderStep() {
   const currSlice = currentTrace.source.slice(Math.max(0, step.curr[0]), Math.max(0, step.curr[1]));
   const detailStr = step.detail ? JSON.stringify(step.detail) : '—';
   const repoRoot = getRepoRoot();
-  let agyPillHtml = '';
+  let agyPillHtml = rawHtml('');
   if (repoRoot) {
+    const safeLine = Math.max(1, Math.trunc(Number(step.line) || 1));
     const absFile = `${repoRoot}/${srcFile}`.replace(/\/+/g, '/');
-    const agyHref = `antigravity-ide://file${absFile.startsWith('/') ? '' : '/'}${absFile}:${step.line}`;
-    agyPillHtml = ` <a id="btnOpenAgyIde" class="copy-pill" href="${escapeHtml(agyHref)}" style="text-decoration:none;" title="Open ${escapeHtml(absFile)}:${escapeHtml(step.line)} in Antigravity IDE and copy trace context to clipboard">↗ Antigravity IDE</a>`;
+    const encodedPath = (absFile.startsWith('/') ? absFile : '/' + absFile)
+      .split('/')
+      .map(seg => encodeURIComponent(seg))
+      .join('/');
+    const agyHref = `antigravity-ide://file${encodedPath}:${safeLine}`;
+    agyPillHtml = safeHtml` <a id="btnOpenAgyIde" class="copy-pill" href="${agyHref}" style="text-decoration:none;" title="Open ${absFile}:${safeLine} in Antigravity IDE and copy trace context to clipboard">↗ Antigravity IDE</a>`;
   }
   const tg = document.getElementById('transitionGrid');
-  tg.innerHTML = `
-    <div class="kv-key">Event Kind</div><div><span class="badge kind-${safeCssToken(step.kind)}">${escapeHtml(step.kind)}</span></div>
+  const nextStartCell = step.next_start >= 0
+    ? safeHtml`<code>offset ${step.next_start}</code>`
+    : safeHtml`<span style="color:var(--muted)">NULL</span>`;
+  const heredocEndCell = step.heredoc_end >= 0
+    ? safeHtml`<code>offset ${step.heredoc_end}</code>`
+    : safeHtml`<span style="color:var(--muted)">NULL</span>`;
+  setSafeHtml(tg, safeHtml`
+    <div class="kv-key">Event Kind</div><div><span class="badge kind-${safeCssToken(step.kind)}">${step.kind}</span></div>
     <div class="kv-key">Location</div><div>
-      <code>${escapeHtml(srcFile)}:${escapeHtml(step.line)}</code> in <code>${escapeHtml(step.func)}()</code>${agyPillHtml}
+      <code>${srcFile}:${step.line}</code> in <code>${step.func}()</code>${agyPillHtml}
     </div>
-    <div class="kv-key">lex_state</div><div><span class="badge kind-LEX_STATE">${escapeHtml(step.lex_state)}</span></div>
-    <div class="kv-key" style="color:var(--green)">current token</div><div id="kvCurrTok"><code style="color:var(--green)">${escapeHtml(step.curr[2])}</code> [${escapeHtml(step.curr[0])}..${escapeHtml(step.curr[1])}] <code>${escapeHtml(JSON.stringify(currSlice))}</code></div>
-    <div class="kv-key" style="color:var(--amber)">previous token</div><div id="kvPrevTok"><code style="color:var(--amber)">${escapeHtml(step.prev[2])}</code> [${escapeHtml(step.prev[0])}..${escapeHtml(step.prev[1])}] <code>${escapeHtml(JSON.stringify(prevSlice))}</code></div>
-    <div class="kv-key">next_start</div><div id="kvNextStart">${step.next_start >= 0 ? '<code>offset ' + escapeHtml(step.next_start) + '</code>' : '<span style="color:var(--muted)">NULL</span>'}</div>
-    <div class="kv-key">heredoc_end</div><div id="kvHeredocEnd">${step.heredoc_end >= 0 ? '<code>offset ' + escapeHtml(step.heredoc_end) + '</code>' : '<span style="color:var(--muted)">NULL</span>'}</div>
-    <div class="kv-key">Errors</div><div>${escapeHtml(step.errors)}</div>
-    <div class="kv-key">Detail</div><div><code>${escapeHtml(detailStr)}</code></div>
-  `;
+    <div class="kv-key">lex_state</div><div><span class="badge kind-LEX_STATE">${step.lex_state}</span></div>
+    <div class="kv-key" style="color:var(--green)">current token</div><div id="kvCurrTok"><code style="color:var(--green)">${step.curr[2]}</code> [${step.curr[0]}..${step.curr[1]}] <code>${JSON.stringify(currSlice)}</code></div>
+    <div class="kv-key" style="color:var(--amber)">previous token</div><div id="kvPrevTok"><code style="color:var(--amber)">${step.prev[2]}</code> [${step.prev[0]}..${step.prev[1]}] <code>${JSON.stringify(prevSlice)}</code></div>
+    <div class="kv-key">next_start</div><div id="kvNextStart">${nextStartCell}</div>
+    <div class="kv-key">heredoc_end</div><div id="kvHeredocEnd">${heredocEndCell}</div>
+    <div class="kv-key">Errors</div><div>${step.errors}</div>
+    <div class="kv-key">Detail</div><div><code>${detailStr}</code></div>
+  `);
   const agyPill = document.getElementById('btnOpenAgyIde');
   if (agyPill) {
     agyPill.addEventListener('click', () => {
@@ -1860,32 +1918,32 @@ function renderMemoryTelemetry(step) {
   const [loSize, loCap] = m.lo || [0, 0];
   const [cpSize, cpCap] = m.cp || [0, 0];
   const [xLive, xPeakStep, xAllocs, xFrees] = m.xalloc || [0, 0, 0, 0];
-  const xPeak = Math.max(xPeakStep || 0, (currentTrace && currentTrace._peakXallocUsed) || 0, xLive || 0);
-  const xPct = xPeak > 0 ? Math.min(100, (xLive / xPeak) * 100).toFixed(1) : 0;
-  const xDelta = step._xallocDelta || 0;
+  const xPeak = Math.max(Number(xPeakStep) || 0, (currentTrace && Number(currentTrace._peakXallocUsed)) || 0, Number(xLive) || 0);
+  const xPct = xPeak > 0 ? Math.max(0, Math.min(100, ((Number(xLive) || 0) / xPeak) * 100)).toFixed(1) : '0';
+  const xDelta = Number(step._xallocDelta) || 0;
   const xDeltaPill = xDelta > 0
-    ? `<span class="mem-delta-pill">xmalloc +${formatBytes(xDelta)}</span>`
-    : (xDelta < 0 ? `<span class="mem-delta-pill" style="background:rgba(88,166,255,0.18);color:var(--accent);">xfree -${formatBytes(Math.abs(xDelta))}</span>` : '');
+    ? safeHtml`<span class="mem-delta-pill">xmalloc +${formatBytes(xDelta)}</span>`
+    : (xDelta < 0 ? safeHtml`<span class="mem-delta-pill" style="background:rgba(88,166,255,0.18);color:var(--accent);">xfree -${formatBytes(Math.abs(xDelta))}</span>` : rawHtml(''));
 
   const leak = currentTrace && currentTrace.leak_summary;
-  let leakBadgeHtml = '';
+  let leakBadgeHtml = null;
   if (leak) {
     if (leak.leaked_bytes > 0) {
-      leakBadgeHtml = `<span style="color:var(--red);font-weight:700;" title="${escapeHtml(leak.leaked_blocks)} unfreed block(s) remaining after parser teardown">⚠ Leak: ${formatBytes(leak.leaked_bytes)} (${escapeHtml(leak.leaked_blocks)} blk)</span>`;
+      leakBadgeHtml = safeHtml`<span style="color:var(--red);font-weight:700;" title="${leak.leaked_blocks} unfreed block(s) remaining after parser teardown">⚠ Leak: ${formatBytes(leak.leaked_bytes)} (${leak.leaked_blocks} blk)</span>`;
     } else if (step.kind === 'TEARDOWN') {
-      leakBadgeHtml = `<span style="color:var(--green);font-weight:600;" title="All ${escapeHtml(leak.alloc_count)} xmalloc/xcalloc/xrealloc allocations (${formatBytes(leak.total_bytes)}) freed cleanly on teardown">✓ 0 B leaked (${escapeHtml(leak.alloc_count)}/${escapeHtml(leak.free_count)} freed)</span>`;
+      leakBadgeHtml = safeHtml`<span style="color:var(--green);font-weight:600;" title="All ${leak.alloc_count} xmalloc/xcalloc/xrealloc allocations (${formatBytes(leak.total_bytes)}) freed cleanly on teardown">✓ 0 B leaked (${leak.alloc_count}/${leak.free_count} freed)</span>`;
     } else {
-      leakBadgeHtml = `<span style="color:var(--green);font-weight:600;" title="Step to TEARDOWN (final step) to see all ${escapeHtml(leak.alloc_count)} allocations freed">✓ 0 B leaked on teardown</span>`;
+      leakBadgeHtml = safeHtml`<span style="color:var(--green);font-weight:600;" title="Step to TEARDOWN (final step) to see all ${leak.alloc_count} allocations freed">✓ 0 B leaked on teardown</span>`;
     }
   }
 
-  const xallocRowHtml = `
+  const xallocRowHtml = safeHtml`
     <div class="mem-row">
       <div class="mem-row-header">
         <span><span class="swatch" style="background:var(--green);margin-right:5px;"></span>Heap${xDeltaPill}</span>
         <span style="color:var(--muted)">
           <strong style="color:var(--text)">${formatBytes(xLive)}</strong> / ${formatBytes(xPeak)} peak
-          (${escapeHtml(xAllocs)} alloc, ${escapeHtml(xFrees)} free)
+          (${xAllocs} alloc, ${xFrees} free)
         </span>
       </div>
       <div class="mem-bar-bg">
@@ -1895,32 +1953,35 @@ function renderMemoryTelemetry(step) {
   `;
 
   if (!hasArena) {
-    badge.innerHTML = leakBadgeHtml || `<span style="color:var(--muted)">peak: ${formatBytes(xPeak)}</span>`;
-    document.getElementById('memBreakdownBox').innerHTML = `
+    setSafeHtml(badge, leakBadgeHtml || safeHtml`<span style="color:var(--muted)">peak: ${formatBytes(xPeak)}</span>`);
+    setSafeHtml(document.getElementById('memBreakdownBox'), safeHtml`
       ${xallocRowHtml}
       <div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:11px;color:var(--muted);padding-top:4px;border-top:1px solid var(--border);">
-        <span><code>line_offsets</code>: <strong style="color:var(--text)">${escapeHtml(loSize)}</strong>/${escapeHtml(loCap)} (${Number(loSize) * 4} B)</span>
-        <span><code>constant_pool</code>: <strong style="color:var(--text)">${escapeHtml(cpSize)}</strong>/${escapeHtml(cpCap)}</span>
+        <span><code>line_offsets</code>: <strong style="color:var(--text)">${loSize}</strong>/${loCap} (${(Number(loSize) || 0) * 4} B)</span>
+        <span><code>constant_pool</code>: <strong style="color:var(--text)">${cpSize}</strong>/${cpCap}</span>
       </div>
-    `;
+    `);
     return;
   }
 
-  badge.innerHTML = step._memDelta > 0
-    ? `<span class="mem-delta-pill">+${formatBytes(step._memDelta)} this step</span>`
-    : (leakBadgeHtml || `<span style="color:var(--muted)">peak: ${formatBytes(currentTrace._peakMemUsed || 0)}</span>`);
+  setSafeHtml(
+    badge,
+    step._memDelta > 0
+      ? safeHtml`<span class="mem-delta-pill">+${formatBytes(step._memDelta)} this step</span>`
+      : (leakBadgeHtml || safeHtml`<span style="color:var(--muted)">peak: ${formatBytes(currentTrace._peakMemUsed || 0)}</span>`)
+  );
 
-  const makeArenaRow = (label, arr, delta, color) => {
+  const makeArenaRow = (labelHtml, arr, delta, color) => {
     const [used, cap, blocks] = arr;
-    const pct = cap > 0 ? Math.min(100, (used / cap) * 100).toFixed(1) : 0;
-    const dPill = delta > 0 ? `<span class="mem-delta-pill">+${formatBytes(delta)}</span>` : '';
-    return `
+    const pct = (Number(cap) || 0) > 0 ? Math.max(0, Math.min(100, ((Number(used) || 0) / Number(cap)) * 100)).toFixed(1) : '0';
+    const dPill = delta > 0 ? safeHtml`<span class="mem-delta-pill">+${formatBytes(delta)}</span>` : rawHtml('');
+    return safeHtml`
       <div class="mem-row">
         <div class="mem-row-header">
-          <span><span class="swatch" style="background:${color};margin-right:5px;"></span>${label}${dPill}</span>
+          <span><span class="swatch" style="background:${color};margin-right:5px;"></span>${labelHtml}${dPill}</span>
           <span style="color:var(--muted)">
             <strong style="color:var(--text)">${formatBytes(used)}</strong> / ${formatBytes(cap)}
-            (${escapeHtml(blocks)} blk${blocks === 1 ? '' : 's'}, ${pct}%)
+            (${blocks} blk${blocks === 1 ? '' : 's'}, ${pct}%)
           </span>
         </div>
         <div class="mem-bar-bg">
@@ -1930,17 +1991,17 @@ function renderMemoryTelemetry(step) {
     `;
   };
 
-  document.getElementById('memBreakdownBox').innerHTML = `
-    ${makeArenaRow('AST Arena (<code>parser-&gt;arena</code>)', m.ast, step._astDelta, 'var(--accent)')}
-    ${makeArenaRow('Metadata Arena (<code>metadata_arena</code>)', m.meta, step._metaDelta, 'var(--purple)')}
-    ${makeArenaRow('Scratch Arena (<code>scratch_arena</code>)', m.scratch, step._scratchDelta, 'var(--cyan)')}
+  setSafeHtml(document.getElementById('memBreakdownBox'), safeHtml`
+    ${makeArenaRow(rawHtml('AST Arena (<code>parser-&gt;arena</code>)'), m.ast, step._astDelta, 'var(--accent)')}
+    ${makeArenaRow(rawHtml('Metadata Arena (<code>metadata_arena</code>)'), m.meta, step._metaDelta, 'var(--purple)')}
+    ${makeArenaRow(rawHtml('Scratch Arena (<code>scratch_arena</code>)'), m.scratch, step._scratchDelta, 'var(--cyan)')}
     ${xallocRowHtml}
     <div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:11px;color:var(--muted);padding-top:4px;border-top:1px solid var(--border);">
-      <span><code>line_offsets</code>: <strong style="color:var(--text)">${escapeHtml(loSize)}</strong>/${escapeHtml(loCap)} (${Number(loSize) * 4} B)</span>
-      <span><code>constant_pool</code>: <strong style="color:var(--text)">${escapeHtml(cpSize)}</strong>/${escapeHtml(cpCap)}</span>
+      <span><code>line_offsets</code>: <strong style="color:var(--text)">${loSize}</strong>/${loCap} (${(Number(loSize) || 0) * 4} B)</span>
+      <span><code>constant_pool</code>: <strong style="color:var(--text)">${cpSize}</strong>/${cpCap}</span>
       <span>Arena: <strong style="color:var(--text)">${formatBytes(step._memTotalUsed)}</strong>/${formatBytes(step._memTotalCap)}</span>
     </div>
-  `;
+  `);
 }
 
 function renderAstForest(step) {
@@ -1965,16 +2026,19 @@ function renderAstForest(step) {
       const blocks = d.leaked_blocks || 0;
       const allocs = d.alloc_count || 0;
       const frees = d.free_count || 0;
-      document.getElementById('astSummary').innerHTML = '0 nodes (torn down)';
-      treeBox.innerHTML = leaked > 0
-        ? `<span style="color:var(--red);font-weight:700;">⚠ Parser &amp; AST torn down with memory leak: ${formatBytes(leaked)} unfreed across ${escapeHtml(blocks)} block(s) (${escapeHtml(allocs)} alloc / ${escapeHtml(frees)} free)</span>`
-        : `<span style="color:var(--green);font-weight:600;">✓ Parser &amp; AST torn down cleanly — 0 B leaked (${escapeHtml(allocs)}/${escapeHtml(frees)} allocations freed)</span>`;
-      orphansBox.innerHTML = '<span style="color:var(--muted)">(arena freed)</span>';
+      document.getElementById('astSummary').textContent = '0 nodes (torn down)';
+      setSafeHtml(
+        treeBox,
+        leaked > 0
+          ? safeHtml`<span style="color:var(--red);font-weight:700;">⚠ Parser &amp; AST torn down with memory leak: ${formatBytes(leaked)} unfreed across ${blocks} block(s) (${allocs} alloc / ${frees} free)</span>`
+          : safeHtml`<span style="color:var(--green);font-weight:600;">✓ Parser &amp; AST torn down cleanly — 0 B leaked (${allocs}/${frees} allocations freed)</span>`
+      );
+      setSafeHtml(orphansBox, safeHtml`<span style="color:var(--muted)">(arena freed)</span>`);
       return;
     }
-    document.getElementById('astSummary').innerHTML = '0 allocated node(s)';
-    treeBox.innerHTML = '<span style="color:var(--muted)">(no AST nodes allocated yet)</span>';
-    orphansBox.innerHTML = '<span style="color:var(--muted)">—</span>';
+    document.getElementById('astSummary').textContent = '0 allocated node(s)';
+    setSafeHtml(treeBox, safeHtml`<span style="color:var(--muted)">(no AST nodes allocated yet)</span>`);
+    setSafeHtml(orphansBox, safeHtml`<span style="color:var(--muted)">—</span>`);
     return;
   }
 
@@ -2015,9 +2079,12 @@ function renderAstForest(step) {
     activeRoots.forEach(countSubtree);
     displayNodeCount = activeCount;
   }
-  document.getElementById('astSummary').innerHTML = underflowCount > 0
-    ? `<span style="color:var(--red);font-weight:700;">⚠ ${underflowCount} corrupted location(s) / ${displayNodeCount} nodes</span>`
-    : `${displayNodeCount} ${hasArena ? 'allocated' : 'active'} node(s)`;
+  setSafeHtml(
+    document.getElementById('astSummary'),
+    underflowCount > 0
+      ? safeHtml`<span style="color:var(--red);font-weight:700;">⚠ ${underflowCount} corrupted location(s) / ${displayNodeCount} nodes</span>`
+      : safeHtml`${displayNodeCount} ${hasArena ? 'allocated' : 'active'} node(s)`
+  );
 
   function buildNodeDom(n) {
     const wrapper = document.createElement('div');
@@ -2031,10 +2098,10 @@ function renderAstForest(step) {
     row.className = 'ast-row' +
       (n.id === changedNodeId ? ' just-changed' : '') +
       (isUnderflow ? ' underflow-node' : '');
-    let sliceHtml = '';
+    let sliceHtml = rawHtml('');
     if (isUnderflow) {
       const uText = `⚠ UNDERFLOW len=${n.len} (end=${n.end} < start=${n.start})`;
-      sliceHtml = `<span class="ast-slice" style="color:var(--red);font-weight:700;">${escapeHtml(uText)}</span>`;
+      sliceHtml = safeHtml`<span class="ast-slice" style="color:var(--red);font-weight:700;">${uText}</span>`;
     } else if (typeof n.val === 'string') {
       const openRaw = n.o_loc ? currentTrace.source.slice(n.o_loc[0], n.o_loc[1]) : '';
       const closeRaw = n.cl_loc ? currentTrace.source.slice(n.cl_loc[0], n.cl_loc[1]) : '';
@@ -2042,40 +2109,40 @@ function renderAstForest(step) {
       const closeVis = closeRaw ? JSON.stringify(closeRaw).slice(1, -1) : '';
       const valVis = JSON.stringify(n.val.slice(0, 24));
       const openSpan = openVis
-        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="opening_loc [${escapeHtml(n.o_loc[0])}..${escapeHtml(n.o_loc[1])}]">${escapeHtml(openVis)}</span>`
-        : '';
-      const cLocLabel = n.c_loc ? `content_loc [${escapeHtml(n.c_loc[0])}..${escapeHtml(n.c_loc[1])}]` : `loc [${escapeHtml(n.start)}..${escapeHtml(n.end)}]`;
-      const contentSpan = `<span class="ast-slice" style="color:var(--green);" title="Unescaped content (${cLocLabel})">${escapeHtml(valVis)}</span>`;
+        ? safeHtml`<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="opening_loc [${n.o_loc[0]}..${n.o_loc[1]}]">${openVis}</span>`
+        : rawHtml('');
+      const cLocLabel = n.c_loc ? `content_loc [${n.c_loc[0]}..${n.c_loc[1]}]` : `loc [${n.start}..${n.end}]`;
+      const contentSpan = safeHtml`<span class="ast-slice" style="color:var(--green);" title="Unescaped content (${cLocLabel})">${valVis}</span>`;
       const closeSpan = closeVis
-        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="closing_loc [${escapeHtml(n.cl_loc[0])}..${escapeHtml(n.cl_loc[1])}]">${escapeHtml(closeVis)}</span>`
-        : '';
-      sliceHtml = `${openSpan}${contentSpan}${closeSpan}`;
+        ? safeHtml`<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="closing_loc [${n.cl_loc[0]}..${n.cl_loc[1]}]">${closeVis}</span>`
+        : rawHtml('');
+      sliceHtml = safeHtml`${openSpan}${contentSpan}${closeSpan}`;
     } else if (n.o_loc || n.cl_loc) {
       const openRaw = n.o_loc ? currentTrace.source.slice(n.o_loc[0], n.o_loc[1]) : '';
       const closeRaw = n.cl_loc ? currentTrace.source.slice(n.cl_loc[0], n.cl_loc[1]) : '';
       const openVis = openRaw ? JSON.stringify(openRaw).slice(1, -1) : '';
       const closeVis = closeRaw ? JSON.stringify(closeRaw).slice(1, -1) : '';
       const openSpan = openVis
-        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="opening_loc [${escapeHtml(n.o_loc[0])}..${escapeHtml(n.o_loc[1])}]">${escapeHtml(openVis)}</span>`
-        : '';
+        ? safeHtml`<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="opening_loc [${n.o_loc[0]}..${n.o_loc[1]}]">${openVis}</span>`
+        : rawHtml('');
       const closeSpan = closeVis
-        ? `<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="closing_loc [${escapeHtml(n.cl_loc[0])}..${escapeHtml(n.cl_loc[1])}]">${escapeHtml(closeVis)}</span>`
-        : '';
-      sliceHtml = `${openSpan}<span class="ast-slice">…</span>${closeSpan}`;
+        ? safeHtml`<span style="color:var(--amber);background:rgba(210,153,34,0.12);padding:0 3px;border-radius:3px;" title="closing_loc [${n.cl_loc[0]}..${n.cl_loc[1]}]">${closeVis}</span>`
+        : rawHtml('');
+      sliceHtml = safeHtml`${openSpan}<span class="ast-slice">…</span>${closeSpan}`;
     } else {
       const slice = JSON.stringify(currentTrace.source.slice(n.start, Math.min(n.end, n.start + 24)));
-      sliceHtml = `<span class="ast-slice">${escapeHtml(slice)}</span>`;
+      sliceHtml = safeHtml`<span class="ast-slice">${slice}</span>`;
     }
     const jumpPill = (typeof detectIdx === 'number' && detectIdx !== currentIdx)
-      ? `<span class="copy-pill ast-jump-underflow" style="border-color:var(--red);color:#ffa198;" title="Jump to step #${escapeHtml(currentTrace.steps[detectIdx].step)} where this corrupted node was detected">↳ Jump to Step #${escapeHtml(currentTrace.steps[detectIdx].step)}</span>`
-      : '';
-    row.innerHTML = `
-      <span class="ast-id">#${escapeHtml(n.id)}</span>
-      <span>${escapeHtml(n.type)}</span>
-      <span class="ast-loc">[${escapeHtml(n.start)}..${escapeHtml(n.end)}]</span>
+      ? safeHtml`<span class="copy-pill ast-jump-underflow" style="border-color:var(--red);color:#ffa198;" title="Jump to step #${currentTrace.steps[detectIdx].step} where this corrupted node was detected">↳ Jump to Step #${currentTrace.steps[detectIdx].step}</span>`
+      : rawHtml('');
+    setSafeHtml(row, safeHtml`
+      <span class="ast-id">#${n.id}</span>
+      <span>${n.type}</span>
+      <span class="ast-loc">[${n.start}..${n.end}]</span>
       ${sliceHtml}
       ${jumpPill}
-    `;
+    `);
     const jumpEl = row.querySelector('.ast-jump-underflow');
     if (jumpEl && typeof detectIdx === 'number') {
       jumpEl.addEventListener('click', (e) => {
@@ -3705,8 +3772,10 @@ async function registerWebMcpTools() {
       document.getElementById('rubyEditor').value = decoded;
       await parseWithWasm(decoded, 'Shared URL Snippet');
     } catch (err) {
-      document.getElementById('wasmStatus').innerHTML =
-        `<span style="color:var(--red)">Invalid ?code= Base64 parameter: ${escapeHtml(err.message)}</span>`;
+      setSafeHtml(
+        document.getElementById('wasmStatus'),
+        safeHtml`<span style="color:var(--red)">Invalid ?code= Base64 parameter: ${err && err.message ? err.message : err}</span>`
+      );
     }
   } else if (PRESETS[0]) {
     if (PRESETS[0].steps) {
@@ -3892,6 +3961,13 @@ loupe_license_text = File.exist?(loupe_license_path) ? File.read(loupe_license_p
 prism_license_path = File.join(PRISM_DIR, "LICENSE.md")
 prism_license_text = File.exist?(prism_license_path) ? File.read(prism_license_path, encoding: "UTF-8").strip : "Copyright 2022-present, Ruby developers (MIT License)"
 
+def safe_script_json(obj)
+  JSON.generate(obj)
+    .gsub("</", "<\\/")
+    .gsub("\u2028", "\\u2028")
+    .gsub("\u2029", "\\u2029")
+end
+
 html = HTML_TEMPLATE
   .sub("__LOUPE_LICENSE_TEXT__") { loupe_license_text }
   .sub("__PRISM_LICENSE_TEXT__") { prism_license_text }
@@ -3910,9 +3986,9 @@ html = HTML_TEMPLATE
   .gsub("__PLAYGROUND_DATE__") { playground_date }
   .gsub("__PLAYGROUND_COMMIT_URL__") { playground_commit_url }
   .gsub("__PLAYGROUND_TITLE__") { playground_title }
-  .sub("__PRISM_BUILD_INFO_JSON__") { JSON.generate(primary_info) }
-  .sub("__PRISM_VERSIONS_JSON__") { JSON.generate(prism_versions) }
-  .sub("__PRESETS_JSON__") { JSON.generate(presets) }
+  .sub("__PRISM_BUILD_INFO_JSON__") { safe_script_json(primary_info) }
+  .sub("__PRISM_VERSIONS_JSON__") { safe_script_json(prism_versions) }
+  .sub("__PRESETS_JSON__") { safe_script_json(presets) }
 
 out_html = OUT_HTML
 FileUtils.mkdir_p(File.dirname(out_html))
