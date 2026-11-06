@@ -641,12 +641,14 @@ prism_trace_emit_event(
             uint32_t n_start = loc_start_offset(parser, &n->location);
             uint32_t n_len = loc_length_bytes(&n->location);
             uint32_t wrapped_end = n_start + n_len;
-            int underflow = ((uint64_t)n_start + (uint64_t)n_len > src_len) ? 1 : 0;
+            int underflow = (wrapped_end < n_start || n_len >= 0x80000000U) ? 1 : 0;
+            int oob = (!underflow && (uint64_t)n_start + (uint64_t)n_len > src_len) ? 1 : 0;
 
             pm_buffer_append_format(out,
-                    "{\"id\":%" PRIu32 ",\"type\":\"%s\",\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"len\":%" PRIu32 ",\"underflow\":%s",
+                    "{\"id\":%" PRIu32 ",\"type\":\"%s\",\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"len\":%" PRIu32 ",\"underflow\":%s%s",
                     n->node_id, tname, n_start, wrapped_end, n_len,
-                    underflow ? "true" : "false");
+                    underflow ? "true" : "false",
+                    oob ? ",\"oob\":true" : "");
             const pm_string_t *unesc = node_unescaped_string(n);
             if (unesc != NULL) {
                 size_t ulen = pm_string_length(unesc);

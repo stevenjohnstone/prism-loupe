@@ -1123,9 +1123,15 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
     );
   } else if (hasUnderflow) {
     const uStep = currentTrace.steps[currentTrace._underflowIdx];
+    const uEvents = currentTrace._underflowEvents || [];
+    const hasU = uEvents.some(ev => ev.kind === 'underflow');
+    const hasOob = uEvents.some(ev => ev.kind === 'oob');
+    const anomalyLabel = (hasU && hasOob)
+      ? 'underflow / out-of-bounds'
+      : (hasOob ? 'out-of-bounds location' : 'underflow');
     setSafeHtml(
       document.getElementById('wasmStatus'),
-      safeHtml`<span style="color:var(--red);font-weight:700;">⚠ Corrupted node (underflow) at step ${uStep.step} (${dt} ms)</span>`
+      safeHtml`<span style="color:var(--red);font-weight:700;">⚠ Corrupted node (${anomalyLabel}) at step ${uStep.step} (${dt} ms)</span>`
     );
   } else {
     setSafeHtml(
@@ -1216,10 +1222,31 @@ function formatBytes(b) {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+function isNodeUnderflow(n) {
+  if (!n) return false;
+  return n.end < n.start || (typeof n.len === 'number' && n.len >= 0x80000000);
+}
+
+function isNodeOutOfBounds(n, srcByteLen) {
+  if (!n || isNodeUnderflow(n)) return false;
+  if (typeof srcByteLen === 'number' && (n.end > srcByteLen || n.start > srcByteLen)) {
+    return true;
+  }
+  return Boolean(n.oob || n.underflow);
+}
+
+function nodeAnomalyKind(n, srcByteLen) {
+  if (isNodeUnderflow(n)) return 'underflow';
+  if (isNodeOutOfBounds(n, srcByteLen)) return 'oob';
+  return null;
+}
+
 function preprocessTrace(trace) {
   if (trace.steps && trace.steps.length > 0 && trace.steps[trace.steps.length - 1] && trace.steps[trace.steps.length - 1].summary) {
     trace.leak_summary = trace.steps.pop();
   }
+  const srcByteLen = new TextEncoder().encode(trace.source || '').length;
+  trace._sourceByteLen = srcByteLen;
   let lastAst = [];
   let lastChangedNodeId = -1;
   let prevCurrStart = 0;
@@ -1246,7 +1273,8 @@ function preprocessTrace(trace) {
           mutatedNodeId = n.id;
           prevNodeSigById.set(n.id, sig);
         }
-        const isU = Boolean(n.underflow || n.end < n.start);
+        const anomalyKind = nodeAnomalyKind(n, srcByteLen);
+        const isU = Boolean(anomalyKind);
         const wasU = prevUnderflowById.get(n.id) || false;
         if (isU && !wasU) {
           newUnderflows.push(n);
@@ -1256,6 +1284,7 @@ function preprocessTrace(trace) {
           trace._underflowEvents.push({
             stepIdx: i,
             step: s.step,
+            kind: anomalyKind,
             node: n,
             func: s.func,
             line: s.line,
@@ -1652,13 +1681,25 @@ function renderStep() {
   const btnUnderflow = document.getElementById('btnJumpUnderflow');
   const uEvents = currentTrace._underflowEvents || [];
   const uSteps = currentTrace._underflowSteps || [];
+  const srcByteLen = typeof currentTrace._sourceByteLen === 'number'
+    ? currentTrace._sourceByteLen
+    : new TextEncoder().encode(currentTrace.source || '').length;
   if (uEvents.length > 0) {
+    const hasU = uEvents.some(ev => ev.kind === 'underflow');
+    const hasOob = uEvents.some(ev => ev.kind === 'oob');
     ub.style.display = 'block';
     btnUnderflow.style.display = 'inline-block';
+    btnUnderflow.textContent = (hasU && hasOob) ? '⚠ Bad Location' : (hasOob ? '⚠ Out of Bounds' : '⚠ Underflow');
+    btnUnderflow.title = (hasU && hasOob)
+      ? 'Jump to corrupted node location detection step (Key: U)'
+      : (hasOob
+        ? 'Jump to corrupted node out-of-bounds location detection step (Key: U)'
+        : 'Jump to corrupted node underflow detection step (Key: U)');
     btnUnderflow.disabled = (uSteps.length === 1 && currentIdx === uSteps[0]);
     const atUnderflowStep = uSteps.includes(currentIdx);
     const nextUStepIdx = uSteps.find(idx => idx > currentIdx) ?? uSteps[0];
     const nextUStep = currentTrace.steps[nextUStepIdx];
+    const nextLabel = (hasU && hasOob) ? 'Next Corrupted' : (hasOob ? 'Next OOB' : 'Next Underflow');
     let headerActionHtml = rawHtml('');
     if (!atUnderflowStep) {
       headerActionHtml = safeHtml`<button class="warn" style="margin-left:8px;padding:2px 7px;" data-jump-step="${Number(nextUStepIdx)}">Jump to Detection Step #${nextUStep.step}</button>`;
@@ -1666,7 +1707,7 @@ function renderStep() {
       headerActionHtml = safeHtml`
         <span style="display:inline-flex;align-items:center;gap:6px;margin-left:8px;">
           <span class="badge kind-CRASH">AT DETECTION STEP #${step.step}</span>
-          <button class="warn" style="padding:2px 7px;" data-jump-step="${Number(nextUStepIdx)}">Next Underflow (#${nextUStep.step}) &rarr;</button>
+          <button class="warn" style="padding:2px 7px;" data-jump-step="${Number(nextUStepIdx)}">${nextLabel} (#${nextUStep.step}) &rarr;</button>
         </span>
       `;
     } else {
@@ -1678,15 +1719,23 @@ function renderStep() {
       const stepBtn = (uEvents.length > 1 && currentIdx !== ev.stepIdx)
         ? safeHtml` <button class="warn" style="padding:1px 6px;font-size:11px;margin-left:4px;" data-jump-step="${Number(ev.stepIdx)}">Step #${ev.step}</button>`
         : rawHtml('');
+      const descHtml = ev.kind === 'oob'
+        ? safeHtml`out of bounds (<code>start=${ev.node.start}, end=${ev.node.end} &gt; src_len=${srcByteLen}, len=${ev.node.len}</code>)`
+        : safeHtml`underflowed (<code>start=${ev.node.start}, end=${ev.node.end}, len=${ev.node.len}</code>)`;
       return safeHtml`
         <div style="margin-top:4px;color:var(--text);">
-          Node <code>#${ev.node.id} ${ev.node.type}</code> underflowed (<code>start=${ev.node.start}, end=${ev.node.end}, len=${ev.node.len}</code>) in <code>${ev.func}()</code>${callerStr} at <code>${ev.file}:${ev.line}</code>${stepBtn}
+          Node <code>#${ev.node.id} ${ev.node.type}</code> ${descHtml} in <code>${ev.func}()</code>${callerStr} at <code>${ev.file}:${ev.line}</code>${stepBtn}
         </div>
       `;
     });
+    const bannerKindTitle = (hasU && hasOob)
+      ? `${uEvents.length} CORRUPTED LOCATIONS: UNDERFLOW & OUT OF BOUNDS`
+      : (hasOob
+        ? (uEvents.length === 1 ? 'LOCATION OUT OF BOUNDS' : `${uEvents.length} LOCATIONS OUT OF BOUNDS`)
+        : (uEvents.length === 1 ? 'LOCATION UNDERFLOW' : `${uEvents.length} LOCATION UNDERFLOWS`));
     setSafeHtml(ub, safeHtml`
       <div style="display:flex;justify-content:space-between;align-items:center;">
-        <strong>⚠ CORRUPTED AST NODE DETECTED (${uEvents.length === 1 ? 'LOCATION UNDERFLOW' : uEvents.length + ' LOCATION UNDERFLOWS'})</strong>
+        <strong>⚠ CORRUPTED AST NODE DETECTED (${bannerKindTitle})</strong>
         ${headerActionHtml}
       </div>
       ${itemsHtml}
@@ -1860,14 +1909,18 @@ function buildGeminiContextMarkdown(step) {
     nearby.push(`${marker}Step ${s.step}: ${s.kind} in ${s.func}() (${stepSourceFile(s)}:${s.line}) curr=${s.curr[2]}[${s.curr[0]}..${s.curr[1]}] lex_state=${s.lex_state}${s._isRewind ? ' [REWIND ' + s._rewindDelta + 'B]' : ''}`);
   }
   const nodes = step._astSnapshot || [];
-  const underflows = nodes.filter(n => n.underflow || n.end < n.start);
+  const srcByteLen = typeof currentTrace._sourceByteLen === 'number'
+    ? currentTrace._sourceByteLen
+    : new TextEncoder().encode(currentTrace.source || '').length;
+  const underflows = nodes.filter(n => isNodeUnderflow(n));
+  const oobs = nodes.filter(n => isNodeOutOfBounds(n, srcByteLen));
   const crashStep = currentTrace._crashIdx >= 0 ? currentTrace.steps[currentTrace._crashIdx] : null;
 
   return [
     `# Prism Ruby Parser Trace Context`,
     `- Prism Version: v${PRISM_BUILD_INFO.version} (${PRISM_BUILD_INFO.describe}, commit ${PRISM_BUILD_INFO.short_sha})`,
     `- Trace Name: ${currentTrace.name}`,
-    `- Ruby Source (${currentTrace.source.length} bytes): ${JSON.stringify(currentTrace.source)}`,
+    `- Ruby Source (${srcByteLen} bytes): ${JSON.stringify(currentTrace.source)}`,
     `- Current Step: ${step.step} / ${total - 1}`,
     `- Event: ${step.kind} at ${srcFile}:${step.line} in ${step.func}()`,
     `- lex_state: ${step.lex_state}`,
@@ -1878,9 +1931,9 @@ function buildGeminiContextMarkdown(step) {
     `- parser call_stack: ${step.call_stack.join(' -> ')}`,
     `- line_offsets (${step.line_offsets.length}): [${step.line_offsets.join(', ')}]`,
     `- Arena Memory Used/Cap: AST=${step.mem ? step.mem.ast[0] : 0}/${step.mem ? step.mem.ast[1] : 0}B, Meta=${step.mem ? step.mem.meta[0] : 0}/${step.mem ? step.mem.meta[1] : 0}B, Scratch=${step.mem ? step.mem.scratch[0] : 0}/${step.mem ? step.mem.scratch[1] : 0}B`,
-    `- Allocated AST Nodes: ${nodes.length} (${underflows.length} underflowed locations)`,
+    `- Allocated AST Nodes: ${nodes.length} (${underflows.length} underflowed, ${oobs.length} out-of-bounds locations)`,
     (currentTrace._underflowEvents && currentTrace._underflowEvents.length > 0)
-      ? `- DETECTED CORRUPTED/UNDERFLOW NODES: ` + currentTrace._underflowEvents.map(ev => `#${ev.node.id} ${ev.node.type} [start=${ev.node.start}, end=${ev.node.end}, len=${ev.node.len}] detected at Step ${ev.step} in ${ev.func}() (${ev.file}:${ev.line})`).join('; ')
+      ? `- DETECTED CORRUPTED NODES: ` + currentTrace._underflowEvents.map(ev => `#${ev.node.id} ${ev.node.type} [${ev.kind === 'oob' ? 'OUT_OF_BOUNDS' : 'UNDERFLOW'} start=${ev.node.start}, end=${ev.node.end}, len=${ev.node.len}] detected at Step ${ev.step} in ${ev.func}() (${ev.file}:${ev.line})`).join('; ')
       : '',
     crashStep ? `- INTERCEPTED CRASH at Step ${crashStep.step}: ${JSON.stringify(crashStep.detail)}` : '',
     `\n## Surrounding Trace Steps (${startWin}..${endWin}):\n` + nearby.join('\n')
@@ -2017,7 +2070,10 @@ function renderAstForest(step) {
   const prevAstScrollTop = astPaneBody ? astPaneBody.scrollTop : 0;
   treeBox.innerHTML = '';
   orphansBox.innerHTML = '';
-  const underflowCount = nodes.filter(n => n.underflow || n.end < n.start).length;
+  const srcByteLen = typeof currentTrace._sourceByteLen === 'number'
+    ? currentTrace._sourceByteLen
+    : new TextEncoder().encode(currentTrace.source || '').length;
+  const underflowCount = nodes.filter(n => Boolean(nodeAnomalyKind(n, srcByteLen))).length;
 
   if (nodes.length === 0) {
     if (step.kind === 'TEARDOWN') {
@@ -2090,17 +2146,26 @@ function renderAstForest(step) {
     const wrapper = document.createElement('div');
     wrapper.className = 'ast-node';
 
-    const isUnderflow = n.underflow || n.end < n.start;
-    const detectIdx = isUnderflow && currentTrace._underflowFirstStepByNode
+    const anomalyKind = nodeAnomalyKind(n, srcByteLen);
+    const isUnderflow = anomalyKind === 'underflow';
+    const isOob = anomalyKind === 'oob';
+    const isCorrupted = Boolean(anomalyKind);
+    const detectIdx = isCorrupted && currentTrace._underflowFirstStepByNode
       ? currentTrace._underflowFirstStepByNode[n.id]
       : undefined;
     const row = document.createElement('div');
     row.className = 'ast-row' +
       (n.id === changedNodeId ? ' just-changed' : '') +
-      (isUnderflow ? ' underflow-node' : '');
+      (isCorrupted ? ' underflow-node' : '');
     let sliceHtml = rawHtml('');
     if (isUnderflow) {
       const uText = `⚠ UNDERFLOW len=${n.len} (end=${n.end} < start=${n.start})`;
+      sliceHtml = safeHtml`<span class="ast-slice" style="color:var(--red);font-weight:700;">${uText}</span>`;
+    } else if (isOob) {
+      const oobDetail = n.start > srcByteLen
+        ? `start=${n.start} > src_len=${srcByteLen}`
+        : `end=${n.end} > src_len=${srcByteLen}`;
+      const uText = `⚠ OUT OF BOUNDS len=${n.len} (${oobDetail})`;
       sliceHtml = safeHtml`<span class="ast-slice" style="color:var(--red);font-weight:700;">${uText}</span>`;
     } else if (typeof n.val === 'string') {
       const openRaw = n.o_loc ? currentTrace.source.slice(n.o_loc[0], n.o_loc[1]) : '';
@@ -2487,7 +2552,8 @@ function createSourceVideoRenderer(trace) {
       detailSummary += ` → ${step.detail.message}`;
     }
     if (step._hasNewUnderflow) {
-      detailSummary += '  ⚠ UNDERFLOW (end < start)';
+      const hasU = (step._newUnderflows || []).some(n => isNodeUnderflow(n));
+      detailSummary += hasU ? '  ⚠ UNDERFLOW (end < start)' : '  ⚠ OUT OF BOUNDS (end > src_len)';
     } else if (step._isRewind) {
       detailSummary += `  ↺ REWIND (${step._rewindDelta}B)`;
     }
@@ -3479,6 +3545,7 @@ function buildTraceSummaryObject() {
     underflows: (currentTrace._underflowEvents || []).map(ev => ({
       stepIndex: ev.stepIdx,
       step: ev.step,
+      kind: ev.kind || 'underflow',
       nodeId: ev.node.id,
       nodeType: ev.node.type,
       start: ev.node.start,
