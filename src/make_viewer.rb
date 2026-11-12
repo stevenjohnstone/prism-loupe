@@ -56,8 +56,17 @@ HTML_TEMPLATE = <<~'HTML'
     --red: #f85149;
     --cyan: #39c5cf;
     --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    color-scheme: dark;
   }
-  * { box-sizing: border-box; }
+  * {
+    box-sizing: border-box;
+    scrollbar-width: thin;
+    scrollbar-color: #30363d transparent;
+  }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+  *::-webkit-scrollbar-thumb:hover { background: #484f58; }
   body {
     margin: 0;
     background: var(--bg);
@@ -231,7 +240,7 @@ HTML_TEMPLATE = <<~'HTML'
   .main-grid {
     flex: 1;
     display: grid;
-    grid-template-columns: 1.15fr 0.95fr 1.1fr;
+    grid-template-columns: 1.1fr 1.05fr 1.05fr;
     gap: 1px;
     background: var(--border);
     overflow: hidden;
@@ -452,6 +461,9 @@ HTML_TEMPLATE = <<~'HTML'
     margin-bottom: 6px;
     display: flex;
     justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
   }
   .kv-grid {
     display: grid;
@@ -571,12 +583,18 @@ HTML_TEMPLATE = <<~'HTML'
     border-color: var(--amber);
     color: #f2cc60;
   }
+  #lineOffsetsBox {
+    max-height: 115px;
+    overflow-y: auto;
+  }
   .inv-list {
     display: flex;
     flex-direction: column;
     gap: 4px;
     font-family: var(--font-mono);
     font-size: 11.5px;
+    max-height: 150px;
+    overflow-y: auto;
   }
   .inv-row {
     padding: 4px 7px;
@@ -912,8 +930,30 @@ __PRISM_LICENSE_HTML__</div>
       </div>
       <div id="sourceBox" class="source-box" title="Double-click (or click '✎ Edit Code') to edit Ruby snippet in-place"></div>
       <textarea id="rubyEditor" spellcheck="false" placeholder="Paste or type Ruby code here and press ⌘+Enter / Ctrl+Enter (or click ▶ Parse & Trace)..."></textarea>
+    </div>
+  </div>
 
-      <div class="card" style="margin-top:12px;">
+  <div class="pane">
+    <div class="pane-header">
+      <span>Lexer State, Metadata &amp; Call Stack</span>
+    </div>
+    <div class="pane-body">
+      <div class="card">
+        <div class="card-title">Current Transition</div>
+        <div class="kv-grid" id="transitionGrid"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span>Lexer Mode Stack (<code>parser-&gt;lex_modes</code>, top &rarr; bottom)</span></div>
+        <div class="stack-list" id="lexModesStack"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span>Parser Context Stack (<code>parser-&gt;current_context</code>)</span></div>
+        <div id="contextsBox" style="font-family:var(--font-mono); font-size:12px;"></div>
+      </div>
+
+      <div class="card">
         <div class="card-title">
           <span>Recorded Line Offsets (<code>parser-&gt;line_offsets</code>)</span>
           <span id="lineOffsetStatus"></span>
@@ -935,28 +975,6 @@ __PRISM_LICENSE_HTML__</div>
           <span id="diagnosticStatus"></span>
         </div>
         <div id="diagnosticsBox" class="inv-list"></div>
-      </div>
-    </div>
-  </div>
-
-  <div class="pane">
-    <div class="pane-header">
-      <span>Lexer State, Mode Stack &amp; Call Stack</span>
-    </div>
-    <div class="pane-body">
-      <div class="card">
-        <div class="card-title">Current Transition</div>
-        <div class="kv-grid" id="transitionGrid"></div>
-      </div>
-
-      <div class="card">
-        <div class="card-title"><span>Lexer Mode Stack (<code>parser-&gt;lex_modes</code>, top &rarr; bottom)</span></div>
-        <div class="stack-list" id="lexModesStack"></div>
-      </div>
-
-      <div class="card">
-        <div class="card-title"><span>Parser Context Stack (<code>parser-&gt;current_context</code>)</span></div>
-        <div id="contextsBox" style="font-family:var(--font-mono); font-size:12px;"></div>
       </div>
 
       <div class="card">

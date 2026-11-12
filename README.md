@@ -35,13 +35,14 @@ An interactive, single-file, in-browser C99 parser, lexer, and AST execution vis
 
 ### 3. Three-Pane Parser & Lexer State Inspector
 - **Pane 1 — Ruby Buffer & Live Lexer**:
-  - Byte-accurate character grid highlighting `parser->previous` (amber), `parser->current` (green), active line, and hovered AST/comment/diagnostic ranges.
+  - Byte-accurate character grid highlighting `parser->previous` (amber), `parser->current` (green), active line, and hovered AST/comment/diagnostic ranges, plus in-place source editing and `pm_options_t` configuration.
+- **Pane 2 — Lexer State, Metadata & Call Stack**:
+  - Current transition metadata (`step`, `kind`, `func`, C source location, `next_start`, `heredoc_end`, `lex_state`, error/warning counts, and comment count).
+  - Live `parser->lex_modes` stack (`top → bottom`) and `parser->current_context` stack.
   - Live `parser->line_offsets` table with automatic detection of empty, non-zero initial (`L1 != 0`), non-monotonic (`off <= prev`), underflowed, or out-of-bounds newline offsets.
   - Live `parser->comment_list` & `parser->magic_comment_list` inspector flagging location underflows, out-of-bounds spans, overlapping/duplicate comment ranges, and post-attach sort violations (while distinguishing legitimate pre-sort heredoc `↺ lex-order` comments).
   - Live `parser->error_list` & `parser->warning_list` diagnostic inspector with severity/level badges, clickable step attribution, and location underflow/out-of-bounds checks.
-- **Pane 2 — Lexer State, Mode Stack & Call Stack**:
-  - Current transition metadata (`step`, `kind`, `func`, C source location, `next_start`, `heredoc_end`, `lex_state`, error/warning counts, and comment count).
-  - Live `parser->lex_modes` stack (`top → bottom`), `parser->current_context` stack, and clickable `parse_*` recursive-descent call stack with GitHub source links.
+  - Clickable `parse_*` recursive-descent call stack with GitHub source links.
 - **Pane 3 — Live Arenas, Memory & AST Assembly**:
   - Real-time byte, capacity, and block telemetry for `parser->arena` (AST nodes), `metadata_arena`, `scratch_arena`, `line_offsets`, and `constant_pool`.
   - Live bottom-up AST forest distinguishing active candidate roots from superseded/orphaned nodes, with hover-to-highlight source spans and warnings for underflowed (`end < start`) or out-of-bounds (`end > src_len`) node locations.
