@@ -208,7 +208,7 @@ build_prism_version() {
             -D_WASI_EMULATED_MMAN -lwasi-emulated-mman \
             -Itrace_src -Iinclude -Isrc \
             -std=c99 \
-            -Wl,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer \
+            -Wl,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer,--export=prism_trace_run_to_buffer_opts \
             -Wl,-z,stack-size=8388608 \
             -Wl,--gc-sections -Wl,--no-entry -mexec-model=reactor \
             "${wasm_opt_flags[@]}" \

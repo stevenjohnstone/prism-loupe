@@ -55,6 +55,9 @@ def write_compat_header(prism_dir, build_dir)
   diag_h_path = File.join(prism_dir, "include/prism/diagnostic.h")
   diag_h = File.exist?(diag_h_path) ? File.read(diag_h_path, encoding: "UTF-8") : ""
 
+  options_h_path = File.join(prism_dir, "include/prism/options.h")
+  options_h = File.exist?(options_h_path) ? File.read(options_h_path, encoding: "UTF-8") : ""
+
   has_arena = File.exist?(File.join(prism_dir, "include/prism/internal/arena.h"))
   has_internal_diag = File.exist?(File.join(prism_dir, "include/prism/internal/diagnostic.h"))
   has_internal_comments = File.exist?(File.join(prism_dir, "include/prism/internal/comments.h"))
@@ -70,6 +73,11 @@ def write_compat_header(prism_dir, build_dir)
   visit_returns_enum = node_h.include?("PM_VISIT_SKIP")
   has_diag_type_fn = diag_h.include?("pm_diagnostic_type(")
   has_buffer_new = File.exist?(File.join(prism_dir, "include/prism/buffer.h"))
+  has_options_new = options_h.include?("pm_options_new(")
+  has_options_attach_comments = options_h.include?("pm_options_attach_comments_set(")
+  has_options_stack_budget = options_h.include?("pm_options_stack_budget_set(")
+  has_options_scope_mut = options_h.include?("pm_options_scope_mut(")
+  has_source_stream = File.exist?(File.join(prism_dir, "include/prism/stream.h"))
 
   contexts = parser_h.scan(/\b(PM_CONTEXT_[A-Z0-9_]+)\b/).flatten.uniq
 
@@ -91,6 +99,11 @@ def write_compat_header(prism_dir, build_dir)
     #define PRISM_TRACE_VISIT_RETURNS_ENUM #{visit_returns_enum ? 1 : 0}
     #define PRISM_TRACE_HAS_DIAG_TYPE_FN #{has_diag_type_fn ? 1 : 0}
     #define PRISM_TRACE_HAS_BUFFER_NEW #{has_buffer_new ? 1 : 0}
+    #define PRISM_TRACE_HAS_OPTIONS_NEW #{has_options_new ? 1 : 0}
+    #define PRISM_TRACE_HAS_OPTIONS_ATTACH_COMMENTS #{has_options_attach_comments ? 1 : 0}
+    #define PRISM_TRACE_HAS_OPTIONS_STACK_BUDGET #{has_options_stack_budget ? 1 : 0}
+    #define PRISM_TRACE_HAS_OPTIONS_SCOPE_MUT #{has_options_scope_mut ? 1 : 0}
+    #define PRISM_TRACE_HAS_SOURCE_STREAM #{has_source_stream ? 1 : 0}
 
     #if PRISM_TRACE_HAS_INTERNAL_HEADERS
     #include "prism/internal/parser.h"
@@ -111,11 +124,17 @@ def write_compat_header(prism_dir, build_dir)
     #include "prism/internal/buffer.h"
     #include "prism/diagnostic.h"
     #include "prism/node.h"
+    #include "prism/options.h"
+    #if PRISM_TRACE_HAS_SOURCE_STREAM
+    #include "prism/source.h"
+    #include "prism/stream.h"
+    #endif
     #else
     #include "prism.h"
     #include "prism/parser.h"
     #include "prism/node.h"
     #include "prism/diagnostic.h"
+    #include "prism/options.h"
     #include "prism/util/pm_buffer.h"
     #include "prism/util/pm_newline_list.h"
     #define pm_token_type(t_) pm_token_type_name(t_)
@@ -274,12 +293,12 @@ def instrument_prism_c(src_path, out_path)
     ]
   )
 
-  # 7. Set g_trace_parser at the opening brace of pm_parse (same line)
+  # 7. Register parser & handle pm_parse_stream multi-pass resets at the opening brace of pm_parse (same line)
   replace_regex_once!(
     content,
     /^(pm_parse\(pm_parser_t\s*\*parser\)\s*\{)/,
     "pm_parse"
-  ) { |m, _| "#{m} g_trace_parser = parser;" }
+  ) { |m, _| "#{m} prism_trace_on_parse_pass(parser);" }
 
   # 8. In v1.x, node constructors are pm_*_node_create in src/prism.c; wrap `return node;` on the same line
   content.gsub!(/^(pm_[a-z0-9_]+_node_create\([^;{]*\)\s*\{.*?\n\})/m) do |fn_block|

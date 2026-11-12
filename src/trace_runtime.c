@@ -2,6 +2,7 @@
 #include "prism.h"
 #undef NDEBUG
 #include <assert.h>
+#include <limits.h>
 
 pm_parser_t *g_trace_parser = NULL;
 pm_buffer_t *g_trace_buf = NULL;
@@ -18,6 +19,8 @@ static uint64_t g_last_diags_hash = 0;
 static uint64_t g_last_comments_hash = 0;
 static const pm_list_node_t *g_last_emitted_error_tail = NULL;
 static const pm_list_node_t *g_last_emitted_warning_tail = NULL;
+static uint32_t g_trace_parse_pass = 0;
+static uint64_t g_trace_input_size = 0;
 static prism_trace_crash_cb_t g_trace_crash_cb = NULL;
 
 static int g_trace_xalloc_tracking = 0;
@@ -280,6 +283,8 @@ prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps) {
     g_last_comments_hash = 0;
     g_last_emitted_error_tail = NULL;
     g_last_emitted_warning_tail = NULL;
+    g_trace_parse_pass = 0;
+    g_trace_input_size = 0;
     g_trace_xalloc_tracking = 0;
     g_trace_xalloc_raw_live_bytes = (buf != NULL && buf->value != NULL) ? (((prism_trace_alloc_hdr_t *) buf->value) - 1)->size : 0;
     g_trace_xalloc_live_bytes = 0;
@@ -732,6 +737,9 @@ prism_trace_emit_event(
 
     pm_buffer_append_format(out, "{\"step\":%" PRIu64 ",\"kind\":\"%s\",\"func\":\"%s\",\"line\":%d",
             g_trace_step++, kind, func ? func : "", line);
+    if (src_len != g_trace_input_size) {
+        pm_buffer_append_format(out, ",\"src_len\":%" PRIu64, src_len);
+    }
 
     pm_buffer_append_format(out, ",\"prev\":[%td,%td,\"%s\"]",
             prev_s, prev_e, safe_token_type_name(parser->previous.type));
@@ -1312,70 +1320,673 @@ prism_trace_node_list_append(const pm_node_list_t *list, const pm_node_t *node, 
     }
 }
 
+void
+prism_trace_on_parse_pass(pm_parser_t *parser) {
+    g_trace_parser = parser;
+    g_trace_parse_pass++;
+    if (g_trace_parse_pass > 1) {
+        if (g_trace_node_count > 0) {
+            uint32_t limit = g_trace_node_count < PRISM_TRACE_MAX_NODES ? (g_trace_node_count + 1) : PRISM_TRACE_MAX_NODES;
+            memset(g_trace_nodes, 0, limit * sizeof(g_trace_nodes[0]));
+            g_trace_node_count = 0;
+        }
+        g_trace_call_depth = 0;
+        g_last_ast_hash = UINT64_MAX;
+        g_last_diags_hash = UINT64_MAX;
+        g_last_comments_hash = UINT64_MAX;
+        g_last_emitted_error_tail = NULL;
+        g_last_emitted_warning_tail = NULL;
+        char detail[96];
+        uint64_t pass_len = (parser != NULL && parser->end >= parser->start) ? (uint64_t)(parser->end - parser->start) : 0;
+        snprintf(detail, sizeof(detail), "{\"pass\":%u,\"src_len\":%" PRIu64 "}", g_trace_parse_pass, pass_len);
+        prism_trace_emit_event(parser, "STREAM_PASS", "pm_parse_stream", 0, detail, 1);
+    }
+}
+
+#define PRISM_TRACE_MAX_SCOPES 16
+#define PRISM_TRACE_MAX_SCOPE_LOCALS 64
+
+typedef struct {
+    uint8_t *bytes;
+    size_t len;
+} prism_trace_bytes_t;
+
+typedef struct {
+    uint8_t forwarding;
+    size_t locals_count;
+    prism_trace_bytes_t locals[PRISM_TRACE_MAX_SCOPE_LOCALS];
+} prism_trace_scope_opt_t;
+
+typedef struct {
+    int any_active;
+    char encoding[64];
+    char ruby_ver[32];
+    char filepath[256];
+    int32_t line;
+    int has_line;
+    uint8_t cmd_flags;
+    int main_script;
+    int partial_script;
+    int freeze;
+    int attach_comments;
+    int encoding_locked;
+    int has_frozen_string_literal;
+    int frozen_string_literal;
+    int stream_mode;
+    int shebang_cb;
+    int has_stack_budget;
+    size_t stack_budget;
+    size_t scopes_count;
+    prism_trace_scope_opt_t scopes[PRISM_TRACE_MAX_SCOPES];
+} prism_trace_options_t;
+
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+    bool eof;
+} prism_trace_stream_t;
+
+static char *
+trace_stream_fgets(char *buf, int n, void *vp) {
+    prism_trace_stream_t *s = (prism_trace_stream_t *) vp;
+    if (n <= 0) return NULL;
+    if (s->pos >= s->size) {
+        s->eof = true;
+        return NULL;
+    }
+    size_t count = 0;
+    size_t limit = (size_t) (n - 1);
+    while (count < limit && s->pos < s->size) {
+        uint8_t ch = s->data[s->pos++];
+        buf[count++] = (char) ch;
+        if (ch == '\n') break;
+    }
+    if (count < limit && (count == 0 || buf[count - 1] != '\n') && s->pos >= s->size) {
+        s->eof = true;
+    }
+    buf[count] = '\0';
+    return buf;
+}
+
+static int
+trace_stream_feof(void *vp) {
+    return ((const prism_trace_stream_t *) vp)->eof ? 1 : 0;
+}
+
+static void
+trace_shebang_cb(pm_options_t *options, const uint8_t *source, size_t length, void *shebang_data) {
+    (void) options;
+    (void) source;
+    (void) length;
+    (void) shebang_data;
+}
+
+static int
+hex_nibble_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static char *
+percent_decode_slice(const char *src, size_t src_len, size_t *out_len) {
+    char *dst = (char *) malloc(src_len + 1);
+    if (dst == NULL) {
+        *out_len = 0;
+        return NULL;
+    }
+    size_t w = 0;
+    for (size_t i = 0; i < src_len; i++) {
+        char c = src[i];
+        if (c == '+') {
+            dst[w++] = ' ';
+        } else if (c == '%' && i + 2 < src_len) {
+            int hi = hex_nibble_val(src[i + 1]);
+            int lo = hex_nibble_val(src[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                dst[w++] = (char) ((hi << 4) | lo);
+                i += 2;
+            } else {
+                dst[w++] = c;
+            }
+        } else {
+            dst[w++] = c;
+        }
+    }
+    dst[w] = '\0';
+    *out_len = w;
+    return dst;
+}
+
+static int
+b64url_char_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+
+static uint8_t *
+b64url_decode_slice(const char *src, size_t src_len, size_t *out_len) {
+    uint8_t *vals = (uint8_t *) malloc(src_len + 1);
+    if (vals == NULL) {
+        *out_len = 0;
+        return NULL;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < src_len; i++) {
+        char c = src[i];
+        if (c == '=' || c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        int v = b64url_char_val(c);
+        if (v >= 0) vals[n++] = (uint8_t) v;
+    }
+    size_t cap = (n * 3) / 4 + 2;
+    uint8_t *out = (uint8_t *) malloc(cap);
+    if (out == NULL) {
+        free(vals);
+        *out_len = 0;
+        return NULL;
+    }
+    size_t w = 0;
+    size_t i = 0;
+    while (i + 4 <= n) {
+        out[w++] = (uint8_t) ((vals[i] << 2) | (vals[i + 1] >> 4));
+        out[w++] = (uint8_t) (((vals[i + 1] & 0x0f) << 4) | (vals[i + 2] >> 2));
+        out[w++] = (uint8_t) (((vals[i + 2] & 0x03) << 6) | vals[i + 3]);
+        i += 4;
+    }
+    size_t rem = n - i;
+    if (rem == 2) {
+        out[w++] = (uint8_t) ((vals[i] << 2) | (vals[i + 1] >> 4));
+    } else if (rem == 3) {
+        out[w++] = (uint8_t) ((vals[i] << 2) | (vals[i + 1] >> 4));
+        out[w++] = (uint8_t) (((vals[i + 1] & 0x0f) << 4) | (vals[i + 2] >> 2));
+    }
+    free(vals);
+    *out_len = w;
+    return out;
+}
+
+static int
+opt_val_is_truthy(const char *v) {
+    return (v != NULL && (strcmp(v, "1") == 0 || strcmp(v, "true") == 0 || strcmp(v, "yes") == 0 || strcmp(v, "on") == 0));
+}
+
+static void
+parse_scopes_param(prism_trace_options_t *opts, const char *val, size_t val_len) {
+    if (val == NULL || val_len == 0) return;
+    const char *p = val;
+    const char *end = val + val_len;
+    while (opts->scopes_count < PRISM_TRACE_MAX_SCOPES) {
+        const char *semi = (const char *) memchr(p, ';', (size_t) (end - p));
+        const char *seg_end = semi != NULL ? semi : end;
+
+        prism_trace_scope_opt_t *sc = &opts->scopes[opts->scopes_count++];
+        memset(sc, 0, sizeof(*sc));
+        opts->any_active = 1;
+
+        const char *colon = (const char *) memchr(p, ':', (size_t) (seg_end - p));
+        const char *locals_p = p;
+        if (colon != NULL) {
+            for (const char *f = p; f < colon; f++) {
+                switch (*f) {
+                    case 'p': case '*': sc->forwarding |= PM_OPTIONS_SCOPE_FORWARDING_POSITIONALS; break;
+                    case 'k':           sc->forwarding |= PM_OPTIONS_SCOPE_FORWARDING_KEYWORDS; break;
+                    case 'b': case '&': sc->forwarding |= PM_OPTIONS_SCOPE_FORWARDING_BLOCK; break;
+                    case 'a': case '.': sc->forwarding |= PM_OPTIONS_SCOPE_FORWARDING_ALL; break;
+                    default: break;
+                }
+            }
+            locals_p = colon + 1;
+        }
+
+        if (locals_p < seg_end) {
+            const char *lp = locals_p;
+            while (sc->locals_count < PRISM_TRACE_MAX_SCOPE_LOCALS) {
+                const char *comma = (const char *) memchr(lp, ',', (size_t) (seg_end - lp));
+                const char *tok_end = comma != NULL ? comma : seg_end;
+                size_t tok_len = (size_t) (tok_end - lp);
+
+                uint8_t *dec_bytes = NULL;
+                size_t dec_len = 0;
+                if (tok_len >= 1 && lp[0] == '~') {
+                    dec_bytes = b64url_decode_slice(lp + 1, tok_len - 1, &dec_len);
+                } else {
+                    dec_bytes = (uint8_t *) malloc(tok_len > 0 ? tok_len : 1);
+                    if (dec_bytes != NULL && tok_len > 0) {
+                        memcpy(dec_bytes, lp, tok_len);
+                    }
+                    dec_len = tok_len;
+                }
+                if (dec_bytes != NULL) {
+                    sc->locals[sc->locals_count].bytes = dec_bytes;
+                    sc->locals[sc->locals_count].len = dec_len;
+                    sc->locals_count++;
+                }
+
+                if (comma == NULL) break;
+                lp = comma + 1;
+            }
+        }
+
+        if (semi == NULL) break;
+        p = semi + 1;
+    }
+}
+
+static void
+prism_trace_options_parse(prism_trace_options_t *opts, const char *query, size_t query_len) {
+    memset(opts, 0, sizeof(*opts));
+    opts->line = 1;
+    if (query == NULL || query_len == 0) return;
+
+    const char *p = query;
+    const char *end = query + query_len;
+    if (p < end && *p == '?') p++;
+
+    while (p < end) {
+        const char *amp = (const char *) memchr(p, '&', (size_t) (end - p));
+        const char *pair_end = amp != NULL ? amp : end;
+        if (pair_end > p) {
+            const char *eq = (const char *) memchr(p, '=', (size_t) (pair_end - p));
+            const char *k_raw = p;
+            size_t k_raw_len = eq != NULL ? (size_t) (eq - p) : (size_t) (pair_end - p);
+            const char *v_raw = eq != NULL ? (eq + 1) : "";
+            size_t v_raw_len = eq != NULL ? (size_t) (pair_end - (eq + 1)) : 0;
+
+            size_t k_len = 0, v_len = 0;
+            char *k = percent_decode_slice(k_raw, k_raw_len, &k_len);
+            char *v = percent_decode_slice(v_raw, v_raw_len, &v_len);
+
+            if (k != NULL && v != NULL) {
+                if ((strcmp(k, "enc") == 0 || strcmp(k, "encoding") == 0) && v_len > 0) {
+                    snprintf(opts->encoding, sizeof(opts->encoding), "%s", v);
+                    opts->any_active = 1;
+                } else if (strcmp(k, "ruby_ver") == 0 && v_len > 0) {
+                    snprintf(opts->ruby_ver, sizeof(opts->ruby_ver), "%s", v);
+                    opts->any_active = 1;
+                } else if (strcmp(k, "filepath") == 0 && v_len > 0) {
+                    snprintf(opts->filepath, sizeof(opts->filepath), "%s", v);
+                    opts->any_active = 1;
+                } else if (strcmp(k, "line") == 0 && v_len > 0) {
+                    char *endptr = NULL;
+                    long long parsed_line = strtoll(v, &endptr, 10);
+                    if (endptr != v) {
+                        if (parsed_line < (long long) INT32_MIN) parsed_line = (long long) INT32_MIN;
+                        if (parsed_line > (long long) INT32_MAX) parsed_line = (long long) INT32_MAX;
+                        opts->line = (int32_t) parsed_line;
+                        opts->has_line = 1;
+                        if (opts->line != 1) opts->any_active = 1;
+                    }
+                } else if (strcmp(k, "cmd") == 0 && v_len > 0) {
+                    for (size_t ci = 0; ci < v_len; ci++) {
+                        switch (v[ci]) {
+                            case 'a': opts->cmd_flags |= PM_OPTIONS_COMMAND_LINE_A; break;
+                            case 'e': opts->cmd_flags |= PM_OPTIONS_COMMAND_LINE_E; break;
+                            case 'l': opts->cmd_flags |= PM_OPTIONS_COMMAND_LINE_L; break;
+                            case 'n': opts->cmd_flags |= PM_OPTIONS_COMMAND_LINE_N; break;
+                            case 'p': opts->cmd_flags |= PM_OPTIONS_COMMAND_LINE_P; break;
+                            case 'x': opts->cmd_flags |= PM_OPTIONS_COMMAND_LINE_X; break;
+                            default: break;
+                        }
+                    }
+                    if (opts->cmd_flags != 0) opts->any_active = 1;
+                } else if (strcmp(k, "main") == 0) {
+                    if (opt_val_is_truthy(v)) { opts->main_script = 1; opts->any_active = 1; }
+                } else if (strcmp(k, "partial") == 0) {
+                    if (opt_val_is_truthy(v)) { opts->partial_script = 1; opts->any_active = 1; }
+                } else if (strcmp(k, "freeze") == 0) {
+                    if (opt_val_is_truthy(v)) { opts->freeze = 1; opts->any_active = 1; }
+                } else if (strcmp(k, "comments") == 0) {
+                    if (opt_val_is_truthy(v)) { opts->attach_comments = 1; opts->any_active = 1; }
+                } else if (strcmp(k, "enc_lock") == 0) {
+                    if (opt_val_is_truthy(v)) { opts->encoding_locked = 1; opts->any_active = 1; }
+                } else if (strcmp(k, "frozen_lit") == 0 && v_len > 0) {
+                    if (opt_val_is_truthy(v)) {
+                        opts->has_frozen_string_literal = 1;
+                        opts->frozen_string_literal = 1;
+                        opts->any_active = 1;
+                    } else if (strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "no") == 0 || strcmp(v, "off") == 0) {
+                        opts->has_frozen_string_literal = 1;
+                        opts->frozen_string_literal = 0;
+                        opts->any_active = 1;
+                    }
+                } else if (strcmp(k, "stream") == 0) {
+                    if (opt_val_is_truthy(v)) { opts->stream_mode = 1; opts->any_active = 1; }
+                } else if (strcmp(k, "shebang_cb") == 0) {
+                    if (opt_val_is_truthy(v)) { opts->shebang_cb = 1; opts->any_active = 1; }
+                } else if (strcmp(k, "budget") == 0 && v_len > 0) {
+                    if (strcmp(v, "SIZE_MAX") == 0 || strcmp(v, "max") == 0 || strcmp(v, "-1") == 0) {
+                        opts->has_stack_budget = 1;
+                        opts->stack_budget = SIZE_MAX;
+                        opts->any_active = 1;
+                    } else {
+                        char *endptr = NULL;
+                        unsigned long long bval = strtoull(v, &endptr, 10);
+                        if (endptr != v) {
+                            opts->has_stack_budget = 1;
+                            opts->stack_budget = (size_t) bval;
+                            opts->any_active = 1;
+                        }
+                    }
+                } else if (strcmp(k, "scopes") == 0 && v_len > 0) {
+                    opts->scopes_count = 0;
+                    parse_scopes_param(opts, v, v_len);
+                }
+            }
+            free(k);
+            free(v);
+        }
+        if (amp == NULL) break;
+        p = amp + 1;
+    }
+}
+
+static void
+prism_trace_options_free(prism_trace_options_t *opts) {
+    if (opts == NULL) return;
+    for (size_t i = 0; i < opts->scopes_count; i++) {
+        for (size_t j = 0; j < opts->scopes[i].locals_count; j++) {
+            free(opts->scopes[i].locals[j].bytes);
+            opts->scopes[i].locals[j].bytes = NULL;
+        }
+    }
+}
+
+static void
+emit_meta_options_json(pm_buffer_t *out, const prism_trace_options_t *opts, const char *raw_query, size_t raw_query_len) {
+    if (opts == NULL || !opts->any_active) return;
+    if (raw_query != NULL && raw_query_len > 0) {
+        PM_BUFFER_APPEND_LITERAL(out, ",\"options_query\":");
+        buf_append_json_escaped(out, (const uint8_t *) raw_query, raw_query_len);
+    }
+    PM_BUFFER_APPEND_LITERAL(out, ",\"options\":{");
+    int first = 1;
+    #define META_OPT_SEP() do { if (!first) pm_buffer_append_byte(out, ','); first = 0; } while (0)
+
+    if (opts->encoding[0] != '\0') {
+        META_OPT_SEP();
+        PM_BUFFER_APPEND_LITERAL(out, "\"enc\":");
+        buf_append_cstr_json_escaped(out, opts->encoding);
+    }
+    if (opts->ruby_ver[0] != '\0') {
+        META_OPT_SEP();
+        PM_BUFFER_APPEND_LITERAL(out, "\"ruby_ver\":");
+        buf_append_cstr_json_escaped(out, opts->ruby_ver);
+    }
+    if (opts->line != 1 || opts->has_line) {
+        META_OPT_SEP();
+        pm_buffer_append_format(out, "\"line\":%" PRId32, opts->line);
+    }
+    if (opts->cmd_flags != 0) {
+        char cmd_str[8];
+        size_t ci = 0;
+        if (opts->cmd_flags & PM_OPTIONS_COMMAND_LINE_A) cmd_str[ci++] = 'a';
+        if (opts->cmd_flags & PM_OPTIONS_COMMAND_LINE_E) cmd_str[ci++] = 'e';
+        if (opts->cmd_flags & PM_OPTIONS_COMMAND_LINE_L) cmd_str[ci++] = 'l';
+        if (opts->cmd_flags & PM_OPTIONS_COMMAND_LINE_N) cmd_str[ci++] = 'n';
+        if (opts->cmd_flags & PM_OPTIONS_COMMAND_LINE_P) cmd_str[ci++] = 'p';
+        if (opts->cmd_flags & PM_OPTIONS_COMMAND_LINE_X) cmd_str[ci++] = 'x';
+        cmd_str[ci] = '\0';
+        META_OPT_SEP();
+        pm_buffer_append_format(out, "\"cmd\":\"%s\"", cmd_str);
+    }
+    if (opts->main_script)     { META_OPT_SEP(); PM_BUFFER_APPEND_LITERAL(out, "\"main\":true"); }
+    if (opts->partial_script)  { META_OPT_SEP(); PM_BUFFER_APPEND_LITERAL(out, "\"partial\":true"); }
+    if (opts->freeze)          { META_OPT_SEP(); PM_BUFFER_APPEND_LITERAL(out, "\"freeze\":true"); }
+    if (opts->attach_comments) { META_OPT_SEP(); PM_BUFFER_APPEND_LITERAL(out, "\"comments\":true"); }
+    if (opts->encoding_locked) { META_OPT_SEP(); PM_BUFFER_APPEND_LITERAL(out, "\"enc_lock\":true"); }
+    if (opts->has_frozen_string_literal) {
+        META_OPT_SEP();
+        pm_buffer_append_format(out, "\"frozen_lit\":%s", opts->frozen_string_literal ? "true" : "false");
+    }
+    if (opts->stream_mode)     { META_OPT_SEP(); PM_BUFFER_APPEND_LITERAL(out, "\"stream\":true"); }
+    if (opts->filepath[0] != '\0') {
+        META_OPT_SEP();
+        PM_BUFFER_APPEND_LITERAL(out, "\"filepath\":");
+        buf_append_cstr_json_escaped(out, opts->filepath);
+    }
+    if (opts->shebang_cb)      { META_OPT_SEP(); PM_BUFFER_APPEND_LITERAL(out, "\"shebang_cb\":true"); }
+    if (opts->has_stack_budget) {
+        META_OPT_SEP();
+        if (opts->stack_budget == SIZE_MAX) {
+            PM_BUFFER_APPEND_LITERAL(out, "\"budget\":\"SIZE_MAX\"");
+        } else {
+            pm_buffer_append_format(out, "\"budget\":\"%zu\"", opts->stack_budget);
+        }
+    }
+    if (opts->scopes_count > 0) {
+        META_OPT_SEP();
+        PM_BUFFER_APPEND_LITERAL(out, "\"scopes\":[");
+        for (size_t i = 0; i < opts->scopes_count; i++) {
+            if (i > 0) pm_buffer_append_byte(out, ',');
+            char fwd_str[8];
+            size_t fi = 0;
+            uint8_t fw = opts->scopes[i].forwarding;
+            if (fw & PM_OPTIONS_SCOPE_FORWARDING_POSITIONALS) fwd_str[fi++] = 'p';
+            if (fw & PM_OPTIONS_SCOPE_FORWARDING_KEYWORDS)    fwd_str[fi++] = 'k';
+            if (fw & PM_OPTIONS_SCOPE_FORWARDING_BLOCK)       fwd_str[fi++] = 'b';
+            if (fw & PM_OPTIONS_SCOPE_FORWARDING_ALL)         fwd_str[fi++] = 'a';
+            fwd_str[fi] = '\0';
+            pm_buffer_append_format(out, "{\"forwarding\":\"%s\",\"locals\":[", fwd_str);
+            for (size_t j = 0; j < opts->scopes[i].locals_count; j++) {
+                if (j > 0) pm_buffer_append_byte(out, ',');
+                buf_append_json_escaped(out, opts->scopes[i].locals[j].bytes, opts->scopes[i].locals[j].len);
+            }
+            PM_BUFFER_APPEND_LITERAL(out, "]}");
+        }
+        pm_buffer_append_byte(out, ']');
+    }
+    #undef META_OPT_SEP
+    pm_buffer_append_byte(out, '}');
+}
+
 PRISM_EXPORTED_FUNCTION void
-prism_trace_run_to_buffer(
+prism_trace_run_to_buffer_opts(
     pm_buffer_t *out_buf,
     const uint8_t *source,
     size_t size,
-    uint32_t max_steps
+    uint32_t max_steps,
+    const char *opts_query,
+    size_t opts_query_len
 ) {
+    const uint8_t *safe_source = (source != NULL) ? source : (const uint8_t *) "";
+
+    prism_trace_options_t parsed_opts;
+    prism_trace_options_parse(&parsed_opts, opts_query, opts_query_len);
+
     prism_trace_reset(out_buf, max_steps > 0 ? (uint64_t) max_steps : 50000);
+    g_trace_input_size = (uint64_t) size;
 
     PM_BUFFER_APPEND_LITERAL(out_buf, "{\"meta\":true,\"prism_version\":\"" PRISM_VERSION "\",\"source\":");
-    buf_append_json_escaped(out_buf, source, size);
-    pm_buffer_append_format(out_buf, ",\"length\":%zu}\n", size);
+    buf_append_json_escaped(out_buf, safe_source, size);
+    pm_buffer_append_format(out_buf, ",\"length\":%zu", size);
+    emit_meta_options_json(out_buf, &parsed_opts, opts_query, opts_query_len);
+    PM_BUFFER_APPEND_LITERAL(out_buf, "}\n");
 
     g_trace_xalloc_tracking = 1;
+
+    pm_options_t *options_ptr = NULL;
+#if !PRISM_TRACE_HAS_OPTIONS_NEW
+    pm_options_t options_storage = { 0 };
+#endif
+
+    if (parsed_opts.any_active) {
+#if PRISM_TRACE_HAS_OPTIONS_NEW
+        options_ptr = pm_options_new();
+#else
+        options_ptr = &options_storage;
+#endif
+        pm_options_line_set(options_ptr, parsed_opts.line);
+        pm_options_command_line_set(options_ptr, parsed_opts.cmd_flags);
+        pm_options_main_script_set(options_ptr, parsed_opts.main_script != 0);
+        pm_options_partial_script_set(options_ptr, parsed_opts.partial_script != 0);
+        pm_options_freeze_set(options_ptr, parsed_opts.freeze != 0);
+#if PRISM_TRACE_HAS_OPTIONS_ATTACH_COMMENTS
+        pm_options_attach_comments_set(options_ptr, parsed_opts.attach_comments != 0);
+#endif
+        pm_options_encoding_locked_set(options_ptr, parsed_opts.encoding_locked != 0);
+
+        if (parsed_opts.ruby_ver[0] != '\0') {
+            pm_options_version_set(options_ptr, parsed_opts.ruby_ver, strlen(parsed_opts.ruby_ver));
+        }
+        if (parsed_opts.has_frozen_string_literal) {
+            pm_options_frozen_string_literal_set(options_ptr, parsed_opts.frozen_string_literal != 0);
+        }
+        if (parsed_opts.encoding[0] != '\0') {
+            pm_options_encoding_set(options_ptr, parsed_opts.encoding);
+        }
+        if (parsed_opts.filepath[0] != '\0') {
+            pm_options_filepath_set(options_ptr, parsed_opts.filepath);
+        }
+        if (parsed_opts.shebang_cb) {
+            pm_options_shebang_callback_set(options_ptr, trace_shebang_cb, NULL);
+        }
+#if PRISM_TRACE_HAS_OPTIONS_STACK_BUDGET
+        if (parsed_opts.has_stack_budget) {
+            pm_options_stack_budget_set(options_ptr, parsed_opts.stack_budget);
+        }
+#endif
+        if (parsed_opts.scopes_count > 0 && pm_options_scopes_init(options_ptr, parsed_opts.scopes_count)) {
+            for (size_t i = 0; i < parsed_opts.scopes_count; i++) {
+#if PRISM_TRACE_HAS_OPTIONS_SCOPE_MUT
+                pm_options_scope_t *scope = pm_options_scope_mut(options_ptr, i);
+                pm_options_scope_init(scope, parsed_opts.scopes[i].locals_count);
+                pm_options_scope_forwarding_set(scope, parsed_opts.scopes[i].forwarding);
+                for (size_t j = 0; j < parsed_opts.scopes[i].locals_count; j++) {
+                    pm_string_init(
+                        pm_options_scope_local_mut(scope, j),
+                        parsed_opts.scopes[i].locals[j].bytes,
+                        parsed_opts.scopes[i].locals[j].len
+                    );
+                }
+#else
+                pm_options_scope_t *scope = &options_ptr->scopes[i];
+                if (pm_options_scope_init(scope, parsed_opts.scopes[i].locals_count)) {
+                    pm_options_scope_forwarding_set(scope, parsed_opts.scopes[i].forwarding);
+                    for (size_t j = 0; j < parsed_opts.scopes[i].locals_count; j++) {
+                        pm_string_constant_init(
+                            &scope->locals[j],
+                            (const char *) parsed_opts.scopes[i].locals[j].bytes,
+                            parsed_opts.scopes[i].locals[j].len
+                        );
+                    }
+                }
+#endif
+            }
+        }
+    }
 
     uint32_t saved_line_offsets[128];
     size_t saved_n_lines = 0;
     size_t saved_errors = 0;
     size_t saved_warnings = 0;
     size_t saved_comments = 0;
+    size_t final_parsed_size = size;
 
 #if PRISM_TRACE_HAS_ARENA
     pm_arena_t arena = { 0 };
-    pm_parser_t parser;
-    pm_parser_init(&arena, &parser, source, size, NULL);
-    g_trace_parser = &parser;
+    if (parsed_opts.stream_mode) {
+#if PRISM_TRACE_HAS_SOURCE_STREAM
+        prism_trace_stream_t stream_state = {
+            .data = safe_source,
+            .size = size,
+            .pos = 0,
+            .eof = false
+        };
+        pm_source_t *stream_src = pm_source_stream_new(&stream_state, trace_stream_fgets, trace_stream_feof);
+        pm_parser_t *stream_parser = NULL;
+        pm_node_t *root = pm_parse_stream(&stream_parser, &arena, stream_src, options_ptr);
+        (void) root;
+        final_parsed_size = pm_source_length(stream_src);
 
-    pm_node_t *root = pm_parse(&parser);
-    (void) root;
+        if (!g_trace_crashed && stream_parser != NULL &&
+            (compute_diags_hash(stream_parser) != g_last_diags_hash ||
+             compute_comments_hash(stream_parser) != g_last_comments_hash ||
+             (g_trace_node_count > 0 && compute_ast_hash(stream_parser) != g_last_ast_hash))) {
+            int ast_changed = (g_trace_node_count > 0 && compute_ast_hash(stream_parser) != g_last_ast_hash) ? 1 : 0;
+            prism_trace_emit_event(stream_parser, "POST_PARSE", "pm_parse_stream", 0, NULL, ast_changed);
+        }
 
-    if (!g_trace_crashed &&
-        (compute_diags_hash(&parser) != g_last_diags_hash ||
-         compute_comments_hash(&parser) != g_last_comments_hash ||
-         (g_trace_node_count > 0 && compute_ast_hash(&parser) != g_last_ast_hash))) {
-        int ast_changed = (g_trace_node_count > 0 && compute_ast_hash(&parser) != g_last_ast_hash) ? 1 : 0;
-        prism_trace_emit_event(&parser, "POST_PARSE", "pm_parse", 0, NULL, ast_changed);
+        if (stream_parser != NULL) {
+            saved_errors = stream_parser->error_list.size;
+            saved_warnings = stream_parser->warning_list.size;
+            saved_comments = stream_parser->comment_list.size;
+            saved_n_lines = stream_parser->line_offsets.size > 128 ? 128 : stream_parser->line_offsets.size;
+            for (size_t i = 0; i < saved_n_lines; i++) {
+                saved_line_offsets[i] = stream_parser->line_offsets.offsets[i];
+            }
+        }
+
+        g_trace_buf = NULL;
+        g_trace_parser = NULL;
+
+        if (stream_parser != NULL) {
+            pm_parser_free(stream_parser);
+        }
+        pm_arena_cleanup(&arena);
+        pm_source_free(stream_src);
+#endif
+    } else {
+        pm_parser_t parser;
+        pm_parser_init(&arena, &parser, safe_source, size, options_ptr);
+        g_trace_parser = &parser;
+
+        pm_node_t *root = pm_parse(&parser);
+        (void) root;
+
+        if (!g_trace_crashed &&
+            (compute_diags_hash(&parser) != g_last_diags_hash ||
+             compute_comments_hash(&parser) != g_last_comments_hash ||
+             (g_trace_node_count > 0 && compute_ast_hash(&parser) != g_last_ast_hash))) {
+            int ast_changed = (g_trace_node_count > 0 && compute_ast_hash(&parser) != g_last_ast_hash) ? 1 : 0;
+            prism_trace_emit_event(&parser, "POST_PARSE", "pm_parse", 0, NULL, ast_changed);
+        }
+
+        saved_errors = parser.error_list.size;
+        saved_warnings = parser.warning_list.size;
+        saved_comments = parser.comment_list.size;
+        saved_n_lines = parser.line_offsets.size > 128 ? 128 : parser.line_offsets.size;
+        for (size_t i = 0; i < saved_n_lines; i++) {
+            saved_line_offsets[i] = parser.line_offsets.offsets[i];
+        }
+
+        g_trace_buf = NULL;
+        g_trace_parser = NULL;
+
+        pm_parser_cleanup(&parser);
+        pm_arena_cleanup(&arena);
     }
-
-    saved_errors = parser.error_list.size;
-    saved_warnings = parser.warning_list.size;
-    saved_comments = parser.comment_list.size;
-    saved_n_lines = parser.line_offsets.size > 128 ? 128 : parser.line_offsets.size;
-    for (size_t i = 0; i < saved_n_lines; i++) {
-        saved_line_offsets[i] = parser.line_offsets.offsets[i];
-    }
-
-    g_trace_buf = NULL;
-    g_trace_parser = NULL;
-
-    pm_parser_cleanup(&parser);
-    pm_arena_cleanup(&arena);
 #else
     pm_parser_t parser;
-    pm_parser_init(&parser, source, size, NULL);
-    g_trace_parser = &parser;
+    pm_buffer_t stream_buf = { 0 };
+    pm_node_t *root = NULL;
 
-    pm_node_t *root = pm_parse(&parser);
+    if (parsed_opts.stream_mode) {
+        prism_trace_stream_t stream_state = {
+            .data = safe_source,
+            .size = size,
+            .pos = 0,
+            .eof = false
+        };
+        root = pm_parse_stream(&parser, &stream_buf, &stream_state, trace_stream_fgets, trace_stream_feof, options_ptr);
+        final_parsed_size = pm_buffer_length(&stream_buf);
+    } else {
+        pm_parser_init(&parser, safe_source, size, options_ptr);
+        g_trace_parser = &parser;
+        root = pm_parse(&parser);
+    }
 
     if (!g_trace_crashed &&
         (compute_diags_hash(&parser) != g_last_diags_hash ||
          compute_comments_hash(&parser) != g_last_comments_hash ||
          (g_trace_node_count > 0 && compute_ast_hash(&parser) != g_last_ast_hash))) {
         int ast_changed = (g_trace_node_count > 0 && compute_ast_hash(&parser) != g_last_ast_hash) ? 1 : 0;
-        prism_trace_emit_event(&parser, "POST_PARSE", "pm_parse", 0, NULL, ast_changed);
+        prism_trace_emit_event(&parser, "POST_PARSE", parsed_opts.stream_mode ? "pm_parse_stream" : "pm_parse", 0, NULL, ast_changed);
     }
 
     saved_errors = parser.error_list.size;
@@ -1400,9 +2011,17 @@ prism_trace_run_to_buffer(
         pm_node_destroy(&parser, root);
     }
     pm_parser_free(&parser);
+    if (parsed_opts.stream_mode) {
+        pm_buffer_free(&stream_buf);
+    }
 #endif
 
+    if (options_ptr != NULL) {
+        pm_options_free(options_ptr);
+    }
+
     g_trace_xalloc_tracking = 0;
+    prism_trace_options_free(&parsed_opts);
 
     if (!g_trace_crashed) {
         pm_buffer_append_format(
@@ -1413,11 +2032,13 @@ prism_trace_run_to_buffer(
             "\"lex_modes\":[],\"contexts\":[],\"call_stack\":[],\"line_offsets\":[",
             g_trace_step++,
 #if PRISM_TRACE_HAS_ARENA
-            "pm_parser_cleanup + pm_arena_cleanup",
+            parsed_opts.stream_mode
+                ? "pm_parser_free + pm_arena_cleanup + pm_source_free"
+                : "pm_parser_cleanup + pm_arena_cleanup",
 #else
             "pm_node_destroy + pm_parser_free",
 #endif
-            size, size, size, size
+            final_parsed_size, final_parsed_size, final_parsed_size, final_parsed_size
         );
         for (size_t i = 0; i < saved_n_lines; i++) {
             if (i > 0) pm_buffer_append_byte(out_buf, ',');
@@ -1451,4 +2072,14 @@ prism_trace_run_to_buffer(
         g_trace_xalloc_alloc_count,
         g_trace_xalloc_free_count
     );
+}
+
+PRISM_EXPORTED_FUNCTION void
+prism_trace_run_to_buffer(
+    pm_buffer_t *out_buf,
+    const uint8_t *source,
+    size_t size,
+    uint32_t max_steps
+) {
+    prism_trace_run_to_buffer_opts(out_buf, source, size, max_steps, NULL, 0);
 }

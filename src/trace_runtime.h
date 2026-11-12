@@ -39,12 +39,22 @@ extern int g_trace_crashed;
 void prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps);
 void prism_trace_set_crash_cb(prism_trace_crash_cb_t cb);
 void prism_trace_emit_crash(const char *reason, const char *expr, const char *file, int line, const char *func);
+void prism_trace_on_parse_pass(pm_parser_t *parser);
 
 PRISM_EXPORTED_FUNCTION void prism_trace_run_to_buffer(
     pm_buffer_t *out_buf,
     const uint8_t *source,
     size_t size,
     uint32_t max_steps
+);
+
+PRISM_EXPORTED_FUNCTION void prism_trace_run_to_buffer_opts(
+    pm_buffer_t *out_buf,
+    const uint8_t *source,
+    size_t size,
+    uint32_t max_steps,
+    const char *opts_query,
+    size_t opts_query_len
 );
 
 void prism_trace_emit_event(

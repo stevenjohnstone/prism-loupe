@@ -75,10 +75,95 @@ read_file_bytes(const char *path, size_t *out_len) {
     return buf;
 }
 
+static int
+cli_hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int
+cli_b64_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+
+static uint8_t *
+decode_url_code_param(const char *query, size_t query_len, size_t *out_len, int *found_code) {
+    *out_len = 0;
+    *found_code = 0;
+    const char *p = query;
+    const char *end = query + query_len;
+    if (p < end && *p == '?') p++;
+
+    while (p < end) {
+        const char *amp = (const char *) memchr(p, '&', (size_t) (end - p));
+        const char *pair_end = amp != NULL ? amp : end;
+        const char *eq = (const char *) memchr(p, '=', (size_t) (pair_end - p));
+        if (eq != NULL && (size_t) (eq - p) == 4 && memcmp(p, "code", 4) == 0) {
+            *found_code = 1;
+            const char *v = eq + 1;
+            size_t v_len = (size_t) (pair_end - v);
+            uint8_t *vals = (uint8_t *) malloc(v_len + 1);
+            if (!vals) return NULL;
+            size_t n = 0;
+            for (size_t i = 0; i < v_len; i++) {
+                char c = v[i];
+                if (c == '%' && i + 2 < v_len) {
+                    int hi = cli_hex_val(v[i + 1]);
+                    int lo = cli_hex_val(v[i + 2]);
+                    if (hi >= 0 && lo >= 0) {
+                        c = (char) ((hi << 4) | lo);
+                        i += 2;
+                    }
+                } else if (c == ' ') {
+                    c = '+';
+                }
+                if (c == '=') continue;
+                int bv = cli_b64_val(c);
+                if (bv >= 0) vals[n++] = (uint8_t) bv;
+            }
+            uint8_t *out = (uint8_t *) malloc((n * 3) / 4 + 2);
+            if (!out) {
+                free(vals);
+                return NULL;
+            }
+            size_t w = 0, i = 0;
+            while (i + 4 <= n) {
+                out[w++] = (uint8_t) ((vals[i] << 2) | (vals[i + 1] >> 4));
+                out[w++] = (uint8_t) (((vals[i + 1] & 0x0f) << 4) | (vals[i + 2] >> 2));
+                out[w++] = (uint8_t) (((vals[i + 2] & 0x03) << 6) | vals[i + 3]);
+                i += 4;
+            }
+            size_t rem = n - i;
+            if (rem == 2) {
+                out[w++] = (uint8_t) ((vals[i] << 2) | (vals[i + 1] >> 4));
+            } else if (rem == 3) {
+                out[w++] = (uint8_t) ((vals[i] << 2) | (vals[i + 1] >> 4));
+                out[w++] = (uint8_t) (((vals[i + 1] & 0x0f) << 4) | (vals[i + 2] >> 2));
+            }
+            out[w] = '\0';
+            free(vals);
+            *out_len = w;
+            return out;
+        }
+        if (amp == NULL) break;
+        p = amp + 1;
+    }
+    return NULL;
+}
+
 int
 main(int argc, char **argv) {
     const char *inline_code = NULL;
     const char *input_file = NULL;
+    const char *opts_query = NULL;
+    const char *loupe_url = NULL;
     uint32_t max_steps = 50000;
 
     for (int i = 1; i < argc; i++) {
@@ -86,10 +171,27 @@ main(int argc, char **argv) {
             s_out_path = argv[++i];
         } else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) {
             inline_code = argv[++i];
+        } else if (strcmp(argv[i], "--opts") == 0 && i + 1 < argc) {
+            opts_query = argv[++i];
+        } else if (strcmp(argv[i], "--loupe-url") == 0 && i + 1 < argc) {
+            loupe_url = argv[++i];
         } else if (strcmp(argv[i], "--max-steps") == 0 && i + 1 < argc) {
             max_steps = (uint32_t) strtoul(argv[++i], NULL, 10);
         } else {
             input_file = argv[i];
+        }
+    }
+
+    const char *effective_query = opts_query;
+    size_t effective_query_len = opts_query ? strlen(opts_query) : 0;
+    if (loupe_url != NULL) {
+        const char *qmark = strchr(loupe_url, '?');
+        const char *qstart = qmark != NULL ? (qmark + 1) : loupe_url;
+        const char *hash = strchr(qstart, '#');
+        size_t qlen = hash != NULL ? (size_t) (hash - qstart) : strlen(qstart);
+        if (effective_query == NULL) {
+            effective_query = qstart;
+            effective_query_len = qlen;
         }
     }
 
@@ -116,6 +218,19 @@ main(int argc, char **argv) {
             return 1;
         }
         source = owned_buf;
+    } else if (loupe_url != NULL) {
+        const char *qmark = strchr(loupe_url, '?');
+        const char *qstart = qmark != NULL ? (qmark + 1) : loupe_url;
+        const char *hash = strchr(qstart, '#');
+        size_t qlen = hash != NULL ? (size_t) (hash - qstart) : strlen(qstart);
+        int found_code = 0;
+        owned_buf = decode_url_code_param(qstart, qlen, &size, &found_code);
+        if (found_code && owned_buf != NULL) {
+            source = owned_buf;
+        } else {
+            source = (const uint8_t *) "";
+            size = 0;
+        }
     } else {
         source = (const uint8_t *) default_code;
         size = strlen(default_code);
@@ -129,7 +244,7 @@ main(int argc, char **argv) {
     signal(SIGFPE, on_fatal_signal);
 
     memset(&s_trace_buf, 0, sizeof(s_trace_buf));
-    prism_trace_run_to_buffer(&s_trace_buf, source, size, max_steps);
+    prism_trace_run_to_buffer_opts(&s_trace_buf, source, size, max_steps, effective_query, effective_query_len);
 
     flush_trace_to_disk(0);
 
