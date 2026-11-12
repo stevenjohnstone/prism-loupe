@@ -57,9 +57,15 @@ def write_compat_header(prism_dir, build_dir)
 
   has_arena = File.exist?(File.join(prism_dir, "include/prism/internal/arena.h"))
   has_internal_diag = File.exist?(File.join(prism_dir, "include/prism/internal/diagnostic.h"))
+  has_internal_comments = File.exist?(File.join(prism_dir, "include/prism/internal/comments.h"))
+  has_internal_magic_comments = File.exist?(File.join(prism_dir, "include/prism/internal/magic_comments.h"))
+  magic_h_path = File.join(prism_dir, has_internal_magic_comments ? "include/prism/internal/magic_comments.h" : "include/prism/parser.h")
+  magic_h = File.exist?(magic_h_path) ? File.read(magic_h_path, encoding: "UTF-8") : ""
+  magic_comment_has_loc = magic_h.include?("pm_location_t key;")
   has_metadata_arena = parser_h.include?("metadata_arena")
   has_scratch_arena = parser_h.include?("scratch_arena")
   has_line_offsets = parser_h.include?("line_offsets")
+  has_attach_comments = parser_h.include?("bool attach_comments;")
   location_is_offset = ast_h.include?("uint32_t length;")
   visit_returns_enum = node_h.include?("PM_VISIT_SKIP")
   has_diag_type_fn = diag_h.include?("pm_diagnostic_type(")
@@ -74,9 +80,13 @@ def write_compat_header(prism_dir, build_dir)
     #define PRISM_TRACE_HAS_INTERNAL_HEADERS #{has_internal_parser ? 1 : 0}
     #define PRISM_TRACE_HAS_ARENA #{has_arena ? 1 : 0}
     #define PRISM_TRACE_HAS_INTERNAL_DIAG #{has_internal_diag ? 1 : 0}
+    #define PRISM_TRACE_HAS_INTERNAL_COMMENTS #{has_internal_comments ? 1 : 0}
+    #define PRISM_TRACE_HAS_INTERNAL_MAGIC_COMMENTS #{has_internal_magic_comments ? 1 : 0}
+    #define PRISM_TRACE_MAGIC_COMMENT_HAS_LOC #{magic_comment_has_loc ? 1 : 0}
     #define PRISM_TRACE_HAS_METADATA_ARENA #{has_metadata_arena ? 1 : 0}
     #define PRISM_TRACE_HAS_SCRATCH_ARENA #{has_scratch_arena ? 1 : 0}
     #define PRISM_TRACE_HAS_LINE_OFFSETS #{has_line_offsets ? 1 : 0}
+    #define PRISM_TRACE_HAS_ATTACH_COMMENTS #{has_attach_comments ? 1 : 0}
     #define PRISM_TRACE_LOCATION_IS_OFFSET #{location_is_offset ? 1 : 0}
     #define PRISM_TRACE_VISIT_RETURNS_ENUM #{visit_returns_enum ? 1 : 0}
     #define PRISM_TRACE_HAS_DIAG_TYPE_FN #{has_diag_type_fn ? 1 : 0}
@@ -91,6 +101,12 @@ def write_compat_header(prism_dir, build_dir)
     #include "prism/internal/tokens.h"
     #if PRISM_TRACE_HAS_INTERNAL_DIAG
     #include "prism/internal/diagnostic.h"
+    #endif
+    #if PRISM_TRACE_HAS_INTERNAL_COMMENTS
+    #include "prism/internal/comments.h"
+    #endif
+    #if PRISM_TRACE_HAS_INTERNAL_MAGIC_COMMENTS
+    #include "prism/internal/magic_comments.h"
     #endif
     #include "prism/internal/buffer.h"
     #include "prism/diagnostic.h"

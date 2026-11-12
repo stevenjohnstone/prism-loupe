@@ -14,6 +14,8 @@ int g_trace_call_depth = 0;
 int g_trace_in_hook = 0;
 int g_trace_crashed = 0;
 static uint64_t g_last_ast_hash = 0;
+static uint64_t g_last_diags_hash = 0;
+static uint64_t g_last_comments_hash = 0;
 static const pm_list_node_t *g_last_emitted_error_tail = NULL;
 static const pm_list_node_t *g_last_emitted_warning_tail = NULL;
 static prism_trace_crash_cb_t g_trace_crash_cb = NULL;
@@ -152,6 +154,14 @@ pm_buffer_new(void) {
 }
 #endif
 
+typedef struct {
+    uint32_t start;
+    uint32_t len;
+    uint32_t end;
+    int underflow;
+    int oob;
+} trace_loc_info_t;
+
 static inline uint32_t
 loc_start_offset(const pm_parser_t *parser, const pm_location_t *loc) {
 #if PRISM_TRACE_LOCATION_IS_OFFSET
@@ -159,7 +169,7 @@ loc_start_offset(const pm_parser_t *parser, const pm_location_t *loc) {
     return loc->start;
 #else
     if (parser == NULL || parser->start == NULL || loc->start == NULL) return 0;
-    return (uint32_t)(loc->start - parser->start);
+    return (uint32_t)((uintptr_t)loc->start - (uintptr_t)parser->start);
 #endif
 }
 
@@ -169,9 +179,85 @@ loc_length_bytes(const pm_location_t *loc) {
     return loc->length;
 #else
     if (loc->start == NULL || loc->end == NULL) return 0;
-    return (uint32_t)(loc->end - loc->start);
+    return (uint32_t)((uintptr_t)loc->end - (uintptr_t)loc->start);
 #endif
 }
+
+static inline trace_loc_info_t
+eval_loc_bounds(const pm_parser_t *parser, const pm_location_t *loc, uint64_t src_len) {
+    trace_loc_info_t info = { 0, 0, 0, 0, 0 };
+    if (loc == NULL) return info;
+#if PRISM_TRACE_LOCATION_IS_OFFSET
+    (void) parser;
+    info.start = loc->start;
+    info.len = loc->length;
+    info.end = info.start + info.len;
+    info.underflow = (
+        info.end < info.start ||
+        info.len >= 0x80000000U ||
+        (src_len < 0x80000000ULL && info.start >= 0x80000000U)
+    ) ? 1 : 0;
+    info.oob = (
+        !info.underflow &&
+        ((uint64_t)info.start > src_len || (uint64_t)info.len > src_len - (uint64_t)info.start)
+    ) ? 1 : 0;
+#else
+    uintptr_t p_base = (parser != NULL && parser->start != NULL) ? (uintptr_t)parser->start : 0;
+    uintptr_t p_end = (parser != NULL && parser->end != NULL) ? (uintptr_t)parser->end : p_base;
+    if (loc->start == NULL && loc->end == NULL) {
+        return info;
+    }
+    if (loc->start == NULL || loc->end == NULL || p_base == 0) {
+        info.underflow = 1;
+        return info;
+    }
+    uintptr_t s = (uintptr_t)loc->start;
+    uintptr_t e = (uintptr_t)loc->end;
+    info.start = (uint32_t)(s - p_base);
+    info.len = (uint32_t)(e - s);
+    info.end = info.start + info.len;
+    info.underflow = (
+        s < p_base ||
+        e < s ||
+        info.len >= 0x80000000U ||
+        info.end < info.start ||
+        (src_len < 0x80000000ULL && info.start >= 0x80000000U)
+    ) ? 1 : 0;
+    info.oob = (!info.underflow && (s > p_end || e > p_end)) ? 1 : 0;
+#endif
+    return info;
+}
+
+#if !PRISM_TRACE_MAGIC_COMMENT_HAS_LOC
+static inline trace_loc_info_t
+eval_ptr_len_bounds(const pm_parser_t *parser, const uint8_t *ptr, uint32_t length, uint64_t src_len) {
+    trace_loc_info_t info = { 0, length, length, 0, 0 };
+    uintptr_t p_base = (parser != NULL && parser->start != NULL) ? (uintptr_t)parser->start : 0;
+    if (ptr == NULL) {
+        info.underflow = (length >= 0x80000000U) ? 1 : 0;
+        info.oob = (!info.underflow && length > 0) ? 1 : 0;
+        return info;
+    }
+    if (p_base == 0) {
+        info.underflow = 1;
+        return info;
+    }
+    uintptr_t s = (uintptr_t)ptr;
+    info.start = (uint32_t)(s - p_base);
+    info.end = info.start + length;
+    info.underflow = (
+        s < p_base ||
+        length >= 0x80000000U ||
+        info.end < info.start ||
+        (src_len < 0x80000000ULL && info.start >= 0x80000000U)
+    ) ? 1 : 0;
+    info.oob = (
+        !info.underflow &&
+        ((uint64_t)info.start > src_len || (uint64_t)length > src_len - (uint64_t)info.start)
+    ) ? 1 : 0;
+    return info;
+}
+#endif
 
 void
 prism_trace_set_crash_cb(prism_trace_crash_cb_t cb) {
@@ -190,6 +276,8 @@ prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps) {
     g_trace_in_hook = 0;
     g_trace_crashed = 0;
     g_last_ast_hash = 0;
+    g_last_diags_hash = 0;
+    g_last_comments_hash = 0;
     g_last_emitted_error_tail = NULL;
     g_last_emitted_warning_tail = NULL;
     g_trace_xalloc_tracking = 0;
@@ -378,12 +466,12 @@ node_string_locs(
 }
 
 static uint64_t
-compute_ast_hash(void) {
+compute_ast_hash(const pm_parser_t *parser) {
     uint64_t h = 14695981039346656037ULL;
     for (uint32_t i = 1; i <= g_trace_node_count; i++) {
         const pm_node_t *n = g_trace_nodes[i];
         if (n == NULL) continue;
-        uint32_t n_start = loc_start_offset(g_trace_parser, &n->location);
+        uint32_t n_start = loc_start_offset(parser, &n->location);
         uint32_t n_len = loc_length_bytes(&n->location);
         h ^= (uint64_t)n->node_id; h *= 1099511628211ULL;
         h ^= (uint64_t)n_start; h *= 1099511628211ULL;
@@ -391,15 +479,15 @@ compute_ast_hash(void) {
         const pm_location_t *oloc = NULL, *cloc = NULL, *clloc = NULL;
         if (node_string_locs(n, &oloc, &cloc, &clloc)) {
             if (oloc != NULL) {
-                h ^= (uint64_t)loc_start_offset(g_trace_parser, oloc); h *= 1099511628211ULL;
+                h ^= (uint64_t)loc_start_offset(parser, oloc); h *= 1099511628211ULL;
                 h ^= (uint64_t)loc_length_bytes(oloc); h *= 1099511628211ULL;
             }
             if (cloc != NULL) {
-                h ^= (uint64_t)loc_start_offset(g_trace_parser, cloc); h *= 1099511628211ULL;
+                h ^= (uint64_t)loc_start_offset(parser, cloc); h *= 1099511628211ULL;
                 h ^= (uint64_t)loc_length_bytes(cloc); h *= 1099511628211ULL;
             }
             if (clloc != NULL) {
-                h ^= (uint64_t)loc_start_offset(g_trace_parser, clloc); h *= 1099511628211ULL;
+                h ^= (uint64_t)loc_start_offset(parser, clloc); h *= 1099511628211ULL;
                 h ^= (uint64_t)loc_length_bytes(clloc); h *= 1099511628211ULL;
             }
         }
@@ -423,6 +511,97 @@ compute_ast_hash(void) {
         }
     }
     return h;
+}
+
+static const char *
+diag_type_name(const pm_diagnostic_t *diag) {
+    if (diag == NULL) return "UNKNOWN";
+#if PRISM_TRACE_HAS_DIAG_TYPE_FN
+    const char *dtype = pm_diagnostic_type(diag);
+#else
+    const char *dtype = pm_diagnostic_id_human(diag->diag_id);
+#endif
+    return dtype != NULL ? dtype : "UNKNOWN";
+}
+
+static uint64_t
+compute_diags_hash(const pm_parser_t *parser) {
+    if (parser == NULL) return 0;
+    if (parser->error_list.size == 0 && parser->warning_list.size == 0 &&
+        parser->error_list.head == NULL && parser->warning_list.head == NULL) {
+        return 0;
+    }
+    uint64_t src_len = (parser->end >= parser->start) ? (uint64_t)(parser->end - parser->start) : 0;
+    uint64_t h = 14695981039346656037ULL;
+    h ^= (uint64_t)parser->error_list.size; h *= 1099511628211ULL;
+    h ^= (uint64_t)parser->warning_list.size; h *= 1099511628211ULL;
+
+    const pm_list_node_t *lists[2] = { parser->error_list.head, parser->warning_list.head };
+    for (int li = 0; li < 2; li++) {
+        h ^= (uint64_t)(li + 1); h *= 1099511628211ULL;
+        size_t guard = 0;
+        for (const pm_list_node_t *cur = lists[li]; cur != NULL && guard++ < 512; cur = cur->next) {
+            const pm_diagnostic_t *d = (const pm_diagnostic_t *)cur;
+            trace_loc_info_t loc = eval_loc_bounds(parser, &d->location, src_len);
+            h ^= (uint64_t)d->diag_id; h *= 1099511628211ULL;
+            h ^= (uint64_t)d->level; h *= 1099511628211ULL;
+            h ^= (uint64_t)loc.start; h *= 1099511628211ULL;
+            h ^= (uint64_t)loc.len; h *= 1099511628211ULL;
+            h ^= (uint64_t)((loc.underflow << 1) | loc.oob); h *= 1099511628211ULL;
+            if (d->message != NULL) {
+                for (size_t k = 0; d->message[k] != '\0' && k < 32; k++) {
+                    h ^= (uint64_t)(uint8_t)d->message[k]; h *= 1099511628211ULL;
+                }
+            }
+        }
+    }
+    return h == 0 ? 1ULL : h;
+}
+
+static uint64_t
+compute_comments_hash(const pm_parser_t *parser) {
+    if (parser == NULL) return 0;
+    if (parser->comment_list.size == 0 && parser->magic_comment_list.size == 0 &&
+        parser->comment_list.head == NULL && parser->magic_comment_list.head == NULL) {
+        return 0;
+    }
+    uint64_t src_len = (parser->end >= parser->start) ? (uint64_t)(parser->end - parser->start) : 0;
+    uint64_t h = 14695981039346656037ULL;
+    h ^= (uint64_t)parser->comment_list.size; h *= 1099511628211ULL;
+    h ^= (uint64_t)parser->magic_comment_list.size; h *= 1099511628211ULL;
+#if PRISM_TRACE_HAS_ATTACH_COMMENTS
+    int attached = (parser->attach_comments && parser->comment_attachments.comments != NULL) ? 1 : 0;
+    h ^= (uint64_t)attached; h *= 1099511628211ULL;
+#endif
+
+    size_t guard = 0;
+    for (const pm_list_node_t *cur = parser->comment_list.head; cur != NULL && guard++ < 512; cur = cur->next) {
+        const pm_comment_t *c = (const pm_comment_t *)cur;
+        trace_loc_info_t loc = eval_loc_bounds(parser, &c->location, src_len);
+        h ^= (uint64_t)c->type; h *= 1099511628211ULL;
+        h ^= (uint64_t)loc.start; h *= 1099511628211ULL;
+        h ^= (uint64_t)loc.len; h *= 1099511628211ULL;
+        h ^= (uint64_t)((loc.underflow << 1) | loc.oob); h *= 1099511628211ULL;
+    }
+
+    guard = 0;
+    for (const pm_list_node_t *cur = parser->magic_comment_list.head; cur != NULL && guard++ < 256; cur = cur->next) {
+        const pm_magic_comment_t *mc = (const pm_magic_comment_t *)cur;
+#if PRISM_TRACE_MAGIC_COMMENT_HAS_LOC
+        trace_loc_info_t kl = eval_loc_bounds(parser, &mc->key, src_len);
+        trace_loc_info_t vl = eval_loc_bounds(parser, &mc->value, src_len);
+#else
+        trace_loc_info_t kl = eval_ptr_len_bounds(parser, mc->key_start, mc->key_length, src_len);
+        trace_loc_info_t vl = eval_ptr_len_bounds(parser, mc->value_start, mc->value_length, src_len);
+#endif
+        h ^= (uint64_t)kl.start; h *= 1099511628211ULL;
+        h ^= (uint64_t)kl.len; h *= 1099511628211ULL;
+        h ^= (uint64_t)vl.start; h *= 1099511628211ULL;
+        h ^= (uint64_t)vl.len; h *= 1099511628211ULL;
+        h ^= (uint64_t)((kl.underflow << 3) | (kl.oob << 2) | (vl.underflow << 1) | vl.oob);
+        h *= 1099511628211ULL;
+    }
+    return h == 0 ? 1ULL : h;
 }
 
 static ptrdiff_t
@@ -460,17 +639,6 @@ measure_arena(const pm_arena_t *arena, size_t *out_used, size_t *out_cap, size_t
 }
 #endif
 
-static const char *
-diag_type_name(const pm_diagnostic_t *diag) {
-    if (diag == NULL) return "UNKNOWN";
-#if PRISM_TRACE_HAS_DIAG_TYPE_FN
-    const char *dtype = pm_diagnostic_type(diag);
-#else
-    const char *dtype = pm_diagnostic_id_human(diag->diag_id);
-#endif
-    return dtype != NULL ? dtype : "UNKNOWN";
-}
-
 static void
 emit_diag_hook_event(
     const pm_parser_t *parser,
@@ -488,9 +656,8 @@ emit_diag_hook_event(
 
     const pm_diagnostic_t *diag = (const pm_diagnostic_t *)tail;
     if (diag != NULL) {
-        uint32_t d_start = loc_start_offset(parser, &diag->location);
-        uint32_t d_len = loc_length_bytes(&diag->location);
-        uint32_t d_end = d_start + d_len;
+        uint64_t src_len = (parser->end >= parser->start) ? (uint64_t)(parser->end - parser->start) : 0;
+        trace_loc_info_t loc = eval_loc_bounds(parser, &diag->location, src_len);
         char esc_type[256];
         char esc_msg[1152];
         char detail[1600];
@@ -500,15 +667,18 @@ emit_diag_hook_event(
             detail,
             sizeof(detail),
             "{\"severity\":\"%s\",\"diag_type\":%s,\"message\":%s,\"level\":%u,"
-            "\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"length\":%" PRIu32 ",\"len\":%" PRIu32 "}",
+            "\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"length\":%" PRIu32 ",\"len\":%" PRIu32 ","
+            "\"underflow\":%s,\"oob\":%s}",
             severity,
             esc_type,
             esc_msg,
             (unsigned)diag->level,
-            d_start,
-            d_end,
-            d_len,
-            d_len
+            loc.start,
+            loc.end,
+            loc.len,
+            loc.len,
+            loc.underflow ? "true" : "false",
+            loc.oob ? "true" : "false"
         );
         prism_trace_emit_event(parser, event_kind, func, line, detail, 0);
     } else {
@@ -547,6 +717,8 @@ prism_trace_emit_event(
     g_trace_in_hook = 1;
     pm_buffer_t *out = g_trace_buf;
     g_trace_event_start_len = pm_buffer_length(out);
+    uint64_t src_len = (parser->end >= parser->start) ? (uint64_t)(parser->end - parser->start) : 0;
+    int is_crash = (kind != NULL && strcmp(kind, "CRASH") == 0) ? 1 : 0;
 
     char state_buf[256];
     format_lex_state(parser->lex_state, state_buf, sizeof(state_buf));
@@ -641,20 +813,20 @@ prism_trace_emit_event(
     }
     pm_buffer_append_byte(out, ']');
 
-    // Line offsets (up to 128)
+    // Line offsets (up to 128) + full-list invariant scan
     PM_BUFFER_APPEND_LITERAL(out, ",\"line_offsets\":[");
 #if PRISM_TRACE_HAS_LINE_OFFSETS
-    size_t n_lines = parser->line_offsets.size;
+    size_t total_lines = parser->line_offsets.size;
     size_t lo_cap = parser->line_offsets.capacity;
-    if (n_lines > 128) n_lines = 128;
+    size_t n_lines = total_lines > 128 ? 128 : total_lines;
     for (size_t i = 0; i < n_lines; i++) {
         if (i > 0) pm_buffer_append_byte(out, ',');
         pm_buffer_append_format(out, "%" PRIu32, parser->line_offsets.offsets[i]);
     }
 #else
-    size_t n_lines = parser->newline_list.size;
+    size_t total_lines = parser->newline_list.size;
     size_t lo_cap = parser->newline_list.capacity;
-    if (n_lines > 128) n_lines = 128;
+    size_t n_lines = total_lines > 128 ? 128 : total_lines;
     for (size_t i = 0; i < n_lines; i++) {
         if (i > 0) pm_buffer_append_byte(out, ',');
         pm_buffer_append_format(out, "%zu", parser->newline_list.offsets[i]);
@@ -662,7 +834,59 @@ prism_trace_emit_event(
 #endif
     pm_buffer_append_byte(out, ']');
 
-    pm_buffer_append_format(out, ",\"errors\":%zu", parser->error_list.size);
+    {
+        int first_lo_anom = 1;
+        size_t lo_anom_count = 0;
+        if (total_lines == 0) {
+            PM_BUFFER_APPEND_LITERAL(out, ",\"lo_anomalies\":[{\"line\":1,\"offset\":0,\"prev\":0,\"kind\":\"empty\"}]");
+        } else {
+            size_t scan_limit = total_lines < 65536 ? total_lines : 65536;
+            for (size_t i = 0; i < scan_limit && lo_anom_count < 64; i++) {
+#if PRISM_TRACE_HAS_LINE_OFFSETS
+                uint64_t off = (parser->line_offsets.offsets != NULL) ? (uint64_t)parser->line_offsets.offsets[i] : 0;
+                uint64_t prev_off = (i > 0 && parser->line_offsets.offsets != NULL) ? (uint64_t)parser->line_offsets.offsets[i - 1] : 0;
+#else
+                uint64_t off = (parser->newline_list.offsets != NULL) ? (uint64_t)parser->newline_list.offsets[i] : 0;
+                uint64_t prev_off = (i > 0 && parser->newline_list.offsets != NULL) ? (uint64_t)parser->newline_list.offsets[i - 1] : 0;
+#endif
+                const char *anom_kind = NULL;
+                if (src_len < 0x80000000ULL && off >= 0x80000000ULL) {
+                    anom_kind = "underflow";
+                } else if (off > src_len) {
+                    anom_kind = "oob";
+                } else if (i == 0 && off != 0) {
+                    anom_kind = "nonzero_start";
+                } else if (i > 0 && off <= prev_off) {
+                    anom_kind = "order";
+                }
+                if (anom_kind != NULL) {
+                    if (first_lo_anom) {
+                        PM_BUFFER_APPEND_LITERAL(out, ",\"lo_anomalies\":[");
+                        first_lo_anom = 0;
+                    } else {
+                        pm_buffer_append_byte(out, ',');
+                    }
+                    pm_buffer_append_format(
+                        out,
+                        "{\"line\":%zu,\"offset\":%" PRIu64 ",\"prev\":%" PRIu64 ",\"kind\":\"%s\"}",
+                        i + 1, off, prev_off, anom_kind
+                    );
+                    lo_anom_count++;
+                }
+            }
+            if (!first_lo_anom) {
+                pm_buffer_append_byte(out, ']');
+            }
+        }
+    }
+
+    pm_buffer_append_format(
+        out,
+        ",\"errors\":%zu,\"warnings\":%zu,\"comments_count\":%zu",
+        parser->error_list.size,
+        parser->warning_list.size,
+        parser->comment_list.size
+    );
 
     size_t ast_u = 0, ast_c = 0, ast_b = 0;
     size_t meta_u = 0, meta_c = 0, meta_b = 0;
@@ -683,11 +907,7 @@ prism_trace_emit_event(
         ast_u, ast_c, ast_b,
         meta_u, meta_c, meta_b,
         scr_u, scr_c, scr_b,
-#if PRISM_TRACE_HAS_LINE_OFFSETS
-        parser->line_offsets.size, lo_cap,
-#else
-        parser->newline_list.size, lo_cap,
-#endif
+        total_lines, lo_cap,
         parser->constant_pool.size, parser->constant_pool.capacity,
         g_trace_xalloc_live_bytes, g_trace_xalloc_peak_bytes,
         g_trace_xalloc_alloc_count, g_trace_xalloc_free_count
@@ -697,15 +917,169 @@ prism_trace_emit_event(
         pm_buffer_append_format(out, ",\"detail\":%s", detail_json);
     }
 
+    // Emit diagnostics snapshot when error_list or warning_list changed (or on CRASH)
+    {
+        uint64_t diags_hash = compute_diags_hash(parser);
+        if (diags_hash != g_last_diags_hash || (is_crash && diags_hash != 0)) {
+            g_last_diags_hash = diags_hash;
+            PM_BUFFER_APPEND_LITERAL(out, ",\"diagnostics\":[");
+            int first_diag = 1;
+            uint32_t diag_seq = 0;
+            const pm_list_node_t *lists[2] = { parser->error_list.head, parser->warning_list.head };
+            const char *severities[2] = { "error", "warning" };
+            for (int li = 0; li < 2; li++) {
+                size_t d_guard = 0;
+                for (const pm_list_node_t *cur = lists[li]; cur != NULL && d_guard++ < 256; cur = cur->next) {
+                    const pm_diagnostic_t *d = (const pm_diagnostic_t *)cur;
+                    trace_loc_info_t d_loc = eval_loc_bounds(parser, &d->location, src_len);
+                    if (!first_diag) pm_buffer_append_byte(out, ',');
+                    first_diag = 0;
+                    diag_seq++;
+                    PM_BUFFER_APPEND_LITERAL(out, "{\"id\":");
+                    pm_buffer_append_format(out, "%" PRIu32 ",\"severity\":\"%s\",\"type\":", diag_seq, severities[li]);
+                    buf_append_cstr_json_escaped(out, diag_type_name(d));
+                    PM_BUFFER_APPEND_LITERAL(out, ",\"message\":");
+                    if (d->message != NULL) {
+                        size_t mlen = strlen(d->message);
+                        if (mlen > 160) mlen = 160;
+                        buf_append_json_escaped(out, (const uint8_t *)d->message, mlen);
+                    } else {
+                        PM_BUFFER_APPEND_LITERAL(out, "\"\"");
+                    }
+                    pm_buffer_append_format(
+                        out,
+                        ",\"level\":%u,\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"len\":%" PRIu32 ",\"underflow\":%s%s}",
+                        (unsigned)d->level,
+                        d_loc.start,
+                        d_loc.end,
+                        d_loc.len,
+                        d_loc.underflow ? "true" : "false",
+                        d_loc.oob ? ",\"oob\":true" : ""
+                    );
+                }
+            }
+            pm_buffer_append_byte(out, ']');
+        }
+    }
+
+    // Emit comments & magic_comments snapshot when comment_list or magic_comment_list changed (or on CRASH)
+    {
+        uint64_t comments_hash = compute_comments_hash(parser);
+        if (comments_hash != g_last_comments_hash || (is_crash && comments_hash != 0)) {
+            g_last_comments_hash = comments_hash;
+            int comments_attached = 0;
+#if PRISM_TRACE_HAS_ATTACH_COMMENTS
+            comments_attached = (parser->attach_comments && parser->comment_attachments.comments != NULL) ? 1 : 0;
+#endif
+            PM_BUFFER_APPEND_LITERAL(out, ",\"comments\":[");
+            int first_c = 1;
+            uint32_t c_seq = 0;
+            uint32_t seen_starts[256];
+            uint32_t seen_ends[256];
+            size_t seen_valid = 0;
+            uint32_t prev_valid_start = 0;
+            int has_prev_valid = 0;
+            size_t c_guard = 0;
+            for (const pm_list_node_t *cur = parser->comment_list.head; cur != NULL && c_guard++ < 256; cur = cur->next) {
+                const pm_comment_t *c = (const pm_comment_t *)cur;
+                trace_loc_info_t c_loc = eval_loc_bounds(parser, &c->location, src_len);
+                const char *ctype =
+                    c->type == PM_COMMENT_EMBDOC ? "EMBDOC" :
+                    c->type == PM_COMMENT_INLINE ? "INLINE" : "OTHER";
+                int overlap = 0;
+                int lex_rewind = 0;
+                int unsorted = 0;
+                if (!c_loc.underflow && !c_loc.oob) {
+                    for (size_t j = 0; j < seen_valid; j++) {
+                        if (c_loc.start == seen_starts[j] ||
+                            (c_loc.end > c_loc.start && seen_ends[j] > seen_starts[j] &&
+                             c_loc.start < seen_ends[j] && seen_starts[j] < c_loc.end)) {
+                            overlap = 1;
+                            break;
+                        }
+                    }
+                    if (has_prev_valid && c_loc.start < prev_valid_start) {
+                        if (comments_attached) {
+                            unsorted = 1;
+                        } else if (!overlap) {
+                            lex_rewind = 1;
+                        }
+                    }
+                    if (seen_valid < 256) {
+                        seen_starts[seen_valid] = c_loc.start;
+                        seen_ends[seen_valid] = c_loc.end;
+                        seen_valid++;
+                    }
+                    prev_valid_start = c_loc.start;
+                    has_prev_valid = 1;
+                }
+                if (!first_c) pm_buffer_append_byte(out, ',');
+                first_c = 0;
+                c_seq++;
+                pm_buffer_append_format(
+                    out,
+                    "{\"id\":%" PRIu32 ",\"type\":\"%s\",\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"len\":%" PRIu32 ",\"underflow\":%s%s%s%s%s}",
+                    c_seq,
+                    ctype,
+                    c_loc.start,
+                    c_loc.end,
+                    c_loc.len,
+                    c_loc.underflow ? "true" : "false",
+                    c_loc.oob ? ",\"oob\":true" : "",
+                    overlap ? ",\"overlap\":true" : "",
+                    unsorted ? ",\"unsorted\":true" : "",
+                    lex_rewind ? ",\"lex_rewind\":true" : ""
+                );
+            }
+            pm_buffer_append_byte(out, ']');
+
+            PM_BUFFER_APPEND_LITERAL(out, ",\"magic_comments\":[");
+            int first_mc = 1;
+            uint32_t mc_seq = 0;
+            size_t mc_guard = 0;
+            for (const pm_list_node_t *cur = parser->magic_comment_list.head; cur != NULL && mc_guard++ < 128; cur = cur->next) {
+                const pm_magic_comment_t *mc = (const pm_magic_comment_t *)cur;
+#if PRISM_TRACE_MAGIC_COMMENT_HAS_LOC
+                trace_loc_info_t kl = eval_loc_bounds(parser, &mc->key, src_len);
+                trace_loc_info_t vl = eval_loc_bounds(parser, &mc->value, src_len);
+#else
+                trace_loc_info_t kl = eval_ptr_len_bounds(parser, mc->key_start, mc->key_length, src_len);
+                trace_loc_info_t vl = eval_ptr_len_bounds(parser, mc->value_start, mc->value_length, src_len);
+#endif
+                int mc_underflow = (kl.underflow || vl.underflow) ? 1 : 0;
+                int mc_oob = (!mc_underflow && (kl.oob || vl.oob)) ? 1 : 0;
+                if (!first_mc) pm_buffer_append_byte(out, ',');
+                first_mc = 0;
+                mc_seq++;
+                pm_buffer_append_format(
+                    out,
+                    "{\"id\":%" PRIu32 ",\"key_start\":%" PRIu32 ",\"key_end\":%" PRIu32 ",\"key_len\":%" PRIu32
+                    ",\"val_start\":%" PRIu32 ",\"val_end\":%" PRIu32 ",\"val_len\":%" PRIu32
+                    ",\"key_underflow\":%s,\"key_oob\":%s,\"val_underflow\":%s,\"val_oob\":%s"
+                    ",\"underflow\":%s%s}",
+                    mc_seq,
+                    kl.start, kl.end, kl.len,
+                    vl.start, vl.end, vl.len,
+                    kl.underflow ? "true" : "false",
+                    kl.oob ? "true" : "false",
+                    vl.underflow ? "true" : "false",
+                    vl.oob ? "true" : "false",
+                    mc_underflow ? "true" : "false",
+                    mc_oob ? ",\"oob\":true" : ""
+                );
+            }
+            pm_buffer_append_byte(out, ']');
+        }
+    }
+
     if (!include_ast && g_trace_node_count > 0) {
-        if (compute_ast_hash() != g_last_ast_hash) {
+        if (compute_ast_hash(parser) != g_last_ast_hash) {
             include_ast = 1;
         }
     }
 
     if (include_ast) {
-        g_last_ast_hash = compute_ast_hash();
-        uint64_t src_len = (parser->end >= parser->start) ? (uint64_t)(parser->end - parser->start) : 0;
+        g_last_ast_hash = compute_ast_hash(parser);
         PM_BUFFER_APPEND_LITERAL(out, ",\"ast\":[");
         int first_node = 1;
         for (uint32_t i = 1; i <= g_trace_node_count; i++) {
@@ -720,17 +1094,13 @@ prism_trace_emit_event(
             direct_children_t dc = { .count = 0 };
             pm_visit_child_nodes(n, collect_direct_child, &dc);
 
-            uint32_t n_start = loc_start_offset(parser, &n->location);
-            uint32_t n_len = loc_length_bytes(&n->location);
-            uint32_t wrapped_end = n_start + n_len;
-            int underflow = (wrapped_end < n_start || n_len >= 0x80000000U) ? 1 : 0;
-            int oob = (!underflow && (uint64_t)n_start + (uint64_t)n_len > src_len) ? 1 : 0;
+            trace_loc_info_t n_loc = eval_loc_bounds(parser, &n->location, src_len);
 
             pm_buffer_append_format(out,
                     "{\"id\":%" PRIu32 ",\"type\":\"%s\",\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"len\":%" PRIu32 ",\"underflow\":%s%s",
-                    n->node_id, tname, n_start, wrapped_end, n_len,
-                    underflow ? "true" : "false",
-                    oob ? ",\"oob\":true" : "");
+                    n->node_id, tname, n_loc.start, n_loc.end, n_loc.len,
+                    n_loc.underflow ? "true" : "false",
+                    n_loc.oob ? ",\"oob\":true" : "");
             const pm_string_t *unesc = node_unescaped_string(n);
             if (unesc != NULL) {
                 size_t ulen = pm_string_length(unesc);
@@ -902,7 +1272,7 @@ prism_trace_scope_cleanup(prism_trace_scope_t *scope) {
     if (g_trace_buf == NULL || g_trace_parser == NULL || g_trace_in_hook || g_trace_step >= g_trace_max_steps) {
         return;
     }
-    uint64_t cur_hash = compute_ast_hash();
+    uint64_t cur_hash = compute_ast_hash(g_trace_parser);
     int ast_changed = (cur_hash != g_last_ast_hash) ? 1 : 0;
     prism_trace_emit_event(g_trace_parser, "PARSE_EXIT", scope->func, scope->line, NULL, ast_changed);
 }
@@ -960,6 +1330,8 @@ prism_trace_run_to_buffer(
     uint32_t saved_line_offsets[128];
     size_t saved_n_lines = 0;
     size_t saved_errors = 0;
+    size_t saved_warnings = 0;
+    size_t saved_comments = 0;
 
 #if PRISM_TRACE_HAS_ARENA
     pm_arena_t arena = { 0 };
@@ -970,7 +1342,17 @@ prism_trace_run_to_buffer(
     pm_node_t *root = pm_parse(&parser);
     (void) root;
 
+    if (!g_trace_crashed &&
+        (compute_diags_hash(&parser) != g_last_diags_hash ||
+         compute_comments_hash(&parser) != g_last_comments_hash ||
+         (g_trace_node_count > 0 && compute_ast_hash(&parser) != g_last_ast_hash))) {
+        int ast_changed = (g_trace_node_count > 0 && compute_ast_hash(&parser) != g_last_ast_hash) ? 1 : 0;
+        prism_trace_emit_event(&parser, "POST_PARSE", "pm_parse", 0, NULL, ast_changed);
+    }
+
     saved_errors = parser.error_list.size;
+    saved_warnings = parser.warning_list.size;
+    saved_comments = parser.comment_list.size;
     saved_n_lines = parser.line_offsets.size > 128 ? 128 : parser.line_offsets.size;
     for (size_t i = 0; i < saved_n_lines; i++) {
         saved_line_offsets[i] = parser.line_offsets.offsets[i];
@@ -988,7 +1370,17 @@ prism_trace_run_to_buffer(
 
     pm_node_t *root = pm_parse(&parser);
 
+    if (!g_trace_crashed &&
+        (compute_diags_hash(&parser) != g_last_diags_hash ||
+         compute_comments_hash(&parser) != g_last_comments_hash ||
+         (g_trace_node_count > 0 && compute_ast_hash(&parser) != g_last_ast_hash))) {
+        int ast_changed = (g_trace_node_count > 0 && compute_ast_hash(&parser) != g_last_ast_hash) ? 1 : 0;
+        prism_trace_emit_event(&parser, "POST_PARSE", "pm_parse", 0, NULL, ast_changed);
+    }
+
     saved_errors = parser.error_list.size;
+    saved_warnings = parser.warning_list.size;
+    saved_comments = parser.comment_list.size;
 #if PRISM_TRACE_HAS_LINE_OFFSETS
     saved_n_lines = parser.line_offsets.size > 128 ? 128 : parser.line_offsets.size;
     for (size_t i = 0; i < saved_n_lines; i++) {
@@ -1033,12 +1425,14 @@ prism_trace_run_to_buffer(
         }
         pm_buffer_append_format(
             out_buf,
-            "],\"errors\":%zu,"
+            "],\"errors\":%zu,\"warnings\":%zu,\"comments_count\":%zu,"
             "\"mem\":{\"ast\":[0,0,0],\"meta\":[0,0,0],\"scratch\":[0,0,0],\"lo\":[0,0],\"cp\":[0,0],"
             "\"xalloc\":[%zu,%zu,%zu,%zu]},"
             "\"detail\":{\"leaked_bytes\":%zu,\"leaked_blocks\":%zu,\"peak_bytes\":%zu,\"total_bytes\":%zu,\"alloc_count\":%zu,\"free_count\":%zu},"
             "\"ast\":[]}\n",
             saved_errors,
+            saved_warnings,
+            saved_comments,
             g_trace_xalloc_live_bytes, g_trace_xalloc_peak_bytes,
             g_trace_xalloc_alloc_count, g_trace_xalloc_free_count,
             g_trace_xalloc_live_bytes, g_trace_xalloc_live_blocks,
