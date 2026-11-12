@@ -35,6 +35,9 @@ extern const char *g_trace_call_stack[PRISM_TRACE_MAX_CALL_STACK];
 extern int g_trace_call_depth;
 extern int g_trace_in_hook;
 extern int g_trace_crashed;
+extern const char *g_trace_last_func;
+extern const char *g_trace_last_file;
+extern int g_trace_last_line;
 
 void prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps);
 void prism_trace_set_crash_cb(prism_trace_crash_cb_t cb);

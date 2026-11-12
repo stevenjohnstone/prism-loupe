@@ -94,8 +94,12 @@ echo "==> Prism version(s) to build: ${REFS_TO_BUILD[*]}"
 
 rm -rf "$BUILD_DIR/versions"
 mkdir -p "$BUILD_DIR/versions" "$BUILD_DIR/wasm_cache"
+if [ "${SKIP_WASM:-0}" != "1" ] && [ "${BUILD_WASM_SAN:-1}" = "1" ]; then
+  rm -rf "$DIST_DIR/wasm"
+  mkdir -p "$DIST_DIR/wasm"
+fi
 
-INSTRUMENT_HASH="$(shasum -a 256 "$ROOT_DIR/src/instrument.rb" "$ROOT_DIR/src/trace_runtime.c" "$ROOT_DIR/src/trace_runtime.h" "$ROOT_DIR/src/prism_xallocator.h" | shasum -a 256 | awk '{print $1}' | cut -c1-16)"
+INSTRUMENT_HASH="$(shasum -a 256 "$ROOT_DIR/src/instrument.rb" "$ROOT_DIR/src/trace_runtime.c" "$ROOT_DIR/src/trace_runtime.h" "$ROOT_DIR/src/prism_xallocator.h" "$ROOT_DIR/src/wasm_san_rt.c" "$ROOT_DIR/src/wasm_san_rt.h" | shasum -a 256 | awk '{print $1}' | cut -c1-16)"
 
 build_prism_version() {
   local idx="$1"
@@ -136,11 +140,17 @@ build_prism_version() {
 
   local dbg_mode="${DEBUG_WASM:-1}"
   local ci_tag="${GITHUB_ACTIONS:-local}"
+  local build_san="${BUILD_WASM_SAN:-1}"
+  local safe_ref="${ref//\//_}"
   local cached_wasm="$BUILD_DIR/wasm_cache/prism_trace_${sha}_${INSTRUMENT_HASH}_src_${dbg_mode}_${ci_tag}.wasm"
+  local cached_san_wasm="$BUILD_DIR/wasm_cache/prism_trace_san_${sha}_${INSTRUMENT_HASH}_src_${dbg_mode}_${ci_tag}.wasm"
   local ver_src_dir="$DIST_DIR/sources/$ref"
 
   local need_compile=0
   if [ ! -f "$cached_wasm" ] || [ "${BUILD_CLI:-0}" = "1" ] || [ ! -f "$ver_src_dir/src/node.c" ]; then
+    need_compile=1
+  fi
+  if [ "$build_san" = "1" ] && [ -n "${WASI_SDK_PATH:-}" ] && [ -x "${WASI_SDK_PATH}/bin/clang" ] && [ ! -f "$cached_san_wasm" ]; then
     need_compile=1
   fi
 
@@ -159,6 +169,7 @@ build_prism_version() {
     [ -f "$PRISM_DIR/LICENSE.md" ] && cp "$PRISM_DIR/LICENSE.md" "$ver_src_dir/LICENSE.md"
     cp "$ver_dir/trace_prism.c" "$ver_dir/trace_node.c" "$ver_dir/trace_compat.h" \
        "$ROOT_DIR/src/trace_runtime.c" "$ROOT_DIR/src/trace_runtime.h" "$ROOT_DIR/src/prism_xallocator.h" \
+       "$ROOT_DIR/src/wasm_san_rt.c" "$ROOT_DIR/src/wasm_san_rt.h" \
        "$ver_src_dir/trace_src/"
 
     local support_srcs=()
@@ -208,7 +219,7 @@ build_prism_version() {
             -D_WASI_EMULATED_MMAN -lwasi-emulated-mman \
             -Itrace_src -Iinclude -Isrc \
             -std=c99 \
-            -Wl,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer,--export=prism_trace_run_to_buffer_opts \
+            -Wl,--export=_initialize,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer,--export=prism_trace_run_to_buffer_opts \
             -Wl,-z,stack-size=8388608 \
             -Wl,--gc-sections -Wl,--no-entry -mexec-model=reactor \
             "${wasm_opt_flags[@]}" \
@@ -222,15 +233,86 @@ build_prism_version() {
           cp "$ver_dir/prism_trace.wasm" "$cached_wasm"
         fi
       fi
+
+      if [ "$build_san" = "1" ]; then
+        if [ -f "$cached_san_wasm" ]; then
+          echo "==> Using cached ASAN+UBSAN WebAssembly module for Prism $ref ($short_sha)"
+          cp "$cached_san_wasm" "$ver_dir/prism_trace_san.wasm"
+        else
+          echo "==> Building ASAN+UBSAN WebAssembly module for Prism $ref ($short_sha)..."
+          local san_opt_flags=(-O1 -g)
+          local san_link_opt_flags=()
+          if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+            san_opt_flags+=(-fdebug-prefix-map="$DIST_DIR=/prism-loupe")
+          fi
+          if [ "$dbg_mode" = "0" ]; then
+            san_opt_flags=(-Oz -fdata-sections -ffunction-sections)
+            san_link_opt_flags=(-Wl,--strip-debug)
+          fi
+          local san_obj_dir="$ver_dir/san_objs"
+          rm -rf "$san_obj_dir"
+          mkdir -p "$san_obj_dir"
+          (
+            cd "$ver_src_dir"
+            for srcf in trace_src/trace_prism.c trace_src/trace_node.c "${rel_support_srcs[@]}"; do
+              obj_base="$(echo "$srcf" | tr '/' '_').o"
+              "${WASI_SDK_PATH}/bin/clang" --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
+                -c -std=c99 -fno-delete-null-pointer-checks -Wno-macro-redefined \
+                -fsanitize=address,undefined -fno-sanitize=alignment -fno-sanitize-recover=all -fsanitize-address-use-after-return=never \
+                -DPRISM_EXPORT_SYMBOLS -DPRISM_EXCLUDE_PRETTYPRINT -DPRISM_EXCLUDE_JSON -DPRISM_XALLOCATOR \
+                -DPM_ARENA_INITIAL_SIZE=0 -DPRISM_WASM_SANITIZE -D_WASI_EMULATED_MMAN \
+                -Itrace_src -Iinclude -Isrc \
+                "${san_opt_flags[@]}" \
+                "$srcf" -o "$san_obj_dir/$obj_base"
+            done
+            for rtf in trace_src/trace_runtime.c trace_src/wasm_san_rt.c; do
+              obj_base="$(echo "$rtf" | tr '/' '_').o"
+              "${WASI_SDK_PATH}/bin/clang" --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
+                -c -std=c99 -fno-delete-null-pointer-checks \
+                -DPRISM_EXPORT_SYMBOLS -DPRISM_EXCLUDE_PRETTYPRINT -DPRISM_EXCLUDE_JSON -DPRISM_XALLOCATOR \
+                -DPM_ARENA_INITIAL_SIZE=0 -DPRISM_WASM_SANITIZE -D_WASI_EMULATED_MMAN \
+                -Itrace_src -Iinclude -Isrc \
+                "${san_opt_flags[@]}" \
+                "$rtf" -o "$san_obj_dir/$obj_base"
+            done
+            "${WASI_SDK_PATH}/bin/clang" --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
+              -lwasi-emulated-mman \
+              -Wl,--no-stack-first -Wl,--global-base=33554432 -Wl,-z,stack-size=8388608 \
+              -Wl,--wrap=memchr -Wl,--wrap=memcmp -Wl,--wrap=strlen -Wl,--wrap=strncmp \
+              -Wl,--export=_initialize,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=prism_trace_run_to_buffer,--export=prism_trace_run_to_buffer_opts \
+              -Wl,--gc-sections -Wl,--no-entry -mexec-model=reactor \
+              ${san_link_opt_flags[@]+"${san_link_opt_flags[@]}"} \
+              "$san_obj_dir"/*.o -o "$ver_dir/prism_trace_san.wasm"
+          )
+          rm -rf "$san_obj_dir"
+          if [ -n "$sha" ]; then
+            cp "$ver_dir/prism_trace_san.wasm" "$cached_san_wasm"
+          fi
+        fi
+      fi
     fi
   else
     echo "==> Using cached WebAssembly module for Prism $ref ($short_sha)"
     cp "$cached_wasm" "$ver_dir/prism_trace.wasm"
+    if [ "$build_san" = "1" ] && [ -f "$cached_san_wasm" ]; then
+      echo "==> Using cached ASAN+UBSAN WebAssembly module for Prism $ref ($short_sha)"
+      cp "$cached_san_wasm" "$ver_dir/prism_trace_san.wasm"
+    fi
     [ -f "$PRISM_DIR/LICENSE.md" ] && [ -d "$ver_src_dir" ] && cp "$PRISM_DIR/LICENSE.md" "$ver_src_dir/LICENSE.md"
   fi
 
   if [ "$idx" -eq 0 ] && [ -f "$ver_dir/prism_trace.wasm" ]; then
     cp "$ver_dir/prism_trace.wasm" "$BUILD_DIR/prism_trace.wasm"
+  fi
+
+  local san_wasm_rel=""
+  if [ -f "$ver_dir/prism_trace_san.wasm" ]; then
+    mkdir -p "$DIST_DIR/wasm"
+    san_wasm_rel="wasm/${safe_ref}-san.wasm"
+    cp "$ver_dir/prism_trace_san.wasm" "$DIST_DIR/$san_wasm_rel"
+    if [ "$idx" -eq 0 ]; then
+      cp "$ver_dir/prism_trace_san.wasm" "$BUILD_DIR/prism_trace_san.wasm"
+    fi
   fi
 
   local semver="unknown"
@@ -244,7 +326,7 @@ build_prism_version() {
   fi
 
   ruby -rjson -e '
-    id, semver, sha, short_sha, describe, date, has_arena, out = ARGV
+    id, semver, sha, short_sha, describe, date, has_arena, san_wasm_rel, out = ARGV
     url = sha.empty? ? "https://github.com/ruby/prism" : "https://github.com/ruby/prism/commit/#{sha}"
     label = id == "main" ? "main (v#{semver} @ #{short_sha})" : "#{id} (#{short_sha})"
     meta = {
@@ -258,8 +340,9 @@ build_prism_version() {
       "url" => url,
       "has_arena" => (has_arena == "true")
     }
+    meta["san_wasm_url"] = san_wasm_rel unless san_wasm_rel.to_s.empty?
     File.write(out, JSON.pretty_generate(meta))
-  ' "$ref" "$semver" "$sha" "$short_sha" "$describe" "$commit_date" "$has_arena" "$ver_dir/meta.json"
+  ' "$ref" "$semver" "$sha" "$short_sha" "$describe" "$commit_date" "$has_arena" "$san_wasm_rel" "$ver_dir/meta.json"
 }
 
 idx=0

@@ -1,4 +1,5 @@
 #include "trace_runtime.h"
+#include "wasm_san_rt.h"
 #include "prism.h"
 #undef NDEBUG
 #include <assert.h>
@@ -6,6 +7,7 @@
 
 pm_parser_t *g_trace_parser = NULL;
 pm_buffer_t *g_trace_buf = NULL;
+static pm_buffer_t *g_trace_crash_out_buf = NULL;
 uint64_t g_trace_step = 0;
 uint64_t g_trace_max_steps = 50000;
 const pm_node_t *g_trace_nodes[PRISM_TRACE_MAX_NODES];
@@ -14,6 +16,9 @@ const char *g_trace_call_stack[PRISM_TRACE_MAX_CALL_STACK];
 int g_trace_call_depth = 0;
 int g_trace_in_hook = 0;
 int g_trace_crashed = 0;
+const char *g_trace_last_func = NULL;
+const char *g_trace_last_file = NULL;
+int g_trace_last_line = 0;
 static uint64_t g_last_ast_hash = 0;
 static uint64_t g_last_diags_hash = 0;
 static uint64_t g_last_comments_hash = 0;
@@ -65,11 +70,28 @@ alloc_with_tracking(size_t s, size_t tracked) {
             assert(g_trace_xalloc_live_bytes <= PRISM_TRACE_MAX_XALLOC_BYTES);
         }
     }
+#ifdef PRISM_WASM_SANITIZE
+    return wasm_san_heap_alloc(s, tracked);
+#else
     prism_trace_alloc_hdr_t *hdr = (prism_trace_alloc_hdr_t *) malloc(sizeof(prism_trace_alloc_hdr_t) + (s > 0 ? s : 1));
     if (hdr == NULL) return NULL;
     hdr->size = s;
     hdr->tracked = tracked;
     return (void *)(hdr + 1);
+#endif
+}
+
+static int
+query_alloc_metadata(const void *ptr, size_t *out_size, size_t *out_tracked) {
+    if (ptr == NULL) return 0;
+#ifdef PRISM_WASM_SANITIZE
+    return wasm_san_heap_query(ptr, out_size, out_tracked);
+#else
+    const prism_trace_alloc_hdr_t *hdr = ((const prism_trace_alloc_hdr_t *) ptr) - 1;
+    if (out_size != NULL) *out_size = hdr->size;
+    if (out_tracked != NULL) *out_tracked = hdr->tracked;
+    return 1;
+#endif
 }
 
 __attribute__((noinline)) void *
@@ -78,8 +100,8 @@ prism_trace_xmalloc(size_t s) {
     return alloc_with_tracking(s, tracked);
 }
 
-__attribute__((noinline)) void
-prism_trace_xfree(void *ptr) {
+static void
+prism_trace_xfree_impl(void *ptr, int has_expected_size, size_t expected_size) {
     if (ptr == NULL) return;
     if (g_trace_parser != NULL) {
         for (uint32_t i = 1; i <= g_trace_node_count; i++) {
@@ -89,15 +111,26 @@ prism_trace_xfree(void *ptr) {
             }
         }
     }
+    size_t alloc_size = 0;
+    size_t alloc_tracked = 0;
+#ifdef PRISM_WASM_SANITIZE
+    wasm_san_heap_free(ptr, &alloc_size, &alloc_tracked, has_expected_size, expected_size);
+#else
+    (void) has_expected_size;
+    (void) expected_size;
     prism_trace_alloc_hdr_t *hdr = ((prism_trace_alloc_hdr_t *) ptr) - 1;
-    if (g_trace_xalloc_raw_live_bytes >= hdr->size) {
-        g_trace_xalloc_raw_live_bytes -= hdr->size;
+    alloc_size = hdr->size;
+    alloc_tracked = hdr->tracked;
+    free(hdr);
+#endif
+    if (g_trace_xalloc_raw_live_bytes >= alloc_size) {
+        g_trace_xalloc_raw_live_bytes -= alloc_size;
     } else {
         g_trace_xalloc_raw_live_bytes = 0;
     }
-    if (hdr->tracked) {
-        if (g_trace_xalloc_live_bytes >= hdr->size) {
-            g_trace_xalloc_live_bytes -= hdr->size;
+    if (alloc_tracked) {
+        if (g_trace_xalloc_live_bytes >= alloc_size) {
+            g_trace_xalloc_live_bytes -= alloc_size;
         } else {
             g_trace_xalloc_live_bytes = 0;
         }
@@ -106,7 +139,16 @@ prism_trace_xfree(void *ptr) {
         }
         g_trace_xalloc_free_count++;
     }
-    free(hdr);
+}
+
+__attribute__((noinline)) void
+prism_trace_xfree(void *ptr) {
+    prism_trace_xfree_impl(ptr, 0, 0);
+}
+
+__attribute__((noinline)) void
+prism_trace_xfree_sized(void *ptr, size_t old_size) {
+    prism_trace_xfree_impl(ptr, 1, old_size);
 }
 
 __attribute__((noinline)) void *
@@ -122,26 +164,85 @@ prism_trace_xcalloc(size_t n, size_t s) {
     return ptr;
 }
 
-__attribute__((noinline)) void *
-prism_trace_xrealloc(void *ptr, size_t s) {
+static void *
+prism_trace_xrealloc_impl(void *ptr, size_t s, int has_old_size, size_t expected_old_size) {
     if (ptr == NULL) {
+#ifdef PRISM_WASM_SANITIZE
+        if (has_old_size && expected_old_size != 0) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "xrealloc_sized(NULL, new=%zu, old=%zu) called with non-zero old_size", s, expected_old_size);
+            prism_trace_emit_crash(
+                "ASAN: sized-realloc-mismatch",
+                msg,
+                g_trace_last_file ? g_trace_last_file : "src/prism.c",
+                g_trace_last_line,
+                g_trace_last_func ? g_trace_last_func : "pm_parse"
+            );
+            __builtin_trap();
+        }
+#endif
         return prism_trace_xmalloc(s);
     }
     if (s == 0) {
-        prism_trace_xfree(ptr);
+        prism_trace_xfree_impl(ptr, has_old_size, expected_old_size);
         return NULL;
     }
-    prism_trace_alloc_hdr_t *old_hdr = ((prism_trace_alloc_hdr_t *) ptr) - 1;
-    size_t old_size = old_hdr->size;
-    size_t tracked = (old_hdr->tracked && !g_trace_in_hook && !g_trace_crashed) ? 1 : 0;
+    size_t old_size = 0;
+    size_t old_tracked = 0;
+    if (!query_alloc_metadata(ptr, &old_size, &old_tracked)) {
+#ifdef PRISM_WASM_SANITIZE
+        char msg[160];
+        snprintf(msg, sizeof(msg), "attempting realloc on invalid or freed pointer 0x%08" PRIxPTR, (uintptr_t) ptr);
+        prism_trace_emit_crash(
+            "ASAN: bad-realloc",
+            msg,
+            g_trace_last_file ? g_trace_last_file : "src/prism.c",
+            g_trace_last_line,
+            g_trace_last_func ? g_trace_last_func : "pm_parse"
+        );
+        __builtin_trap();
+#endif
+    }
+#ifdef PRISM_WASM_SANITIZE
+    if (has_old_size && expected_old_size != old_size) {
+        char msg[200];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "sized-realloc mismatch on 0x%08" PRIxPTR ": allocated %zu byte(s), realloced with old_size %zu",
+            (uintptr_t) ptr,
+            old_size,
+            expected_old_size
+        );
+        prism_trace_emit_crash(
+            "ASAN: sized-realloc-mismatch",
+            msg,
+            g_trace_last_file ? g_trace_last_file : "src/prism.c",
+            g_trace_last_line,
+            g_trace_last_func ? g_trace_last_func : "pm_parse"
+        );
+        __builtin_trap();
+    }
+#endif
+    size_t tracked = (old_tracked && !g_trace_in_hook && !g_trace_crashed) ? 1 : 0;
     void *new_ptr = alloc_with_tracking(s, tracked);
     if (new_ptr == NULL) return NULL;
     size_t copy_size = old_size < s ? old_size : s;
     if (copy_size > 0) {
         memcpy(new_ptr, ptr, copy_size);
     }
-    prism_trace_xfree(ptr);
+    prism_trace_xfree_impl(ptr, has_old_size, expected_old_size);
     return new_ptr;
+}
+
+__attribute__((noinline)) void *
+prism_trace_xrealloc(void *ptr, size_t s) {
+    return prism_trace_xrealloc_impl(ptr, s, 0, 0);
+}
+
+__attribute__((noinline)) void *
+prism_trace_xrealloc_sized(void *ptr, size_t new_size, size_t old_size) {
+    return prism_trace_xrealloc_impl(ptr, new_size, 1, old_size);
 }
 
 #if !PRISM_TRACE_HAS_BUFFER_NEW
@@ -269,8 +370,13 @@ prism_trace_set_crash_cb(prism_trace_crash_cb_t cb) {
 
 void
 prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps) {
+    size_t init_buf_sz = 0;
+    if (buf != NULL && buf->value != NULL) {
+        query_alloc_metadata(buf->value, &init_buf_sz, NULL);
+    }
     g_trace_parser = NULL;
     g_trace_buf = buf;
+    g_trace_crash_out_buf = buf;
     g_trace_step = 0;
     g_trace_max_steps = max_steps;
     memset(g_trace_nodes, 0, sizeof(g_trace_nodes));
@@ -278,6 +384,9 @@ prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps) {
     g_trace_call_depth = 0;
     g_trace_in_hook = 0;
     g_trace_crashed = 0;
+    g_trace_last_func = NULL;
+    g_trace_last_file = NULL;
+    g_trace_last_line = 0;
     g_last_ast_hash = 0;
     g_last_diags_hash = 0;
     g_last_comments_hash = 0;
@@ -286,7 +395,7 @@ prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps) {
     g_trace_parse_pass = 0;
     g_trace_input_size = 0;
     g_trace_xalloc_tracking = 0;
-    g_trace_xalloc_raw_live_bytes = (buf != NULL && buf->value != NULL) ? (((prism_trace_alloc_hdr_t *) buf->value) - 1)->size : 0;
+    g_trace_xalloc_raw_live_bytes = init_buf_sz;
     g_trace_xalloc_live_bytes = 0;
     g_trace_xalloc_peak_bytes = 0;
     g_trace_xalloc_total_bytes = 0;
@@ -720,6 +829,14 @@ prism_trace_emit_event(
     }
 
     g_trace_in_hook = 1;
+    if (func != NULL && func[0] != '\0') {
+        g_trace_last_func = func;
+        g_trace_last_line = line;
+        size_t flen = strlen(func);
+        g_trace_last_file = (flen > 7 && strncmp(func, "pm_", 3) == 0 && strcmp(func + flen - 4, "_new") == 0)
+            ? "src/node.c"
+            : "src/prism.c";
+    }
     pm_buffer_t *out = g_trace_buf;
     g_trace_event_start_len = pm_buffer_length(out);
     uint64_t src_len = (parser->end >= parser->start) ? (uint64_t)(parser->end - parser->start) : 0;
@@ -1170,10 +1287,12 @@ prism_trace_emit_crash(const char *reason, const char *expr, const char *file, i
     g_trace_in_hook = 0;
 
     if (was_in_hook && g_trace_buf != NULL && g_trace_buf->value != NULL) {
-        prism_trace_alloc_hdr_t *buf_hdr = ((prism_trace_alloc_hdr_t *) g_trace_buf->value) - 1;
-        g_trace_buf->capacity = buf_hdr->size;
-        if (g_trace_event_start_len <= buf_hdr->size) {
-            g_trace_buf->length = g_trace_event_start_len;
+        size_t buf_alloc_sz = 0;
+        if (query_alloc_metadata(g_trace_buf->value, &buf_alloc_sz, NULL)) {
+            g_trace_buf->capacity = buf_alloc_sz;
+            if (g_trace_event_start_len <= buf_alloc_sz) {
+                g_trace_buf->length = g_trace_event_start_len;
+            }
         }
         if (g_trace_step > 0) {
             g_trace_step--;
@@ -1218,6 +1337,31 @@ prism_trace_emit_crash(const char *reason, const char *expr, const char *file, i
             1
         );
         pm_buffer_cleanup(&detail_buf);
+    } else if (g_trace_crash_out_buf != NULL) {
+        pm_buffer_t *out = g_trace_crash_out_buf;
+        pm_buffer_append_format(
+            out,
+            "{\"step\":%" PRIu64 ",\"kind\":\"CRASH\",\"func\":",
+            g_trace_step++
+        );
+        buf_append_cstr_json_escaped(out, func ? func : "pm_parse");
+        pm_buffer_append_format(
+            out,
+            ",\"line\":%d,\"prev\":[-1,-1,\"NOT_PROVIDED\"],\"curr\":[-1,-1,\"NOT_PROVIDED\"],"
+            "\"next_start\":-1,\"heredoc_end\":-1,\"lex_state\":\"NONE\","
+            "\"lex_modes\":[],\"contexts\":[],\"call_stack\":[],\"line_offsets\":[0],"
+            "\"errors\":0,\"warnings\":0,\"comments_count\":0,"
+            "\"detail\":{\"reason\":",
+            line
+        );
+        buf_append_cstr_json_escaped(out, reason ? reason : "CRASH");
+        PM_BUFFER_APPEND_LITERAL(out, ",\"expr\":");
+        buf_append_cstr_json_escaped(out, expr ? expr : "");
+        PM_BUFFER_APPEND_LITERAL(out, ",\"file\":");
+        buf_append_cstr_json_escaped(out, file ? file : "src/prism.c");
+        pm_buffer_append_format(out, ",\"line\":%d,\"func\":", line);
+        buf_append_cstr_json_escaped(out, func ? func : "pm_parse");
+        PM_BUFFER_APPEND_LITERAL(out, "}}\n");
     }
 
 #if defined(__wasm__)
@@ -1264,6 +1408,11 @@ __assert_fail(const char *expr, const char *file, int line, const char *func) {
 prism_trace_scope_t
 prism_trace_scope_enter(const char *func, int line) {
     prism_trace_scope_t s = { .func = func, .line = line, .active = 1 };
+    if (func != NULL && func[0] != '\0') {
+        g_trace_last_func = func;
+        g_trace_last_file = "src/prism.c";
+        g_trace_last_line = line;
+    }
     if (g_trace_call_depth < PRISM_TRACE_MAX_CALL_STACK) {
         g_trace_call_stack[g_trace_call_depth++] = func;
     }
@@ -1795,6 +1944,13 @@ prism_trace_run_to_buffer_opts(
     size_t opts_query_len
 ) {
     const uint8_t *safe_source = (source != NULL) ? source : (const uint8_t *) "";
+#ifdef PRISM_WASM_SANITIZE
+    wasm_san_begin_run();
+    uint8_t *san_source = wasm_san_alloc_input(safe_source, size);
+    if (san_source != NULL) {
+        safe_source = san_source;
+    }
+#endif
 
     prism_trace_options_t parsed_opts;
     prism_trace_options_parse(&parsed_opts, opts_query, opts_query_len);
@@ -1802,7 +1958,11 @@ prism_trace_run_to_buffer_opts(
     prism_trace_reset(out_buf, max_steps > 0 ? (uint64_t) max_steps : 50000);
     g_trace_input_size = (uint64_t) size;
 
-    PM_BUFFER_APPEND_LITERAL(out_buf, "{\"meta\":true,\"prism_version\":\"" PRISM_VERSION "\",\"source\":");
+    PM_BUFFER_APPEND_LITERAL(out_buf, "{\"meta\":true,\"prism_version\":\"" PRISM_VERSION "\",");
+#ifdef PRISM_WASM_SANITIZE
+    PM_BUFFER_APPEND_LITERAL(out_buf, "\"sanitized\":true,");
+#endif
+    PM_BUFFER_APPEND_LITERAL(out_buf, "\"source\":");
     buf_append_json_escaped(out_buf, safe_source, size);
     pm_buffer_append_format(out_buf, ",\"length\":%zu", size);
     emit_meta_options_json(out_buf, &parsed_opts, opts_query, opts_query_len);
@@ -2021,7 +2181,12 @@ prism_trace_run_to_buffer_opts(
     }
 
     g_trace_xalloc_tracking = 0;
+    g_trace_crash_out_buf = NULL;
     prism_trace_options_free(&parsed_opts);
+#ifdef PRISM_WASM_SANITIZE
+    wasm_san_free_input(san_source);
+    wasm_san_finish_run();
+#endif
 
     if (!g_trace_crashed) {
         pm_buffer_append_format(

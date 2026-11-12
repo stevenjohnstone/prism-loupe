@@ -13,6 +13,7 @@ An interactive, single-file, in-browser C99 parser, lexer, and AST execution vis
 - **Fine-Grained Execution Events**: Records every `PARSE_ENTER`, `PARSE_EXIT`, `LEX_TOKEN`, `LEX_MODE_PUSH`, `LEX_MODE_POP`, `LEX_STATE`, `HEREDOC_FLUSH`, `NODE_NEW`, `NODE_LIST_APPEND`, `ERROR`, `WARNING`, `STREAM_PASS`, `POST_PARSE`, and `CRASH` transition while preserving exact upstream C source filenames and line numbers.
 - **Full `pm_options_t` & `pm_parse_stream` Support**: Click **`⚙ Options`** in the Source Input toolbar to configure every `pm_options_t` parser setting (`encoding`, `ruby_ver`, `line`, `frozen_string_literal`, `filepath`, `stack_budget`, `scopes` with parameter-forwarding flags and binary local names, command-line switches `-a`/`-e`/`-l`/`-n`/`-p`/`-x`, `attach_comments`, `main_script`, `partial_script`, `freeze`, `encoding_locked`, `shebang_callback`, and `pm_parse_stream` multi-pass streaming). Active options appear as removable pills above the source buffer and round-trip cleanly in shareable URLs and `.jsonl` traces.
 - **Multi-Version In-Browser Switcher**: Includes an interactive header selector for the last two minor releases of the current major version, the final release of the previous major version, and `main` (e.g. `v2.1.0`, `v2.0.0`, `v1.9.0`, and `main`), each linked to its exact commit on GitHub. Switching versions swaps the in-memory Wasm module and re-traces the active snippet in-place with the active `pm_options_t`.
+- **In-Browser ASAN + UBSAN WebAssembly Mode (`🛡 ASAN+UBSAN`)**: Toggle **`🛡 ASAN+UBSAN`** in the header (or pass `?san=1`) to fetch and trace against an AddressSanitizer + UndefinedBehaviorSanitizer WebAssembly build (`dist/wasm/<version>-san.wasm`, compiled with `-fsanitize=address,undefined -DPM_ARENA_INITIAL_SIZE=0` and a custom 32 MB 8:1 shadow-memory Wasm runtime in [`src/wasm_san_rt.c`](src/wasm_san_rt.c)). Detects heap/stack/global/input-buffer overflows, use-after-free (quarantined heap chunks), double/bad/sized-free mismatches, and arithmetic/shift/bounds/null UB directly in the browser on GitHub Pages or `make serve`, emitting a structured `CRASH` trace step with the exact C file, line, and Wasm function before trapping.
 - **Binary-Safe File Import**: Load `.rb` or raw binary fuzzer inputs directly into the in-browser Wasm tracer (`📂 .rb`, preserving arbitrary non-UTF-8 bytes) or inspect pre-recorded `.jsonl` trace files (`📂 .jsonl`).
 
 ### 2. Interactive Timeline, Navigation & Playback
@@ -48,7 +49,7 @@ An interactive, single-file, in-browser C99 parser, lexer, and AST execution vis
   - Live bottom-up AST forest distinguishing active candidate roots from superseded/orphaned nodes, with hover-to-highlight source spans and warnings for underflowed (`end < start`) or out-of-bounds (`end > src_len`) node locations.
 
 ### 4. Shareable URLs, CLI Options & Instant Video Export
-- **Shareable Links (`?version=`, `?code=`, and `pm_options_t` params)**: Click **`🔗 Share`** to copy a URL with the selected Prism version (`?version=`), the current Ruby or binary byte payload Base64-encoded in `?code=`, any non-default `pm_options_t` / `pm_parse_stream` query parameters (`enc`, `ruby_ver`, `line`, `cmd`, `main`, `partial`, `freeze`, `comments`, `enc_lock`, `frozen_lit`, `stream`, `filepath`, `shebang_cb`, `budget`, `scopes`), and optional `&step=<n|underflow|anomaly|invariant|crash>` deep-linking. Opening the URL automatically selects the requested Prism version, applies the parser options, decodes the raw bytes without UTF-8 loss, and traces in Wasm.
+- **Shareable Links (`?version=`, `?san=1`, `?code=`, and `pm_options_t` params)**: Click **`🔗 Share`** to copy a URL with the selected Prism version (`?version=`), optional sanitizer mode (`?san=1`), the current Ruby or binary byte payload Base64-encoded in `?code=`, any non-default `pm_options_t` / `pm_parse_stream` query parameters (`enc`, `ruby_ver`, `line`, `cmd`, `main`, `partial`, `freeze`, `comments`, `enc_lock`, `frozen_lit`, `stream`, `filepath`, `shebang_cb`, `budget`, `scopes`), and optional `&step=<n|underflow|anomaly|invariant|crash>` deep-linking. Opening the URL automatically selects the requested Prism version, enables ASAN+UBSAN when `san=1`, applies the parser options, decodes the raw bytes without UTF-8 loss, and traces in Wasm.
 - **Native CLI (`build/prism_trace`)**: Supports `--opts "<query>"` and `--loupe-url "<url>"` to reproduce any Prism Loupe URL directly in native C/ASAN builds (`./build/prism_trace --loupe-url "http://127.0.0.1:8080/?code=L1xN&enc=ASCII-8BIT&..."`).
 - **Instant Playthrough Video Export (`🎬 Video`)**: Click **`🎬 Video`** in the Source Input toolbar to generate a high-DPI `.webm` video of the Ruby source buffer being lexed and parsed step-by-step.
   - Uses the browser's **WebCodecs API** (`VideoEncoder` + `VideoFrame`) and a built-in WebM/EBML muxer to encode the entire playthrough faster-than-realtime (e.g., ~200 steps in under a second), paced to your configured playback interval (with automatic fallback to `MediaRecorder`).
@@ -121,6 +122,9 @@ PRISM_DIR=/path/to/local/prism make build
 
 # Build size-optimized Wasm modules (-Oz -Wl,--strip-debug) without DWARF debug info:
 DEBUG_WASM=0 make build
+
+# Skip building the optional ASAN+UBSAN Wasm modules (dist/wasm/*-san.wasm):
+BUILD_WASM_SAN=0 make build
 ```
 
 ---

@@ -129,6 +129,31 @@ HTML_TEMPLATE = <<~'HTML'
     fill: currentColor;
     display: block;
   }
+  .san-toggle-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 26px;
+    padding: 0 9px;
+    border-radius: 5px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s;
+  }
+  .san-toggle-btn:hover:not(:disabled) {
+    border-color: var(--amber);
+    color: var(--text);
+  }
+  .san-toggle-btn.active {
+    background: rgba(248, 81, 73, 0.16);
+    border-color: var(--red);
+    color: #ffa198;
+    box-shadow: 0 0 0 1px rgba(248, 81, 73, 0.25);
+  }
   .playground-source-link {
     display: inline-flex;
     align-items: center;
@@ -261,6 +286,11 @@ HTML_TEMPLATE = <<~'HTML'
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
+  }
+  .pane-header > span:first-child {
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .pane-body {
     padding: 10px 12px;
@@ -731,6 +761,7 @@ HTML_TEMPLATE = <<~'HTML'
     <a id="prismVersionCommitLink" class="github-commit-btn" href="__PRISM_COMMIT_URL__" target="_blank" rel="noopener" aria-label="View Prism commit on GitHub" title="__PRISM_VERSION_TITLE__">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
     </a>
+    <button id="btnToggleSanitizer" type="button" class="san-toggle-btn" aria-pressed="false" title="Toggle WebAssembly AddressSanitizer + UndefinedBehaviorSanitizer build (-fsanitize=address,undefined -DPM_ARENA_INITIAL_SIZE=0)">🛡 ASAN+UBSAN</button>
   </div>
   <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
     <button id="btnToggleGemini" style="display:none; border-color:var(--purple); color:var(--purple); font-weight:600;" title="Open in-page Gemini assistant drawer">✨ Ask Gemini</button>
@@ -810,7 +841,7 @@ __PRISM_LICENSE_HTML__</div>
   <div class="pane">
     <div class="pane-header">
       <span>Ruby Buffer &amp; Live Lexer</span>
-      <span id="wasmStatus" style="font-size:11px; color:var(--muted); font-family:var(--font-mono); font-weight:400; white-space:nowrap;">Wasm: init...</span>
+      <span id="wasmStatus" onmouseover="this.title=this.textContent.trim()" style="font-size:11px; color:var(--muted); font-family:var(--font-mono); font-weight:400; white-space:nowrap; min-width:0; overflow:hidden; text-overflow:ellipsis;">Wasm: init...</span>
     </div>
     <div class="pane-body">
       <div id="crashBanner" class="crash-banner"></div>
@@ -1110,6 +1141,8 @@ function setPlayIntervalMs(rawMs) {
 
 const wasmBytesCache = new Map();
 let wasmExports = null;
+let sanitizerEnabled = false;
+let lastRunHostCrash = null;
 let currentTrace = null;
 let currentIdx = 0;
 let hoverRange = null;
@@ -1161,6 +1194,37 @@ PRESETS.forEach((p, i) => {
 
 const prismVersionSelect = document.getElementById('prismVersionSelect');
 const prismVersionCommitLink = document.getElementById('prismVersionCommitLink');
+const btnToggleSanitizer = document.getElementById('btnToggleSanitizer');
+
+function updateSanitizerToggleUI() {
+  if (!btnToggleSanitizer) return;
+  const hasSanBuild = Boolean(PRISM_BUILD_INFO && PRISM_BUILD_INFO.san_wasm_url);
+  btnToggleSanitizer.style.display = hasSanBuild ? 'inline-flex' : 'none';
+  btnToggleSanitizer.classList.toggle('active', sanitizerEnabled && hasSanBuild);
+  btnToggleSanitizer.setAttribute('aria-pressed', (sanitizerEnabled && hasSanBuild) ? 'true' : 'false');
+  btnToggleSanitizer.title = (sanitizerEnabled && hasSanBuild)
+    ? 'ASAN + UBSAN WebAssembly active (-fsanitize=address,undefined -DPM_ARENA_INITIAL_SIZE=0) — click to switch back to fast standard Wasm'
+    : 'Toggle WebAssembly AddressSanitizer + UndefinedBehaviorSanitizer build (-fsanitize=address,undefined -DPM_ARENA_INITIAL_SIZE=0)';
+}
+
+function parseSanitizerParam(params) {
+  const raw = params.get('san') ?? params.get('sanitizer') ?? params.get('asan');
+  if (raw === null) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (s === '1' || s === 'true' || s === 'yes' || s === 'on' || s === 'asan' || s === 'ubsan') return true;
+  if (s === '0' || s === 'false' || s === 'no' || s === 'off') return false;
+  return null;
+}
+
+function applySanitizerToSearchParams(params) {
+  params.delete('sanitizer');
+  params.delete('asan');
+  if (sanitizerEnabled && PRISM_BUILD_INFO && PRISM_BUILD_INFO.san_wasm_url) {
+    params.set('san', '1');
+  } else {
+    params.delete('san');
+  }
+}
 
 function updateVersionBadgeUI() {
   if (!PRISM_BUILD_INFO) return;
@@ -1172,6 +1236,7 @@ function updateVersionBadgeUI() {
     const datePart = PRISM_BUILD_INFO.date ? `, ${PRISM_BUILD_INFO.date}` : '';
     prismVersionCommitLink.title = `View Prism ${PRISM_BUILD_INFO.id} (${PRISM_BUILD_INFO.short_sha}${datePart}) on GitHub`;
   }
+  updateSanitizerToggleUI();
 }
 
 PRISM_VERSIONS.forEach((v) => {
@@ -1585,21 +1650,85 @@ prismVersionSelect.addEventListener('change', async (e) => {
   await selectPrismVersion(e.target.value, true);
 });
 
+let pendingSanitizerFallbackNotice = '';
+
+async function setSanitizerEnabled(enabled, reparse = true) {
+  const prev = sanitizerEnabled;
+  const next = Boolean(enabled && PRISM_BUILD_INFO && PRISM_BUILD_INFO.san_wasm_url);
+  if (sanitizerEnabled === next && wasmExports) return sanitizerEnabled;
+  sanitizerEnabled = next;
+  wasmExports = null;
+  updateSanitizerToggleUI();
+  updateBrowserUrlVersionOnly();
+  await initWasm();
+  if (reparse && currentTrace && sanitizerEnabled !== prev) {
+    const editor = document.getElementById('rubyEditor');
+    const isEditing = editor && editor.style.display !== 'none';
+    const src = getActiveSourceInput();
+    const hasCodeInUrl = new URLSearchParams(window.location.search).has('code') || hasActiveParserOptions();
+    await parseWithWasm(src, currentTrace.name, hasCodeInUrl || isEditing);
+  }
+  return sanitizerEnabled;
+}
+
+if (btnToggleSanitizer) {
+  btnToggleSanitizer.addEventListener('click', async () => {
+    await setSanitizerEnabled(!sanitizerEnabled, true);
+  });
+}
+
+function extractTopPrismWasmCaller(stackStr) {
+  if (!stackStr) return '';
+  for (const frameLine of String(stackStr).split('\n').slice(1)) {
+    const m = frameLine.match(/at\s+(?:[\w.-]+\.)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+    if (!m) continue;
+    const fn = m[1];
+    if (
+      fn === 'prism_host_debugger' ||
+      fn === 'prism_trace_emit_crash' ||
+      fn.startsWith('wasm_san_') ||
+      fn.startsWith('__asan_') ||
+      fn.startsWith('__ubsan_') ||
+      fn.startsWith('__wrap_') ||
+      fn.startsWith('__assert_') ||
+      fn.startsWith('prism_trace_x')
+    ) {
+      continue;
+    }
+    return fn;
+  }
+  return '';
+}
+
 async function initWasm() {
   const statusEl = document.getElementById('wasmStatus');
   const verObj = PRISM_VERSIONS[currentPrismVersionIdx] || PRISM_BUILD_INFO;
+  const useSan = Boolean(sanitizerEnabled && verObj && verObj.san_wasm_url);
   const b64 = verObj ? verObj.wasm_b64 : '';
-  if (!b64) {
+  if (!useSan && !b64) {
     statusEl.textContent = 'Wasm: not embedded';
     return;
   }
   try {
-    let bytes = wasmBytesCache.get(verObj.id);
+    const cacheKey = `${verObj.id}:${useSan ? 'san' : 'std'}`;
+    let bytes = wasmBytesCache.get(cacheKey);
     if (!bytes) {
-      const binStr = atob(b64);
-      bytes = new Uint8Array(binStr.length);
-      for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
-      wasmBytesCache.set(verObj.id, bytes);
+      if (useSan) {
+        if (window.location.protocol === 'file:') {
+          throw new Error("ASAN+UBSAN Wasm requires HTTP(S) — run 'make serve' locally or use GitHub Pages");
+        }
+        setSafeHtml(statusEl, safeHtml`<span style="color:var(--amber)">⟳ Loading ASAN+UBSAN Wasm (${verObj.id})...</span>`);
+        const resp = await fetch(verObj.san_wasm_url);
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status} loading ${verObj.san_wasm_url}`);
+        }
+        bytes = new Uint8Array(await resp.arrayBuffer());
+      } else {
+        const binStr = atob(b64);
+        bytes = new Uint8Array(binStr.length);
+        for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+      }
+      wasmBytesCache.set(cacheKey, bytes);
     }
 
     const wasiImport = new Proxy({
@@ -1624,14 +1753,18 @@ async function initWasm() {
         const crashLine = line;
         const crashFunc = readWasmCString(funcPtr);
         const crashStack = (new Error(`Prism ${crashReason}: ${crashExpr} at ${crashFile}:${crashLine} (${crashFunc})`)).stack;
-        window._lastPrismWasmCrash = {
+        const wasmCaller = extractTopPrismWasmCaller(crashStack);
+        const crashRecord = {
           reason: crashReason,
           expr: crashExpr,
           file: crashFile,
           line: crashLine,
-          func: crashFunc,
+          func: wasmCaller || crashFunc,
+          wasmCaller,
           stack: crashStack
         };
+        lastRunHostCrash = crashRecord;
+        window._lastPrismWasmCrash = crashRecord;
         // eslint-disable-next-line no-debugger
         debugger;
       }
@@ -1641,13 +1774,25 @@ async function initWasm() {
       wasi_snapshot_preview1: wasiImport,
       env: envImport
     });
-    if (instance.exports._initialize) instance.exports._initialize();
     wasmExports = instance.exports;
-    if (!statusEl.innerHTML.includes('Crash captured')) {
-      setSafeHtml(statusEl, safeHtml`<span style="color:var(--green)">● Wasm ready (Prism ${PRISM_BUILD_INFO.id} @ ${PRISM_BUILD_INFO.short_sha})</span>`);
+    if (useSan) pendingSanitizerFallbackNotice = '';
+    if (instance.exports._initialize) instance.exports._initialize();
+    if (!statusEl.innerHTML.includes('Crash captured') && !statusEl.innerHTML.includes('captured at step')) {
+      const sanBadge = useSan ? ' · ASAN+UBSAN' : '';
+      setSafeHtml(statusEl, safeHtml`<span style="color:var(--green)">● Wasm ready (Prism ${PRISM_BUILD_INFO.id} @ ${PRISM_BUILD_INFO.short_sha}${sanBadge})</span>`);
     }
   } catch (err) {
-    setSafeHtml(statusEl, safeHtml`<span style="color:var(--red)">Wasm init error: ${err && err.message ? err.message : err}</span>`);
+    const errMsg = err && err.message ? err.message : String(err);
+    if (useSan) {
+      if (!currentTrace) pendingSanitizerFallbackNotice = errMsg;
+      sanitizerEnabled = false;
+      updateSanitizerToggleUI();
+      updateBrowserUrlVersionOnly();
+      await initWasm();
+      setSafeHtml(statusEl, safeHtml`<span style="color:var(--amber)">⚠ ${errMsg} (using standard Wasm)</span>`);
+      return;
+    }
+    setSafeHtml(statusEl, safeHtml`<span style="color:var(--red)">Wasm init error: ${errMsg}</span>`);
   }
 }
 
@@ -1704,6 +1849,7 @@ async function parseWithWasm(rubyCodeOrPayload, label = 'Live Wasm Parse', updat
 
   const bufPtr = wasmExports.pm_buffer_new();
   let trappedError = null;
+  lastRunHostCrash = null;
 
   try {
     if (typeof wasmExports.prism_trace_run_to_buffer_opts === 'function') {
@@ -1746,6 +1892,14 @@ async function parseWithWasm(rubyCodeOrPayload, label = 'Live Wasm Parse', updat
     leakSummary = steps.pop();
   }
   const lastStep = steps[steps.length - 1];
+  if (lastStep && lastStep.kind === 'CRASH' && lastRunHostCrash && lastRunHostCrash.wasmCaller && lastStep.detail) {
+    const r = String(lastStep.detail.reason || '');
+    if (r.startsWith('ASAN:') || r.startsWith('UBSAN:')) {
+      lastStep.detail.wasm_caller = lastRunHostCrash.wasmCaller;
+      lastStep.detail.func = lastRunHostCrash.wasmCaller;
+      lastStep.func = lastRunHostCrash.wasmCaller;
+    }
+  }
 
   if (trappedError && (!lastStep || lastStep.kind !== 'CRASH')) {
     const base = lastStep || {
@@ -1796,9 +1950,11 @@ async function parseWithWasm(rubyCodeOrPayload, label = 'Live Wasm Parse', updat
   const hasInvariant = currentTrace._invariantIdx >= 0;
 
   if (hasCrash) {
+    const cStep = currentTrace.steps[currentTrace._crashIdx];
+    const cReason = (cStep && cStep.detail && cStep.detail.reason) ? cStep.detail.reason : 'Crash';
     setSafeHtml(
       document.getElementById('wasmStatus'),
-      safeHtml`<span style="color:var(--red);font-weight:700;">💥 Crash captured at step ${steps.length - 1} (${dt} ms) — Wasm reset</span>`
+      safeHtml`<span style="color:var(--red);font-weight:700;">💥 ${cReason} captured at step ${steps.length - 1} (${dt} ms) — Wasm reset</span>`
     );
   } else if (hasInvariant) {
     const invStep = currentTrace.steps[currentTrace._invariantIdx];
@@ -1808,10 +1964,18 @@ async function parseWithWasm(rubyCodeOrPayload, label = 'Live Wasm Parse', updat
       document.getElementById('wasmStatus'),
       safeHtml`<span style="color:var(--red);font-weight:700;">⚠ ${summaryLabel} at step ${invStep.step} (${dt} ms)</span>`
     );
-  } else {
+  } else if (pendingSanitizerFallbackNotice) {
+    const notice = pendingSanitizerFallbackNotice;
+    pendingSanitizerFallbackNotice = '';
     setSafeHtml(
       document.getElementById('wasmStatus'),
-      safeHtml`<span style="color:var(--green)">● Traced ${steps.length} steps in ${dt} ms</span>`
+      safeHtml`<span style="color:var(--amber)">⚠ ${notice} · Traced ${steps.length} steps in ${dt} ms</span>`
+    );
+  } else {
+    const sanTag = sanitizerEnabled ? ' · ASAN+UBSAN' : '';
+    setSafeHtml(
+      document.getElementById('wasmStatus'),
+      safeHtml`<span style="color:var(--green)">● Traced ${steps.length} steps in ${dt} ms${sanTag}</span>`
     );
   }
 }
@@ -1852,6 +2016,7 @@ function buildShareableUrl(rubyCode, stepIdx = currentIdx) {
   if (PRISM_BUILD_INFO && PRISM_BUILD_INFO.id) {
     url.searchParams.set('version', PRISM_BUILD_INFO.id);
   }
+  applySanitizerToSearchParams(url.searchParams);
   url.searchParams.set('code', encodeCodeBase64(rubyCode));
   applyOptionsToSearchParams(url.searchParams, currentParserOptions);
   if (Number.isFinite(stepIdx) && stepIdx >= 0) {
@@ -1864,13 +2029,15 @@ function updateBrowserUrlVersionOnly() {
   try {
     const url = new URL(window.location.href);
     const urlHadOpts = OPTION_URL_KEYS.some(k => url.searchParams.has(k));
+    const urlHadSan = url.searchParams.has('san') || url.searchParams.has('sanitizer') || url.searchParams.has('asan');
     if (PRISM_BUILD_INFO && PRISM_BUILD_INFO.id) {
-      if (currentPrismVersionIdx === 0 && !url.searchParams.has('code') && !url.searchParams.has('version') && !hasActiveParserOptions() && !urlHadOpts) {
+      if (currentPrismVersionIdx === 0 && !sanitizerEnabled && !urlHadSan && !url.searchParams.has('code') && !url.searchParams.has('version') && !hasActiveParserOptions() && !urlHadOpts) {
         return;
       }
-      if (url.searchParams.has('version') || currentPrismVersionIdx !== 0 || hasActiveParserOptions()) {
+      if (url.searchParams.has('version') || currentPrismVersionIdx !== 0 || hasActiveParserOptions() || sanitizerEnabled) {
         url.searchParams.set('version', PRISM_BUILD_INFO.id);
       }
+      applySanitizerToSearchParams(url.searchParams);
       applyOptionsToSearchParams(url.searchParams, currentParserOptions);
       window.history.replaceState(null, '', url.toString());
     }
@@ -1889,6 +2056,7 @@ function updateBrowserUrlWithCode(rubyCodeOrBytes, stepIdx = null) {
       if (PRISM_BUILD_INFO && PRISM_BUILD_INFO.id) {
         url.searchParams.set('version', PRISM_BUILD_INFO.id);
       }
+      applySanitizerToSearchParams(url.searchParams);
       url.searchParams.set('code', encodeCodeBase64(rubyCodeOrBytes));
       applyOptionsToSearchParams(url.searchParams, currentParserOptions);
       if (Number.isFinite(stepIdx) && stepIdx >= 0) {
@@ -1906,6 +2074,7 @@ function clearBrowserUrlCodeParam() {
     const url = new URL(window.location.href);
     url.searchParams.delete('code');
     url.searchParams.delete('step');
+    applySanitizerToSearchParams(url.searchParams);
     applyOptionsToSearchParams(url.searchParams, currentParserOptions);
     window.history.replaceState(null, '', url.toString());
   } catch (_) {}
@@ -2795,13 +2964,17 @@ function renderStep() {
     const jumpBtn = currentIdx !== currentTrace._crashIdx
       ? safeHtml`<button class="warn" style="margin-left:8px;padding:2px 7px;" data-jump-step="${Number(currentTrace._crashIdx)}">Jump to Crash Step #${crashStep.step}</button>`
       : safeHtml`<span class="badge kind-CRASH" style="margin-left:8px;">AT CRASH POINT</span>`;
+    const isAssertCrash = !cd.reason || cd.reason === 'ASSERT_FAIL';
+    const crashMsgHtml = isAssertCrash
+      ? safeHtml`<code>assert(${cd.expr || ''})</code> failed`
+      : safeHtml`<code>${cd.expr || cd.reason || 'trap'}</code>`;
     setSafeHtml(cb, safeHtml`
       <div style="display:flex;justify-content:space-between;align-items:center;">
         <strong>💥 PRISM CRASH INTERCEPTED (${cd.reason || 'CRASH'})</strong>
         ${jumpBtn}
       </div>
       <div style="margin-top:4px;color:var(--text);">
-        <code>assert(${cd.expr || ''})</code> failed in <code>${cd.func || crashStep.func}()</code> at <code>${cFile}:${cd.line || crashStep.line}</code>
+        ${crashMsgHtml} in <code>${cd.func || crashStep.func}()</code> at <code>${cFile}:${cd.line || crashStep.line}</code>
       </div>
     `);
     cb.querySelectorAll('[data-jump-step]').forEach(btn => {
@@ -3331,7 +3504,7 @@ function buildGeminiContextMarkdown(step) {
 
   return [
     `# Prism Ruby Parser Trace Context`,
-    `- Prism Version: v${PRISM_BUILD_INFO.version} (${PRISM_BUILD_INFO.describe}, commit ${PRISM_BUILD_INFO.short_sha})`,
+    `- Prism Version: v${PRISM_BUILD_INFO.version} (${PRISM_BUILD_INFO.describe}, commit ${PRISM_BUILD_INFO.short_sha})${sanitizerEnabled ? ' [ASAN+UBSAN Wasm]' : ''}`,
     `- Trace Name: ${currentTrace.name}`,
     optsQuery ? `- Parser Options (pm_options_t): ${optsQuery}` : '',
     `- Ruby Source (${fullByteLen} bytes${srcByteLen !== fullByteLen ? `, active stream slice ${srcByteLen} bytes` : ''}): ${JSON.stringify(currentTrace.source)}`,
@@ -5017,11 +5190,13 @@ function buildTraceSummaryObject() {
   return {
     name: currentTrace.name,
     prismBuild: cleanBuildInfo,
+    sanitizerEnabled,
     availableVersions: PRISM_VERSIONS.map(v => ({
       id: v.id,
       version: v.version,
       short_sha: v.short_sha,
-      date: v.date
+      date: v.date,
+      hasSanitizerWasm: Boolean(v.san_wasm_url)
     })),
     source: currentTrace.source,
     sourceBytes: srcByteLen,
@@ -5165,6 +5340,10 @@ async function registerWebMcpTools() {
             type: 'string',
             description: `Optional Prism version ID to trace with (${PRISM_VERSIONS.map(v => v.id).join(', ')}).`
           },
+          sanitize: {
+            type: 'boolean',
+            description: 'Optional: enable (true) or disable (false) the ASAN+UBSAN WebAssembly build (-fsanitize=address,undefined) before tracing.'
+          },
           options: {
             description: 'Optional pm_options_t / pm_parse_stream configuration, passed either as a URL query string (e.g. "enc=ASCII-8BIT&ruby_ver=3.3&cmd=al&stream=1") or as an object ({ enc, ruby_ver, line, cmd, main, partial, freeze, comments, enc_lock, frozen_lit, stream, filepath, shebang_cb, budget, scopes }). Pass null or "" to reset options to defaults.'
           },
@@ -5179,6 +5358,9 @@ async function registerWebMcpTools() {
       handler: async (input) => {
         if (input && input.version) {
           await selectPrismVersion(input.version, false);
+        }
+        if (input && typeof input.sanitize === 'boolean') {
+          await setSanitizerEnabled(input.sanitize, false);
         }
         if (input && input.options !== undefined) {
           if (input.options === null || input.options === '') {
@@ -5401,8 +5583,13 @@ async function registerWebMcpTools() {
 (async function initFromUrlOrPreset() {
   const params = new URLSearchParams(window.location.search);
   const versionParam = params.get('version');
+  const sanParam = parseSanitizerParam(params);
   const codeParam = params.get('code');
   const stepParam = params.get('step');
+  if (sanParam !== null) {
+    sanitizerEnabled = sanParam;
+    updateSanitizerToggleUI();
+  }
   const { opts: urlOpts, hasAny: hasOptsParam } = parseOptionsFromSearchParams(params);
   if (hasOptsParam) {
     currentParserOptions = urlOpts;
@@ -5435,7 +5622,7 @@ async function registerWebMcpTools() {
         syncOptionsFormFromState();
       }
     }
-    if (PRESETS[0].steps && !hasOptsParam) {
+    if (PRESETS[0].steps && !hasOptsParam && !sanitizerEnabled) {
       loadTrace(PRESETS[0]);
     } else {
       await parseWithWasm(PRESETS[0].source, PRESETS[0].name, false);
@@ -5580,8 +5767,9 @@ end
 
 if prism_versions.empty?
   wasm_path = File.join(BUILD_DIR, "prism_trace.wasm")
+  san_wasm_path = File.join(BUILD_DIR, "prism_trace_san.wasm")
   wasm_b64 = File.exist?(wasm_path) ? [File.binread(wasm_path)].pack("m0") : ""
-  prism_versions << {
+  fallback_ver = {
     "id" => prism_describe,
     "label" => "#{prism_describe} (#{prism_short_sha})",
     "version" => prism_semver,
@@ -5592,6 +5780,8 @@ if prism_versions.empty?
     "url" => prism_commit_url,
     "wasm_b64" => wasm_b64
   }
+  fallback_ver["san_wasm_url"] = "wasm/#{prism_describe.tr('/', '_')}-san.wasm" if File.exist?(san_wasm_path)
+  prism_versions << fallback_ver
 end
 
 primary_info = prism_versions.first
