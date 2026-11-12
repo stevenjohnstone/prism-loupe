@@ -11,10 +11,12 @@ def load_jsonl(path, name)
   rescue JSON::ParserError
     nil
   end
-  meta = lines.first
+  meta = lines.first || {}
   steps = lines.drop(1)
   leak_summary = steps.pop if steps.last && steps.last["summary"]
-  { "name" => name, "source" => meta["source"], "steps" => steps, "leak_summary" => leak_summary }
+  trace = { "name" => name, "source" => meta["source"], "steps" => steps, "leak_summary" => leak_summary }
+  trace["byte_length"] = meta["length"] if meta["length"].is_a?(Integer)
+  trace
 end
 
 PRISM_DIR = ARGV[0] || "vendor/prism"
@@ -327,6 +329,8 @@ HTML_TEMPLATE = <<~'HTML'
   .kind-PARSE_ENTER, .kind-PARSE_EXIT { background: rgba(139, 148, 158, 0.15); color: var(--muted); border: 1px solid var(--border); }
   .kind-NODE_NEW, .kind-NODE_LIST_APPEND { background: rgba(88, 166, 255, 0.2); color: var(--accent); border: 1px solid var(--accent); }
   .kind-ERROR { background: rgba(247, 120, 186, 0.22); color: var(--pink); border: 1px solid var(--pink); }
+  .kind-WARNING { background: rgba(210, 153, 34, 0.22); color: var(--amber); border: 1px solid var(--amber); }
+  .kind-POST_PARSE { background: rgba(139, 148, 158, 0.18); color: var(--text); border: 1px solid var(--border); }
   .kind-TEARDOWN { background: rgba(57, 197, 207, 0.2); color: var(--cyan); border: 1px solid var(--cyan); }
   .kind-CRASH { background: var(--red); color: #fff; border: 1px solid #ff7b72; font-weight: 700; }
   .card {
@@ -457,6 +461,35 @@ HTML_TEMPLATE = <<~'HTML'
     background: rgba(248, 81, 73, 0.25);
     border-color: var(--red);
     color: #ffa198;
+  }
+  .offset-chip.warn {
+    background: rgba(210, 153, 34, 0.2);
+    border-color: var(--amber);
+    color: #f2cc60;
+  }
+  .inv-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+  }
+  .inv-row {
+    padding: 4px 7px;
+    border-radius: 4px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .inv-row:hover {
+    border-color: var(--accent);
+  }
+  .inv-row.bad {
+    background: rgba(248, 81, 73, 0.20);
+    border-color: var(--red);
   }
   .mem-row {
     margin-bottom: 7px;
@@ -630,7 +663,7 @@ __PRISM_LICENSE_HTML__</div>
 </div>
 
 <div class="scrubber-bar">
-  <div class="timeline-track" id="timelineTrack" title="Drag or click to scrub — Red = Crash / Corrupted Node (Underflow) | Pink = Syntax Error | Amber = Cursor Rewind | Blue = AST Update | Green = Token">
+  <div class="timeline-track" id="timelineTrack" title="Drag or click to scrub — Red = Crash / Invariant Violation (Node, Comment, Diagnostic, Line Offset) | Pink = Error | Amber = Warning / Cursor Rewind | Blue = AST Update | Green = Token">
     <div class="timeline-playhead" id="timelinePlayhead"></div>
   </div>
   <div class="scrubber-controls">
@@ -690,6 +723,22 @@ __PRISM_LICENSE_HTML__</div>
           <span id="lineOffsetStatus"></span>
         </div>
         <div id="lineOffsetsBox"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <span>Recorded Comments (<code>comment_list</code> / <code>magic_comment_list</code>)</span>
+          <span id="commentStatus"></span>
+        </div>
+        <div id="commentsBox" class="inv-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <span>Recorded Diagnostics (<code>error_list</code> / <code>warning_list</code>)</span>
+          <span id="diagnosticStatus"></span>
+        </div>
+        <div id="diagnosticsBox" class="inv-list"></div>
       </div>
     </div>
   </div>
@@ -1106,7 +1155,8 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
   }
 
   const dt = (performance.now() - t0).toFixed(1);
-  loadTrace({ name: label, source: meta.source, steps, leak_summary: leakSummary }, false);
+  const metaByteLen = typeof meta.length === 'number' ? meta.length : srcBytes.length;
+  loadTrace({ name: label, source: meta.source, byte_length: metaByteLen, steps, leak_summary: leakSummary }, false);
   if (updateUrlCode) {
     updateBrowserUrlWithCode(rubyCode);
   } else {
@@ -1114,24 +1164,20 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
   }
 
   const hasCrash = currentTrace._crashIdx >= 0;
-  const hasUnderflow = currentTrace._underflowIdx >= 0;
+  const hasInvariant = currentTrace._invariantIdx >= 0;
 
   if (hasCrash) {
     setSafeHtml(
       document.getElementById('wasmStatus'),
       safeHtml`<span style="color:var(--red);font-weight:700;">💥 Crash captured at step ${steps.length - 1} (${dt} ms) — Wasm reset</span>`
     );
-  } else if (hasUnderflow) {
-    const uStep = currentTrace.steps[currentTrace._underflowIdx];
-    const uEvents = currentTrace._underflowEvents || [];
-    const hasU = uEvents.some(ev => ev.kind === 'underflow');
-    const hasOob = uEvents.some(ev => ev.kind === 'oob');
-    const anomalyLabel = (hasU && hasOob)
-      ? 'underflow / out-of-bounds'
-      : (hasOob ? 'out-of-bounds location' : 'underflow');
+  } else if (hasInvariant) {
+    const invStep = currentTrace.steps[currentTrace._invariantIdx];
+    const invEvents = currentTrace._invariantEvents || [];
+    const summaryLabel = summarizeInvariantBadgeText(invEvents);
     setSafeHtml(
       document.getElementById('wasmStatus'),
-      safeHtml`<span style="color:var(--red);font-weight:700;">⚠ Corrupted node (${anomalyLabel}) at step ${uStep.step} (${dt} ms)</span>`
+      safeHtml`<span style="color:var(--red);font-weight:700;">⚠ ${summaryLabel} at step ${invStep.step} (${dt} ms)</span>`
     );
   } else {
     setSafeHtml(
@@ -1222,48 +1268,205 @@ function formatBytes(b) {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-function isNodeUnderflow(n) {
+function isSpanUnderflow(start, end, len, explicitFlag, srcByteLen) {
+  if (Boolean(explicitFlag)) return true;
+  if (typeof end === 'number' && typeof start === 'number' && end < start) return true;
+  if (typeof len === 'number' && len >= 0x80000000) return true;
+  if (typeof srcByteLen === 'number' && srcByteLen < 0x80000000 && typeof start === 'number' && start >= 0x80000000) return true;
+  return false;
+}
+
+function isSpanOutOfBounds(start, end, len, explicitUnderflow, explicitOob, srcByteLen) {
+  if (isSpanUnderflow(start, end, len, explicitUnderflow, srcByteLen)) return false;
+  if (typeof srcByteLen === 'number') {
+    if ((typeof start === 'number' && start > srcByteLen) || (typeof end === 'number' && end > srcByteLen)) {
+      return true;
+    }
+  }
+  return Boolean(explicitOob);
+}
+
+function isNodeUnderflow(n, srcByteLen) {
   if (!n) return false;
-  return n.end < n.start || (typeof n.len === 'number' && n.len >= 0x80000000);
+  return isSpanUnderflow(n.start, n.end, n.len, n.underflow, srcByteLen);
 }
 
 function isNodeOutOfBounds(n, srcByteLen) {
-  if (!n || isNodeUnderflow(n)) return false;
-  if (typeof srcByteLen === 'number' && (n.end > srcByteLen || n.start > srcByteLen)) {
-    return true;
-  }
-  return Boolean(n.oob || n.underflow);
+  if (!n) return false;
+  return isSpanOutOfBounds(n.start, n.end, n.len, n.underflow, n.oob, srcByteLen);
 }
 
 function nodeAnomalyKind(n, srcByteLen) {
-  if (isNodeUnderflow(n)) return 'underflow';
+  if (isNodeUnderflow(n, srcByteLen)) return 'underflow';
   if (isNodeOutOfBounds(n, srcByteLen)) return 'oob';
   return null;
+}
+
+function normalizeDiagnosticItem(raw, fallbackId, fallbackSeverity = 'error') {
+  if (!raw) return null;
+  const start = typeof raw.start === 'number' ? raw.start : 0;
+  const len = typeof raw.len === 'number'
+    ? raw.len
+    : (typeof raw.length === 'number'
+      ? raw.length
+      : (typeof raw.end === 'number' && raw.end >= start ? (raw.end - start) : 0));
+  const end = typeof raw.end === 'number' ? raw.end : ((start + len) >>> 0);
+  return {
+    id: raw.id ?? fallbackId,
+    severity: raw.severity || fallbackSeverity,
+    type: raw.type || raw.diag_type || 'UNKNOWN',
+    message: raw.message || '',
+    level: raw.level ?? 0,
+    start,
+    end,
+    len,
+    underflow: Boolean(raw.underflow),
+    oob: Boolean(raw.oob)
+  };
+}
+
+function diagAnomalyKind(d, srcByteLen) {
+  if (!d) return null;
+  if (isSpanUnderflow(d.start, d.end, d.len, d.underflow, srcByteLen)) return 'underflow';
+  if (isSpanOutOfBounds(d.start, d.end, d.len, d.underflow, d.oob, srcByteLen)) return 'oob';
+  return null;
+}
+
+function commentAnomalyKind(c, srcByteLen) {
+  if (!c) return null;
+  if (isSpanUnderflow(c.start, c.end, c.len, c.underflow, srcByteLen)) return 'underflow';
+  if (isSpanOutOfBounds(c.start, c.end, c.len, c.underflow, c.oob, srcByteLen)) return 'oob';
+  if (c.overlap) return 'overlap';
+  if (c.unsorted) return 'order';
+  return null;
+}
+
+function magicCommentAnomalyKind(mc, srcByteLen) {
+  if (!mc) return null;
+  const ku = isSpanUnderflow(mc.key_start, mc.key_end, mc.key_len, mc.key_underflow || mc.underflow, srcByteLen);
+  const vu = isSpanUnderflow(mc.val_start, mc.val_end, mc.val_len, mc.val_underflow, srcByteLen);
+  if (ku || vu) return 'underflow';
+  const ko = isSpanOutOfBounds(mc.key_start, mc.key_end, mc.key_len, mc.key_underflow, mc.key_oob, srcByteLen);
+  const vo = isSpanOutOfBounds(mc.val_start, mc.val_end, mc.val_len, mc.val_underflow, mc.val_oob, srcByteLen);
+  if (ko || vo || Boolean(mc.oob)) return 'oob';
+  return null;
+}
+
+function collectStepLineOffsetAnomalies(s, srcByteLen) {
+  const byLine = new Map();
+  const lo = Array.isArray(s.line_offsets) ? s.line_offsets : [];
+  if (lo.length === 0 && s.kind !== 'TEARDOWN') {
+    byLine.set(1, { line: 1, offset: 0, prev: 0, kind: 'empty' });
+  }
+  for (let idx = 0; idx < lo.length; idx++) {
+    const off = lo[idx];
+    const prev = idx > 0 ? lo[idx - 1] : 0;
+    let kind = null;
+    if (typeof srcByteLen === 'number' && srcByteLen < 0x80000000 && off >= 0x80000000) {
+      kind = 'underflow';
+    } else if (typeof srcByteLen === 'number' && off > srcByteLen) {
+      kind = 'oob';
+    } else if (idx === 0 && off !== 0) {
+      kind = 'nonzero_start';
+    } else if (idx > 0 && off <= prev) {
+      kind = 'order';
+    }
+    if (kind) {
+      byLine.set(idx + 1, { line: idx + 1, offset: off, prev, kind });
+    }
+  }
+  if (Array.isArray(s.lo_anomalies)) {
+    s.lo_anomalies.forEach(a => {
+      if (!a || typeof a.line !== 'number') return;
+      if (!byLine.has(a.line)) {
+        byLine.set(a.line, {
+          line: a.line,
+          offset: a.offset ?? 0,
+          prev: a.prev ?? 0,
+          kind: a.kind || 'order'
+        });
+      }
+    });
+  }
+  return Array.from(byLine.values()).sort((a, b) => a.line - b.line);
+}
+
+function summarizeInvariantBadgeText(invEvents) {
+  if (!invEvents || invEvents.length === 0) return 'Invariant violation';
+  const cats = new Set(invEvents.map(e => e.category));
+  const kinds = new Set(invEvents.map(e => e.kind));
+  const kindLabel = kinds.size === 1
+    ? (kinds.has('underflow') ? 'underflow'
+      : kinds.has('oob') ? 'out-of-bounds'
+      : kinds.has('overlap') ? 'duplicate/overlap'
+      : (kinds.has('order') || kinds.has('nonzero_start') || kinds.has('empty')) ? 'out-of-order' : 'anomaly')
+    : 'multiple anomalies';
+  if (cats.size === 1) {
+    if (cats.has('node')) return `Corrupted node (${kindLabel})`;
+    if (cats.has('comment') || cats.has('magic_comment')) return `Corrupted comment (${kindLabel})`;
+    if (cats.has('diagnostic')) return `Corrupted diagnostic (${kindLabel})`;
+    if (cats.has('line_offset')) return `Line offset violation (${kindLabel})`;
+  }
+  return `${invEvents.length} parser invariant violations`;
 }
 
 function preprocessTrace(trace) {
   if (trace.steps && trace.steps.length > 0 && trace.steps[trace.steps.length - 1] && trace.steps[trace.steps.length - 1].summary) {
     trace.leak_summary = trace.steps.pop();
   }
-  const srcByteLen = new TextEncoder().encode(trace.source || '').length;
+  const srcByteLen = typeof trace.byte_length === 'number'
+    ? trace.byte_length
+    : new TextEncoder().encode(trace.source || '').length;
   trace._sourceByteLen = srcByteLen;
   let lastAst = [];
+  let lastDiagnostics = [];
+  let legacyDiagSeq = 0;
+  let lastComments = [];
+  let lastMagicComments = [];
   let lastChangedNodeId = -1;
   let prevCurrStart = 0;
   let prevAstU = 0, prevMetaU = 0, prevScratchU = 0, prevTotalU = 0, prevXallocU = 0;
   const prevUnderflowById = new Map();
   const prevNodeSigById = new Map();
+  const prevDiagAnomalyByKey = new Map();
+  const prevCommentAnomalyByKey = new Map();
+  const prevMagicAnomalyByKey = new Map();
+  const prevLoAnomalyByKey = new Map();
+
   trace._crashIdx = -1;
   trace._underflowIdx = -1;
   trace._underflowSteps = [];
   trace._underflowEvents = [];
   trace._underflowFirstStepByNode = {};
+
+  trace._diagStepByKey = {};
+  trace._diagAnomalyFirstStepByKey = {};
+  trace._diagAnomalyEvents = [];
+
+  trace._commentStepByKey = {};
+  trace._commentAnomalyFirstStepByKey = {};
+  trace._magicCommentStepByKey = {};
+  trace._magicCommentAnomalyFirstStepByKey = {};
+  trace._commentAnomalyEvents = [];
+
+  trace._loAnomalyFirstStepByLine = {};
+  trace._loAnomalyEvents = [];
+
+  trace._invariantIdx = -1;
+  trace._invariantSteps = [];
+  trace._invariantEvents = [];
+
   trace._peakMemUsed = 0;
   trace._peakXallocUsed = (trace.leak_summary && trace.leak_summary.peak_bytes) ? trace.leak_summary.peak_bytes : 0;
   trace._hasArena = false;
+
   trace.steps.forEach((s, i) => {
     const newUnderflows = [];
+    const newInvariants = [];
+    const srcFile = stepSourceFile(s);
+    const callStack = s.call_stack || [];
     let mutatedNodeId = -1;
+
     if (s.ast) {
       lastAst = s.ast;
       s.ast.forEach(n => {
@@ -1281,20 +1484,243 @@ function preprocessTrace(trace) {
           if (trace._underflowFirstStepByNode[n.id] === undefined) {
             trace._underflowFirstStepByNode[n.id] = i;
           }
-          trace._underflowEvents.push({
+          const nodeEv = {
             stepIdx: i,
             step: s.step,
             kind: anomalyKind,
             node: n,
             func: s.func,
             line: s.line,
-            file: stepSourceFile(s),
-            callStack: s.call_stack || []
-          });
+            file: srcFile,
+            callStack
+          };
+          trace._underflowEvents.push(nodeEv);
+          const invEv = {
+            stepIdx: i,
+            step: s.step,
+            category: 'node',
+            kind: anomalyKind,
+            targetId: n.id,
+            targetType: n.type,
+            start: n.start,
+            end: n.end,
+            len: n.len,
+            func: s.func,
+            line: s.line,
+            file: srcFile,
+            callStack,
+            item: n
+          };
+          trace._invariantEvents.push(invEv);
+          newInvariants.push(invEv);
         }
         prevUnderflowById.set(n.id, isU);
       });
     }
+
+    // Diagnostics snapshot (or fallback synthesis from ERROR/WARNING step.detail on older JSONL files)
+    if (Array.isArray(s.diagnostics)) {
+      lastDiagnostics = s.diagnostics.map((d, idx) => normalizeDiagnosticItem(d, idx + 1, d.severity || 'error'));
+    } else if ((s.kind === 'ERROR' || s.kind === 'WARNING') && s.detail && (s.detail.diag_type || typeof s.detail.start === 'number')) {
+      legacyDiagSeq++;
+      const fallbackDiag = normalizeDiagnosticItem(s.detail, legacyDiagSeq, s.kind === 'WARNING' ? 'warning' : 'error');
+      lastDiagnostics = [...lastDiagnostics, fallbackDiag];
+    }
+    lastDiagnostics.forEach(d => {
+      const dKey = `${d.severity}:${d.id}`;
+      if (trace._diagStepByKey[dKey] === undefined) {
+        trace._diagStepByKey[dKey] = i;
+      }
+      const dKind = diagAnomalyKind(d, srcByteLen);
+      const isBad = Boolean(dKind);
+      const wasBad = prevDiagAnomalyByKey.get(dKey) || false;
+      if (isBad && !wasBad) {
+        if (trace._diagAnomalyFirstStepByKey[dKey] === undefined) {
+          trace._diagAnomalyFirstStepByKey[dKey] = i;
+        }
+        const diagEv = {
+          stepIdx: i,
+          step: s.step,
+          category: 'diagnostic',
+          kind: dKind,
+          severity: d.severity,
+          targetId: d.id,
+          targetType: d.type,
+          message: d.message,
+          start: d.start,
+          end: d.end,
+          len: d.len,
+          func: s.func,
+          line: s.line,
+          file: srcFile,
+          callStack,
+          item: d
+        };
+        trace._diagAnomalyEvents.push(diagEv);
+        trace._invariantEvents.push(diagEv);
+        newInvariants.push(diagEv);
+      }
+      prevDiagAnomalyByKey.set(dKey, isBad);
+    });
+
+    // Comments & magic comments snapshot
+    if (Array.isArray(s.comments)) {
+      const seenValid = [];
+      let prevValidStart = null;
+      lastComments = s.comments.map((rawC, idx) => {
+        const start = typeof rawC.start === 'number' ? rawC.start : 0;
+        const len = typeof rawC.len === 'number'
+          ? rawC.len
+          : (typeof rawC.end === 'number' && rawC.end >= start ? (rawC.end - start) : 0);
+        const end = typeof rawC.end === 'number' ? rawC.end : ((start + len) >>> 0);
+        const c = {
+          ...rawC,
+          id: rawC.id ?? (idx + 1),
+          type: rawC.type || 'INLINE',
+          start,
+          end,
+          len
+        };
+        const u = isSpanUnderflow(c.start, c.end, c.len, c.underflow, srcByteLen);
+        const o = isSpanOutOfBounds(c.start, c.end, c.len, c.underflow, c.oob, srcByteLen);
+        if (!u && !o) {
+          let jsOverlap = Boolean(c.overlap);
+          if (!jsOverlap) {
+            for (const prev of seenValid) {
+              if (c.start === prev.start ||
+                  (c.end > c.start && prev.end > prev.start && c.start < prev.end && prev.start < c.end)) {
+                jsOverlap = true;
+                break;
+              }
+            }
+          }
+          if (jsOverlap) c.overlap = true;
+          if (prevValidStart !== null && c.start < prevValidStart && !c.unsorted && !c.overlap) {
+            c.lex_rewind = true;
+          }
+          seenValid.push({ start: c.start, end: c.end });
+          prevValidStart = c.start;
+        }
+        return c;
+      });
+    }
+    lastComments.forEach(c => {
+      const cKey = `c:${c.id}`;
+      if (trace._commentStepByKey[cKey] === undefined) {
+        trace._commentStepByKey[cKey] = i;
+      }
+      const cKind = commentAnomalyKind(c, srcByteLen);
+      const isBad = Boolean(cKind);
+      const wasBad = prevCommentAnomalyByKey.get(cKey) || false;
+      if (isBad && !wasBad) {
+        if (trace._commentAnomalyFirstStepByKey[cKey] === undefined) {
+          trace._commentAnomalyFirstStepByKey[cKey] = i;
+        }
+        const cEv = {
+          stepIdx: i,
+          step: s.step,
+          category: 'comment',
+          kind: cKind,
+          targetId: c.id,
+          targetType: c.type,
+          start: c.start,
+          end: c.end,
+          len: c.len,
+          func: s.func,
+          line: s.line,
+          file: srcFile,
+          callStack,
+          item: c
+        };
+        trace._commentAnomalyEvents.push(cEv);
+        trace._invariantEvents.push(cEv);
+        newInvariants.push(cEv);
+      }
+      prevCommentAnomalyByKey.set(cKey, isBad);
+    });
+
+    if (Array.isArray(s.magic_comments)) {
+      lastMagicComments = s.magic_comments.map((mc, idx) => ({
+        ...mc,
+        id: mc.id ?? (idx + 1)
+      }));
+    }
+    lastMagicComments.forEach(mc => {
+      const mKey = `mc:${mc.id}`;
+      if (trace._magicCommentStepByKey[mKey] === undefined) {
+        trace._magicCommentStepByKey[mKey] = i;
+      }
+      const mKind = magicCommentAnomalyKind(mc, srcByteLen);
+      const isBad = Boolean(mKind);
+      const wasBad = prevMagicAnomalyByKey.get(mKey) || false;
+      if (isBad && !wasBad) {
+        if (trace._magicCommentAnomalyFirstStepByKey[mKey] === undefined) {
+          trace._magicCommentAnomalyFirstStepByKey[mKey] = i;
+        }
+        const keyBad = Boolean(
+          isSpanUnderflow(mc.key_start, mc.key_end, mc.key_len, mc.key_underflow, srcByteLen) ||
+          isSpanOutOfBounds(mc.key_start, mc.key_end, mc.key_len, mc.key_underflow, mc.key_oob, srcByteLen)
+        );
+        const start = keyBad ? mc.key_start : mc.val_start;
+        const end = keyBad ? mc.key_end : mc.val_end;
+        const len = keyBad ? mc.key_len : mc.val_len;
+        const mcEv = {
+          stepIdx: i,
+          step: s.step,
+          category: 'magic_comment',
+          kind: mKind,
+          targetId: mc.id,
+          targetType: keyBad ? 'key' : 'value',
+          start,
+          end,
+          len,
+          func: s.func,
+          line: s.line,
+          file: srcFile,
+          callStack,
+          item: mc
+        };
+        trace._commentAnomalyEvents.push(mcEv);
+        trace._invariantEvents.push(mcEv);
+        newInvariants.push(mcEv);
+      }
+      prevMagicAnomalyByKey.set(mKey, isBad);
+    });
+
+    // Line offset anomalies
+    const stepLoAnomalies = collectStepLineOffsetAnomalies(s, srcByteLen);
+    s._loAnomalies = stepLoAnomalies;
+    stepLoAnomalies.forEach(la => {
+      const loKey = `${la.line}:${la.kind}:${la.offset}`;
+      if (trace._loAnomalyFirstStepByLine[la.line] === undefined) {
+        trace._loAnomalyFirstStepByLine[la.line] = i;
+      }
+      if (!prevLoAnomalyByKey.get(loKey)) {
+        prevLoAnomalyByKey.set(loKey, true);
+        const loEv = {
+          stepIdx: i,
+          step: s.step,
+          category: 'line_offset',
+          kind: la.kind,
+          targetId: la.line,
+          targetType: `L${la.line}`,
+          offset: la.offset,
+          prevOffset: la.prev,
+          start: la.offset,
+          end: la.offset,
+          len: 0,
+          func: s.func,
+          line: s.line,
+          file: srcFile,
+          callStack,
+          item: la
+        };
+        trace._loAnomalyEvents.push(loEv);
+        trace._invariantEvents.push(loEv);
+        newInvariants.push(loEv);
+      }
+    });
+
     if (s.detail && s.detail.node_id) {
       lastChangedNodeId = s.detail.node_id;
     } else if (newUnderflows.length > 0) {
@@ -1303,12 +1729,17 @@ function preprocessTrace(trace) {
       lastChangedNodeId = mutatedNodeId;
     }
     s._astSnapshot = lastAst;
+    s._diagnosticsSnapshot = lastDiagnostics;
+    s._commentsSnapshot = lastComments;
+    s._magicCommentsSnapshot = lastMagicComments;
     s._lastChangedNodeId = lastChangedNodeId;
     s._newUnderflows = newUnderflows;
     s._hasNewUnderflow = newUnderflows.length > 0;
-    if (s._hasNewUnderflow) {
-      if (trace._underflowIdx < 0) trace._underflowIdx = i;
-      trace._underflowSteps.push(i);
+    s._newInvariants = newInvariants;
+    s._hasNewInvariant = newInvariants.length > 0;
+    if (s._hasNewInvariant) {
+      if (trace._invariantIdx < 0) trace._invariantIdx = i;
+      trace._invariantSteps.push(i);
     }
     s._isRewind = (i > 0 && s.curr[0] >= 0 && prevCurrStart >= 0 && s.curr[0] < prevCurrStart);
     s._rewindDelta = s._isRewind ? (s.curr[0] - prevCurrStart) : 0;
@@ -1344,6 +1775,9 @@ function preprocessTrace(trace) {
     prevTotalU = totalU;
     prevXallocU = xLive;
   });
+
+  trace._underflowIdx = trace._invariantIdx;
+  trace._underflowSteps = trace._invariantSteps;
 }
 
 function setEditMode(editing) {
@@ -1405,7 +1839,7 @@ function renderTimeline() {
       width = '6px';
       zIndex = 2;
       shadow = '0 0 6px var(--red)';
-    } else if (s._hasNewUnderflow) {
+    } else if (s._hasNewInvariant || s._hasNewUnderflow) {
       color = 'var(--red)';
       width = '5px';
       zIndex = 2;
@@ -1413,6 +1847,9 @@ function renderTimeline() {
     } else if (s.kind === 'ERROR') {
       color = 'var(--pink)';
       width = '3px';
+    } else if (s.kind === 'WARNING') {
+      color = 'var(--amber)';
+      width = '2.5px';
     } else if (s._isRewind) {
       color = 'var(--amber)';
     } else if (s.kind === 'NODE_NEW' || s.kind === 'NODE_LIST_APPEND') {
@@ -1512,7 +1949,7 @@ function renderSource(step, autoScroll = false) {
   let focusOffset = (hoverRange && hoverRange[0] >= 0)
     ? hoverRange[0]
     : (currE >= 0 ? currE : (currS >= 0 ? currS : (prevE >= 0 ? prevE : 0)));
-  if (!hoverRange && (step.kind === 'ERROR' || step.kind === 'NODE_NEW') && step.detail && typeof step.detail.start === 'number') {
+  if (!hoverRange && (step.kind === 'ERROR' || step.kind === 'WARNING' || step.kind === 'NODE_NEW') && step.detail && typeof step.detail.start === 'number') {
     focusOffset = step.detail.start;
   }
   focusOffset = Math.max(0, Math.min(src.length, focusOffset));
@@ -1679,27 +2116,40 @@ function renderStep() {
 
   const ub = document.getElementById('underflowBanner');
   const btnUnderflow = document.getElementById('btnJumpUnderflow');
-  const uEvents = currentTrace._underflowEvents || [];
-  const uSteps = currentTrace._underflowSteps || [];
+  const invEvents = currentTrace._invariantEvents || [];
+  const uSteps = currentTrace._invariantSteps || currentTrace._underflowSteps || [];
   const srcByteLen = typeof currentTrace._sourceByteLen === 'number'
     ? currentTrace._sourceByteLen
     : new TextEncoder().encode(currentTrace.source || '').length;
-  if (uEvents.length > 0) {
-    const hasU = uEvents.some(ev => ev.kind === 'underflow');
-    const hasOob = uEvents.some(ev => ev.kind === 'oob');
+  if (invEvents.length > 0) {
+    const cats = new Set(invEvents.map(ev => ev.category));
+    const kinds = new Set(invEvents.map(ev => ev.kind));
+    const hasU = kinds.has('underflow');
+    const hasOob = kinds.has('oob');
+    const onlyNodes = (cats.size === 1 && cats.has('node'));
+
     ub.style.display = 'block';
     btnUnderflow.style.display = 'inline-block';
-    btnUnderflow.textContent = (hasU && hasOob) ? '⚠ Bad Location' : (hasOob ? '⚠ Out of Bounds' : '⚠ Underflow');
-    btnUnderflow.title = (hasU && hasOob)
-      ? 'Jump to corrupted node location detection step (Key: U)'
-      : (hasOob
-        ? 'Jump to corrupted node out-of-bounds location detection step (Key: U)'
-        : 'Jump to corrupted node underflow detection step (Key: U)');
+    if (kinds.size === 1) {
+      btnUnderflow.textContent = hasU ? '⚠ Underflow'
+        : hasOob ? '⚠ Out of Bounds'
+        : kinds.has('overlap') ? '⚠ Overlap'
+        : '⚠ Line Order';
+    } else if (onlyNodes && hasU && hasOob && kinds.size === 2) {
+      btnUnderflow.textContent = '⚠ Bad Location';
+    } else {
+      btnUnderflow.textContent = '⚠ Invariant';
+    }
+    btnUnderflow.title = 'Jump to parser invariant violation detection step (Key: U)';
     btnUnderflow.disabled = (uSteps.length === 1 && currentIdx === uSteps[0]);
+
     const atUnderflowStep = uSteps.includes(currentIdx);
     const nextUStepIdx = uSteps.find(idx => idx > currentIdx) ?? uSteps[0];
     const nextUStep = currentTrace.steps[nextUStepIdx];
-    const nextLabel = (hasU && hasOob) ? 'Next Corrupted' : (hasOob ? 'Next OOB' : 'Next Underflow');
+    const nextLabel = (kinds.size === 1 && hasU) ? 'Next Underflow'
+      : (kinds.size === 1 && hasOob) ? 'Next OOB'
+      : 'Next Anomaly';
+
     let headerActionHtml = rawHtml('');
     if (!atUnderflowStep) {
       headerActionHtml = safeHtml`<button class="warn" style="margin-left:8px;padding:2px 7px;" data-jump-step="${Number(nextUStepIdx)}">Jump to Detection Step #${nextUStep.step}</button>`;
@@ -1713,29 +2163,81 @@ function renderStep() {
     } else {
       headerActionHtml = safeHtml`<span class="badge kind-CRASH" style="margin-left:8px;">AT DETECTION STEP</span>`;
     }
-    const itemsHtml = uEvents.map(ev => {
+
+    const itemsHtml = invEvents.map(ev => {
       const caller = ev.callStack.length > 0 ? ev.callStack[ev.callStack.length - 1] : null;
       const callerStr = (caller && caller !== ev.func) ? safeHtml` via <code>${caller}()</code>` : rawHtml('');
-      const stepBtn = (uEvents.length > 1 && currentIdx !== ev.stepIdx)
+      const stepBtn = (invEvents.length > 1 && currentIdx !== ev.stepIdx)
         ? safeHtml` <button class="warn" style="padding:1px 6px;font-size:11px;margin-left:4px;" data-jump-step="${Number(ev.stepIdx)}">Step #${ev.step}</button>`
         : rawHtml('');
-      const descHtml = ev.kind === 'oob'
-        ? safeHtml`out of bounds (<code>start=${ev.node.start}, end=${ev.node.end} &gt; src_len=${srcByteLen}, len=${ev.node.len}</code>)`
-        : safeHtml`underflowed (<code>start=${ev.node.start}, end=${ev.node.end}, len=${ev.node.len}</code>)`;
+
+      let subjectHtml = rawHtml('');
+      let descHtml = rawHtml('');
+      if (ev.category === 'node') {
+        subjectHtml = safeHtml`Node <code>#${ev.targetId} ${ev.targetType}</code>`;
+        descHtml = ev.kind === 'oob'
+          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${srcByteLen}, len=${ev.len}</code>)`
+          : safeHtml`underflowed (<code>start=${ev.start}, end=${ev.end}, len=${ev.len}</code>)`;
+      } else if (ev.category === 'diagnostic') {
+        const sevTitle = ev.severity === 'warning' ? 'Warning' : 'Error';
+        subjectHtml = safeHtml`${sevTitle} Diagnostic <code>#${ev.targetId} ${ev.targetType}</code>`;
+        descHtml = ev.kind === 'oob'
+          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${srcByteLen}, len=${ev.len}</code>)`
+          : safeHtml`underflowed (<code>start=${ev.start}, end=${ev.end}, len=${ev.len}</code>)`;
+      } else if (ev.category === 'comment') {
+        subjectHtml = safeHtml`Comment <code>#${ev.targetId} ${ev.targetType}</code>`;
+        descHtml = ev.kind === 'oob'
+          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${srcByteLen}, len=${ev.len}</code>)`
+          : ev.kind === 'overlap'
+            ? safeHtml`duplicates/overlaps earlier comment (<code>[${ev.start}..${ev.end}]</code>)`
+            : ev.kind === 'order'
+              ? safeHtml`out of order after attach_comments (<code>[${ev.start}..${ev.end}]</code>)`
+              : safeHtml`underflowed (<code>start=${ev.start}, end=${ev.end}, len=${ev.len}</code>)`;
+      } else if (ev.category === 'magic_comment') {
+        subjectHtml = safeHtml`Magic Comment <code>#${ev.targetId} (${ev.targetType})</code>`;
+        descHtml = ev.kind === 'oob'
+          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${srcByteLen}, len=${ev.len}</code>)`
+          : safeHtml`underflowed (<code>start=${ev.start}, end=${ev.end}, len=${ev.len}</code>)`;
+      } else {
+        subjectHtml = safeHtml`Line Offset <code>${ev.targetType}:@${ev.offset}</code>`;
+        descHtml = ev.kind === 'underflow'
+          ? safeHtml`underflowed (<code>offset=${ev.offset}</code>)`
+          : ev.kind === 'oob'
+            ? safeHtml`out of bounds (<code>offset=${ev.offset} &gt; src_len=${srcByteLen}</code>)`
+            : ev.kind === 'nonzero_start'
+              ? safeHtml`invalid initial offset (<code>L1=${ev.offset} != 0</code>)`
+              : ev.kind === 'empty'
+                ? safeHtml`empty <code>line_offsets</code> table`
+                : safeHtml`not strictly increasing (<code>@${ev.offset} &lt;= prev @${ev.prevOffset}</code>)`;
+      }
       return safeHtml`
         <div style="margin-top:4px;color:var(--text);">
-          Node <code>#${ev.node.id} ${ev.node.type}</code> ${descHtml} in <code>${ev.func}()</code>${callerStr} at <code>${ev.file}:${ev.line}</code>${stepBtn}
+          ${subjectHtml} ${descHtml} in <code>${ev.func}()</code>${callerStr} at <code>${ev.file}:${ev.line}</code>${stepBtn}
         </div>
       `;
     });
-    const bannerKindTitle = (hasU && hasOob)
-      ? `${uEvents.length} CORRUPTED LOCATIONS: UNDERFLOW & OUT OF BOUNDS`
-      : (hasOob
-        ? (uEvents.length === 1 ? 'LOCATION OUT OF BOUNDS' : `${uEvents.length} LOCATIONS OUT OF BOUNDS`)
-        : (uEvents.length === 1 ? 'LOCATION UNDERFLOW' : `${uEvents.length} LOCATION UNDERFLOWS`));
+
+    let bannerHeaderTitle = '';
+    if (onlyNodes) {
+      const bannerKindTitle = (hasU && hasOob)
+        ? `${invEvents.length} CORRUPTED LOCATIONS: UNDERFLOW & OUT OF BOUNDS`
+        : (hasOob
+          ? (invEvents.length === 1 ? 'LOCATION OUT OF BOUNDS' : `${invEvents.length} LOCATIONS OUT OF BOUNDS`)
+          : (invEvents.length === 1 ? 'LOCATION UNDERFLOW' : `${invEvents.length} LOCATION UNDERFLOWS`));
+      bannerHeaderTitle = `⚠ CORRUPTED AST NODE DETECTED (${bannerKindTitle})`;
+    } else if (cats.size === 1 && cats.has('diagnostic')) {
+      bannerHeaderTitle = `⚠ CORRUPTED DIAGNOSTIC LOCATION DETECTED (${invEvents.length === 1 ? '1 DIAGNOSTIC' : invEvents.length + ' DIAGNOSTICS'})`;
+    } else if (cats.size === 1 && (cats.has('comment') || cats.has('magic_comment')) || (cats.size === 2 && cats.has('comment') && cats.has('magic_comment'))) {
+      bannerHeaderTitle = `⚠ COMMENT INVARIANT VIOLATION DETECTED (${invEvents.length === 1 ? '1 COMMENT' : invEvents.length + ' COMMENTS'})`;
+    } else if (cats.size === 1 && cats.has('line_offset')) {
+      bannerHeaderTitle = `⚠ LINE OFFSET INVARIANT VIOLATION (${invEvents.length === 1 ? '1 OFFSET' : invEvents.length + ' OFFSETS'})`;
+    } else {
+      bannerHeaderTitle = `⚠ PARSER INVARIANT VIOLATIONS DETECTED (${invEvents.length} ANOMALIES)`;
+    }
+
     setSafeHtml(ub, safeHtml`
       <div style="display:flex;justify-content:space-between;align-items:center;">
-        <strong>⚠ CORRUPTED AST NODE DETECTED (${bannerKindTitle})</strong>
+        <strong>${bannerHeaderTitle}</strong>
         ${headerActionHtml}
       </div>
       ${itemsHtml}
@@ -1762,7 +2264,9 @@ function renderStep() {
     if (startOff < 0) return;
     el.style.cursor = 'pointer';
     el.addEventListener('mouseenter', () => {
-      hoverRange = [startOff, Math.max(startOff + 1, endOff)];
+      const lo = Math.min(startOff, endOff);
+      const hi = Math.max(lo + 1, Math.max(startOff, endOff));
+      hoverRange = [lo, hi];
       renderSource(currentTrace.steps[currentIdx], true);
     });
     el.addEventListener('mouseleave', () => {
@@ -1773,22 +2277,228 @@ function renderStep() {
 
   const loBox = document.getElementById('lineOffsetsBox');
   loBox.innerHTML = '';
-  let badOffsets = 0;
+  const stepLoAnoms = step._loAnomalies || collectStepLineOffsetAnomalies(step, srcByteLen);
+  const loAnomByLine = new Map(stepLoAnoms.map(a => [a.line, a]));
   step.line_offsets.forEach((off, idx) => {
+    const lineNo = idx + 1;
+    const anom = loAnomByLine.get(lineNo);
     const chip = document.createElement('span');
-    const isBad = idx > 0 && off <= step.line_offsets[idx - 1];
-    if (isBad) badOffsets++;
-    chip.className = 'offset-chip' + (isBad ? ' bad' : '');
-    chip.textContent = `L${idx + 1}:@${off}`;
-    chip.title = `Hover to highlight byte offset ${off} in source buffer`;
-    bindOffsetHover(chip, off);
+    chip.className = 'offset-chip' + (anom ? ' bad' : '');
+    chip.textContent = `L${lineNo}:@${off}`;
+    if (anom) {
+      const reason = anom.kind === 'underflow' ? `underflow (@${off})`
+        : anom.kind === 'oob' ? `out of bounds (@${off} > src_len=${srcByteLen})`
+        : anom.kind === 'nonzero_start' ? `L1 must start at 0 (got @${off})`
+        : `duplicate/out-of-order (@${off} <= prev @${anom.prev})`;
+      chip.title = `⚠ Line ${lineNo}: ${reason} — click to jump to detection step`;
+      const detIdx = currentTrace._loAnomalyFirstStepByLine ? currentTrace._loAnomalyFirstStepByLine[lineNo] : undefined;
+      if (typeof detIdx === 'number' && detIdx !== currentIdx) {
+        chip.addEventListener('click', () => jumpToStep(detIdx));
+      }
+    } else {
+      chip.title = `Hover to highlight byte offset ${off} in source buffer`;
+    }
+    if (off >= 0 && off <= srcByteLen) {
+      bindOffsetHover(chip, off);
+    }
+    loBox.appendChild(chip);
+  });
+  stepLoAnoms.filter(a => a.line > step.line_offsets.length || a.kind === 'empty').forEach(anom => {
+    const chip = document.createElement('span');
+    chip.className = 'offset-chip bad';
+    chip.textContent = anom.kind === 'empty' ? '⚠ empty line_offsets' : `L${anom.line}:@${anom.offset} (${anom.kind})`;
     loBox.appendChild(chip);
   });
   const loStatus = document.getElementById('lineOffsetStatus');
-  if (badOffsets > 0) {
-    setSafeHtml(loStatus, safeHtml`<span style="color:var(--red);font-weight:700;">⚠ ${badOffsets} duplicate/out-of-order newline offset(s)!</span>`);
+  const totalLinesReported = (step.mem && step.mem.lo && step.mem.lo[0]) ? step.mem.lo[0] : step.line_offsets.length;
+  if (stepLoAnoms.length > 0) {
+    setSafeHtml(loStatus, safeHtml`<span style="color:var(--red);font-weight:700;">⚠ ${stepLoAnoms.length} line_offsets violation(s)!</span>`);
   } else {
-    loStatus.textContent = `${step.line_offsets.length} line(s)`;
+    loStatus.textContent = `${totalLinesReported} line(s)`;
+  }
+
+  // Recorded Comments & Magic Comments card
+  const commentsBox = document.getElementById('commentsBox');
+  const commentStatus = document.getElementById('commentStatus');
+  if (commentsBox && commentStatus) {
+    commentsBox.innerHTML = '';
+    const comments = step._commentsSnapshot || [];
+    const magicComments = step._magicCommentsSnapshot || [];
+    let badCommentCount = 0;
+
+    if (comments.length === 0 && magicComments.length === 0) {
+      commentStatus.textContent = '0 comments';
+      setSafeHtml(commentsBox, safeHtml`<span style="color:var(--muted)">(none recorded yet)</span>`);
+    } else {
+      comments.forEach(c => {
+        const cKey = `c:${c.id}`;
+        const cKind = commentAnomalyKind(c, srcByteLen);
+        if (cKind) badCommentCount++;
+        const row = document.createElement('div');
+        row.className = 'inv-row' + (cKind ? ' bad' : '');
+        const firstStepIdx = cKind
+          ? currentTrace._commentAnomalyFirstStepByKey?.[cKey]
+          : currentTrace._commentStepByKey?.[cKey];
+        let slicePart = rawHtml('');
+        if (cKind === 'underflow') {
+          slicePart = safeHtml`<span style="color:var(--red);font-weight:700;">⚠ UNDERFLOW len=${c.len} (end=${c.end} &lt; start=${c.start})</span>`;
+        } else if (cKind === 'oob') {
+          const oobWhy = c.start > srcByteLen ? `start=${c.start} > src_len=${srcByteLen}` : `end=${c.end} > src_len=${srcByteLen}`;
+          slicePart = safeHtml`<span style="color:var(--red);font-weight:700;">⚠ OUT OF BOUNDS (${oobWhy})</span>`;
+        } else if (cKind === 'overlap') {
+          const preview = JSON.stringify(currentTrace.source.slice(c.start, Math.min(c.end, c.start + 32)));
+          slicePart = safeHtml`<span style="color:var(--red);font-weight:700;">⚠ DUPLICATE / OVERLAP</span> <span class="ast-slice">${preview}</span>`;
+        } else if (cKind === 'order') {
+          const preview = JSON.stringify(currentTrace.source.slice(c.start, Math.min(c.end, c.start + 32)));
+          slicePart = safeHtml`<span style="color:var(--red);font-weight:700;">⚠ UNSORTED AFTER ATTACH</span> <span class="ast-slice">${preview}</span>`;
+        } else {
+          const preview = JSON.stringify(currentTrace.source.slice(c.start, Math.min(c.end, c.start + 36)));
+          const lexOrderPill = c.lex_rewind
+            ? safeHtml` <span class="offset-chip warn" title="Lexed after a later-offset heredoc body comment (normal unless attach_comments sorted list)">↺ lex-order</span>`
+            : rawHtml('');
+          slicePart = safeHtml`<span class="ast-slice">${preview}</span>${lexOrderPill}`;
+        }
+        const jumpPill = (typeof firstStepIdx === 'number' && firstStepIdx !== currentIdx)
+          ? safeHtml`<span class="copy-pill inv-jump-btn" style="${cKind ? 'border-color:var(--red);color:#ffa198;margin-left:auto;' : 'margin-left:auto;'}" title="Jump to step #${currentTrace.steps[firstStepIdx].step}">${cKind ? '↳ Jump to Step #' : '↳ Step #'}${currentTrace.steps[firstStepIdx].step}</span>`
+          : rawHtml('');
+        setSafeHtml(row, safeHtml`
+          <span class="ast-id">#${c.id}</span>
+          <span class="badge" style="background:rgba(139,148,158,0.16);border:1px solid var(--border);color:var(--text);font-size:10px;padding:1px 5px;">${c.type}</span>
+          <span class="ast-loc">[${c.start}..${c.end}]</span>
+          ${slicePart}
+          ${jumpPill}
+        `);
+        const jBtn = row.querySelector('.inv-jump-btn');
+        if (jBtn && typeof firstStepIdx === 'number') {
+          jBtn.addEventListener('click', (e) => { e.stopPropagation(); jumpToStep(firstStepIdx); });
+        }
+        if (cKind === 'underflow') {
+          bindOffsetHover(row, Math.min(srcByteLen, c.end), Math.min(srcByteLen, c.start));
+        } else if (!cKind || c.start <= srcByteLen) {
+          bindOffsetHover(row, Math.min(srcByteLen, c.start), Math.min(srcByteLen, c.end));
+        }
+        commentsBox.appendChild(row);
+      });
+
+      magicComments.forEach(mc => {
+        const mKey = `mc:${mc.id}`;
+        const mKind = magicCommentAnomalyKind(mc, srcByteLen);
+        if (mKind) badCommentCount++;
+        const row = document.createElement('div');
+        row.className = 'inv-row' + (mKind ? ' bad' : '');
+        const firstStepIdx = mKind
+          ? currentTrace._magicCommentAnomalyFirstStepByKey?.[mKey]
+          : currentTrace._magicCommentStepByKey?.[mKey];
+        let bodyHtml = rawHtml('');
+        if (mKind) {
+          bodyHtml = safeHtml`<span style="color:var(--red);font-weight:700;">⚠ ${mKind === 'oob' ? 'OUT OF BOUNDS' : 'UNDERFLOW'} key=[${mc.key_start}..${mc.key_end}] (len=${mc.key_len}), val=[${mc.val_start}..${mc.val_end}] (len=${mc.val_len})</span>`;
+        } else {
+          const kStr = JSON.stringify(currentTrace.source.slice(mc.key_start, Math.min(mc.key_end, mc.key_start + 28)));
+          const vStr = JSON.stringify(currentTrace.source.slice(mc.val_start, Math.min(mc.val_end, mc.val_start + 28)));
+          bodyHtml = safeHtml`<span class="ast-loc">key[${mc.key_start}..${mc.key_end}]</span><span class="ast-slice">${kStr}</span><span class="ast-loc">val[${mc.val_start}..${mc.val_end}]</span><span class="ast-slice">${vStr}</span>`;
+        }
+        const jumpPill = (typeof firstStepIdx === 'number' && firstStepIdx !== currentIdx)
+          ? safeHtml`<span class="copy-pill inv-jump-btn" style="${mKind ? 'border-color:var(--red);color:#ffa198;margin-left:auto;' : 'margin-left:auto;'}" title="Jump to step #${currentTrace.steps[firstStepIdx].step}">${mKind ? '↳ Jump to Step #' : '↳ Step #'}${currentTrace.steps[firstStepIdx].step}</span>`
+          : rawHtml('');
+        setSafeHtml(row, safeHtml`
+          <span class="ast-id" style="color:var(--purple);">★#${mc.id}</span>
+          <span class="badge" style="background:rgba(188,140,255,0.18);border:1px solid var(--purple);color:var(--purple);font-size:10px;padding:1px 5px;">MAGIC</span>
+          ${bodyHtml}
+          ${jumpPill}
+        `);
+        const jBtn = row.querySelector('.inv-jump-btn');
+        if (jBtn && typeof firstStepIdx === 'number') {
+          jBtn.addEventListener('click', (e) => { e.stopPropagation(); jumpToStep(firstStepIdx); });
+        }
+        if (!mKind) {
+          row.style.cursor = 'pointer';
+          row.addEventListener('mouseenter', () => {
+            hoverRange = [[mc.key_start, Math.max(mc.key_start + 1, mc.key_end)], [mc.val_start, Math.max(mc.val_start + 1, mc.val_end)]];
+            renderSource(currentTrace.steps[currentIdx], true);
+          });
+          row.addEventListener('mouseleave', () => {
+            hoverRange = null;
+            renderSource(currentTrace.steps[currentIdx], false);
+          });
+        }
+        commentsBox.appendChild(row);
+      });
+
+      if (badCommentCount > 0) {
+        setSafeHtml(commentStatus, safeHtml`<span style="color:var(--red);font-weight:700;">⚠ ${badCommentCount} corrupted comment(s)!</span>`);
+      } else {
+        const mcPart = magicComments.length > 0 ? `, ${magicComments.length} magic` : '';
+        commentStatus.textContent = `${comments.length} comment(s)${mcPart}`;
+      }
+    }
+  }
+
+  // Recorded Diagnostics (errors & warnings) card
+  const diagnosticsBox = document.getElementById('diagnosticsBox');
+  const diagnosticStatus = document.getElementById('diagnosticStatus');
+  if (diagnosticsBox && diagnosticStatus) {
+    diagnosticsBox.innerHTML = '';
+    const diags = step._diagnosticsSnapshot || [];
+    let badDiagCount = 0;
+    const errCount = diags.filter(d => d.severity !== 'warning').length;
+    const warnCount = diags.filter(d => d.severity === 'warning').length;
+
+    if (diags.length === 0) {
+      diagnosticStatus.textContent = `${step.errors || 0} error(s), ${step.warnings || 0} warning(s)`;
+      setSafeHtml(diagnosticsBox, safeHtml`<span style="color:var(--muted)">(none recorded yet)</span>`);
+    } else {
+      diags.forEach(d => {
+        const dKey = `${d.severity}:${d.id}`;
+        const dKind = diagAnomalyKind(d, srcByteLen);
+        if (dKind) badDiagCount++;
+        const row = document.createElement('div');
+        row.className = 'inv-row' + (dKind ? ' bad' : '');
+        const firstStepIdx = dKind
+          ? currentTrace._diagAnomalyFirstStepByKey?.[dKey]
+          : currentTrace._diagStepByKey?.[dKey];
+        const sevKindClass = d.severity === 'warning' ? 'kind-WARNING' : 'kind-ERROR';
+        const sevLabel = d.severity === 'warning' ? 'WARN' : 'ERR';
+
+        let detailPart = rawHtml('');
+        if (dKind === 'underflow') {
+          detailPart = safeHtml`<span style="color:var(--red);font-weight:700;">⚠ UNDERFLOW len=${d.len} (end=${d.end} &lt; start=${d.start})</span>`;
+        } else if (dKind === 'oob') {
+          const oobWhy = d.start > srcByteLen ? `start=${d.start} > src_len=${srcByteLen}` : `end=${d.end} > src_len=${srcByteLen}`;
+          detailPart = safeHtml`<span style="color:var(--red);font-weight:700;">⚠ OUT OF BOUNDS (${oobWhy})</span>`;
+        }
+        const msgPart = d.message
+          ? safeHtml`<span style="color:var(--text);">${d.message}</span>`
+          : rawHtml('');
+        const jumpPill = (typeof firstStepIdx === 'number' && firstStepIdx !== currentIdx)
+          ? safeHtml`<span class="copy-pill inv-jump-btn" style="${dKind ? 'border-color:var(--red);color:#ffa198;margin-left:auto;' : 'margin-left:auto;'}" title="Jump to step #${currentTrace.steps[firstStepIdx].step}">${dKind ? '↳ Jump to Step #' : '↳ Step #'}${currentTrace.steps[firstStepIdx].step}</span>`
+          : rawHtml('');
+
+        setSafeHtml(row, safeHtml`
+          <span class="badge ${sevKindClass}" style="font-size:10px;padding:1px 5px;">${sevLabel}</span>
+          <code>${d.type}</code>
+          <span class="ast-loc">[${d.start}..${d.end}]</span>
+          ${detailPart}
+          ${msgPart}
+          ${jumpPill}
+        `);
+        const jBtn = row.querySelector('.inv-jump-btn');
+        if (jBtn && typeof firstStepIdx === 'number') {
+          jBtn.addEventListener('click', (e) => { e.stopPropagation(); jumpToStep(firstStepIdx); });
+        }
+        if (dKind === 'underflow') {
+          bindOffsetHover(row, Math.min(srcByteLen, d.end), Math.min(srcByteLen, d.start));
+        } else if (!dKind || d.start <= srcByteLen) {
+          bindOffsetHover(row, Math.min(srcByteLen, d.start), Math.min(srcByteLen, d.end));
+        }
+        diagnosticsBox.appendChild(row);
+      });
+
+      if (badDiagCount > 0) {
+        setSafeHtml(diagnosticStatus, safeHtml`<span style="color:var(--red);font-weight:700;">⚠ ${badDiagCount} corrupted diagnostic location(s)!</span>`);
+      } else {
+        diagnosticStatus.textContent = `${errCount} error(s), ${warnCount} warning(s)`;
+      }
+    }
   }
 
   const prevSlice = currentTrace.source.slice(Math.max(0, step.prev[0]), Math.max(0, step.prev[1]));
@@ -1823,7 +2533,7 @@ function renderStep() {
     <div class="kv-key" style="color:var(--amber)">previous token</div><div id="kvPrevTok"><code style="color:var(--amber)">${step.prev[2]}</code> [${step.prev[0]}..${step.prev[1]}] <code>${JSON.stringify(prevSlice)}</code></div>
     <div class="kv-key">next_start</div><div id="kvNextStart">${nextStartCell}</div>
     <div class="kv-key">heredoc_end</div><div id="kvHeredocEnd">${heredocEndCell}</div>
-    <div class="kv-key">Errors</div><div>${step.errors}</div>
+    <div class="kv-key">Diagnostics</div><div>${step.errors || 0} error(s), ${step.warnings || 0} warning(s) &middot; ${step.comments_count ?? (step._commentsSnapshot ? step._commentsSnapshot.length : 0)} comment(s)</div>
     <div class="kv-key">Detail</div><div><code>${detailStr}</code></div>
   `);
   const agyPill = document.getElementById('btnOpenAgyIde');
@@ -2347,6 +3057,8 @@ function getKindBadgeStyle(kind) {
     case 'LEX_MODE_POP':
     case 'ERROR':
       return { bg: 'rgba(247, 120, 186, 0.22)', fg: '#f778ba', border: '#f778ba' };
+    case 'WARNING':
+      return { bg: 'rgba(210, 153, 34, 0.22)', fg: '#d29922', border: '#d29922' };
     case 'HEREDOC_FLUSH':
       return { bg: 'rgba(188, 140, 255, 0.25)', fg: '#bc8cff', border: '#bc8cff' };
     case 'NODE_NEW':
@@ -2472,7 +3184,7 @@ function createSourceVideoRenderer(trace) {
     const [currS, currE, currTok] = step.curr || [-1, -1, ''];
 
     let focusOffset = (currE >= 0 ? currE : (currS >= 0 ? currS : (prevE >= 0 ? prevE : 0)));
-    if ((step.kind === 'ERROR' || step.kind === 'NODE_NEW') && step.detail && typeof step.detail.start === 'number') {
+    if ((step.kind === 'ERROR' || step.kind === 'WARNING' || step.kind === 'NODE_NEW') && step.detail && typeof step.detail.start === 'number') {
       focusOffset = step.detail.start;
     }
     const maxOff = (trace.source || '').length;
@@ -2548,12 +3260,17 @@ function createSourceVideoRenderer(trace) {
       detailSummary += ` → ${currTok.replace(/^PM_TOKEN_/, '')} [${currS}..${currE}]`;
     } else if ((step.kind === 'NODE_NEW' || step.kind === 'NODE_LIST_APPEND') && step.detail) {
       detailSummary += ` → ${(step.detail.type || '').replace(/^PM_/, '')} #${step.detail.node_id ?? '?'} [${step.detail.start ?? '?'}..${step.detail.end ?? '?'}]`;
-    } else if (step.kind === 'ERROR' && step.detail && step.detail.message) {
+    } else if ((step.kind === 'ERROR' || step.kind === 'WARNING') && step.detail && step.detail.message) {
       detailSummary += ` → ${step.detail.message}`;
     }
-    if (step._hasNewUnderflow) {
-      const hasU = (step._newUnderflows || []).some(n => isNodeUnderflow(n));
-      detailSummary += hasU ? '  ⚠ UNDERFLOW (end < start)' : '  ⚠ OUT OF BOUNDS (end > src_len)';
+    if (step._hasNewInvariant || step._hasNewUnderflow) {
+      const invs = step._newInvariants || [];
+      if (step._hasNewUnderflow) {
+        const hasU = (step._newUnderflows || []).some(n => isNodeUnderflow(n, trace._sourceByteLen));
+        detailSummary += hasU ? '  ⚠ UNDERFLOW (end < start)' : '  ⚠ OUT OF BOUNDS (end > src_len)';
+      } else if (invs.length > 0) {
+        detailSummary += `  ⚠ INVARIANT (${invs[0].category}: ${invs[0].kind})`;
+      }
     } else if (step._isRewind) {
       detailSummary += `  ↺ REWIND (${step._rewindDelta}B)`;
     }
@@ -2566,7 +3283,7 @@ function createSourceVideoRenderer(trace) {
     if (steps.length > 1) {
       const trackW = logicalW - outerPad * 2;
       const ratio = stepIdx / (steps.length - 1);
-      ctx.fillStyle = step._hasNewUnderflow || step.kind === 'CRASH'
+      ctx.fillStyle = step._hasNewInvariant || step._hasNewUnderflow || step.kind === 'CRASH'
         ? '#f85149'
         : (step._isRewind ? '#d29922' : '#58a6ff');
       ctx.fillRect(outerPad, trackY, Math.max(2, ratio * trackW), 3);
@@ -3233,7 +3950,13 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
     if (steps.length > 0 && steps[steps.length - 1] && steps[steps.length - 1].summary) {
       leakSummary = steps.pop();
     }
-    loadTrace({ name: file.name, source: meta.source, steps, leak_summary: leakSummary });
+    loadTrace({
+      name: file.name,
+      source: meta.source,
+      byte_length: typeof meta.length === 'number' ? meta.length : undefined,
+      steps,
+      leak_summary: leakSummary
+    });
   };
   reader.readAsText(file);
 });
