@@ -16,6 +16,8 @@ def load_jsonl(path, name)
   leak_summary = steps.pop if steps.last && steps.last["summary"]
   trace = { "name" => name, "source" => meta["source"], "steps" => steps, "leak_summary" => leak_summary }
   trace["byte_length"] = meta["length"] if meta["length"].is_a?(Integer)
+  trace["options"] = meta["options"] if meta["options"].is_a?(Hash)
+  trace["options_query"] = meta["options_query"] if meta["options_query"].is_a?(String)
   trace
 end
 
@@ -331,8 +333,110 @@ HTML_TEMPLATE = <<~'HTML'
   .kind-ERROR { background: rgba(247, 120, 186, 0.22); color: var(--pink); border: 1px solid var(--pink); }
   .kind-WARNING { background: rgba(210, 153, 34, 0.22); color: var(--amber); border: 1px solid var(--amber); }
   .kind-POST_PARSE { background: rgba(139, 148, 158, 0.18); color: var(--text); border: 1px solid var(--border); }
+  .kind-STREAM_PASS { background: rgba(57, 197, 207, 0.22); color: var(--cyan); border: 1px solid var(--cyan); }
   .kind-TEARDOWN { background: rgba(57, 197, 207, 0.2); color: var(--cyan); border: 1px solid var(--cyan); }
   .kind-CRASH { background: var(--red); color: #fff; border: 1px solid #ff7b72; font-weight: 700; }
+  button.has-active-opts {
+    border-color: var(--accent);
+    background: rgba(88, 166, 255, 0.15);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .opt-pill-bar {
+    display: none;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 8px;
+    margin-bottom: 6px;
+    background: rgba(88, 166, 255, 0.08);
+    border: 1px solid rgba(88, 166, 255, 0.35);
+    border-radius: 6px;
+  }
+  .opt-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text);
+  }
+  .opt-pill-remove {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    padding: 0 2px;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .opt-pill-remove:hover { color: var(--red); }
+  .options-panel {
+    display: none;
+    background: var(--panel);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 10px 11px;
+    margin-bottom: 8px;
+  }
+  .options-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+    gap: 7px 10px;
+    margin-bottom: 8px;
+  }
+  .opt-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .opt-field label {
+    font-size: 10.5px;
+    color: var(--muted);
+    font-family: var(--font-mono);
+  }
+  .opt-field input[type="text"],
+  .opt-field input[type="number"],
+  .opt-field select {
+    background: #090d13;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 6px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    width: 100%;
+  }
+  .opt-field input:focus, .opt-field select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .opt-checks-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    align-items: center;
+    padding: 5px 0;
+    border-top: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .opt-checks-row label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    color: var(--text);
+  }
+  .opt-checks-row input[type="checkbox"] {
+    margin: 0;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
   .card {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -701,9 +805,10 @@ __PRISM_LICENSE_HTML__</div>
             <button id="btnEditSource" class="success" title="Edit Ruby source in-place (or double-click source buffer)">✎ Edit Code</button>
             <button id="btnRunWasm" class="success" style="display:none;" title="Parse &amp; trace with in-browser Prism Wasm (Cmd/Ctrl + Enter)">▶ Parse &amp; Trace (⌘+Enter)</button>
             <button id="btnCancelEdit" style="display:none;">Cancel</button>
-            <button id="btnShareCode" title="Copy a shareable URL with the current Ruby snippet Base64-encoded in ?code=">🔗 Share</button>
+            <button id="btnToggleOptions" title="Configure pm_options_t &amp; pm_parse_stream parser options">⚙ Options</button>
+            <button id="btnShareCode" title="Copy a shareable URL with the current Ruby snippet &amp; pm_options_t encoded in query params">🔗 Share</button>
             <button id="btnRecordVideo" title="Record a video of the Ruby source buffer being parsed step-by-step">🎬 Video</button>
-            <button id="btnOpenRb" title="Load a .rb file and trace it live">📂 .rb</button>
+            <button id="btnOpenRb" title="Load a .rb or raw fuzz input file and trace it live">📂 .rb</button>
             <button id="btnOpenJsonl" title="Load a pre-recorded .jsonl trace">📂 .jsonl</button>
             <input type="file" id="rbFileInput" accept=".rb,.txt,*" style="display:none;">
             <input type="file" id="fileInput" accept=".jsonl,.json" style="display:none;">
@@ -712,6 +817,97 @@ __PRISM_LICENSE_HTML__</div>
         <div style="display:flex; align-items:center; gap:6px;">
           <label for="presetSelect" style="font-size:11px; color:var(--muted); white-space:nowrap;">Preset:</label>
           <select id="presetSelect" style="flex:1; min-width:0; flex-shrink:1; text-overflow:ellipsis; overflow:hidden;"></select>
+        </div>
+      </div>
+      <div id="activeOptionsBar" class="opt-pill-bar"></div>
+      <div id="parserOptionsPanel" class="options-panel">
+        <div class="card-title" style="margin-bottom:8px;">
+          <span>Parser Options (<code>pm_options_t</code> &amp; <code>pm_parse_stream</code>)</span>
+          <div style="display:flex; gap:5px;">
+            <button id="btnApplyOptions" class="primary" style="padding:2px 8px; font-size:11px;">▶ Apply</button>
+            <button id="btnResetOptions" style="padding:2px 8px; font-size:11px;" title="Reset all parser options to defaults">↺ Reset</button>
+          </div>
+        </div>
+        <div class="options-grid">
+          <div class="opt-field">
+            <label for="optEnc" title="pm_options_encoding_set(options, name)">encoding (enc)</label>
+            <input id="optEnc" type="text" list="optEncList" placeholder="(default UTF-8)">
+            <datalist id="optEncList">
+              <option value="UTF-8"></option>
+              <option value="ASCII-8BIT"></option>
+              <option value="US-ASCII"></option>
+              <option value="Windows-31J"></option>
+              <option value="EUC-JP"></option>
+              <option value="UTF-8-MAC"></option>
+              <option value="ISO-8859-1"></option>
+              <option value="Shift_JIS"></option>
+              <option value="UTF-16LE"></option>
+              <option value="UTF-16BE"></option>
+              <option value="GBK"></option>
+              <option value="Big5"></option>
+              <option value="KOI8-R"></option>
+            </datalist>
+          </div>
+          <div class="opt-field">
+            <label for="optRubyVer" title="pm_options_version_set(options, ver, len)">ruby_ver</label>
+            <select id="optRubyVer">
+              <option value="">(latest)</option>
+              <option value="3.3">CRuby 3.3</option>
+              <option value="3.4">CRuby 3.4</option>
+              <option value="3.5">CRuby 3.5</option>
+              <option value="4.0">CRuby 4.0</option>
+              <option value="4.1">CRuby 4.1</option>
+            </select>
+          </div>
+          <div class="opt-field">
+            <label for="optLine" title="pm_options_line_set(options, int32_t)">start line (line)</label>
+            <input id="optLine" type="number" step="1" value="1">
+          </div>
+          <div class="opt-field">
+            <label for="optFrozenLit" title="pm_options_frozen_string_literal_set">frozen_string_literal</label>
+            <select id="optFrozenLit">
+              <option value="">(unset)</option>
+              <option value="1">true (frozen)</option>
+              <option value="0">false (mutable)</option>
+            </select>
+          </div>
+          <div class="opt-field">
+            <label for="optFilepath" title="pm_options_filepath_set(options, path)">filepath</label>
+            <input id="optFilepath" type="text" placeholder="(empty)">
+          </div>
+          <div class="opt-field">
+            <label for="optBudget" title="pm_options_stack_budget_set (when supported by Prism build)">stack_budget (budget)</label>
+            <input id="optBudget" type="text" list="optBudgetList" placeholder="(default SIZE_MAX)">
+            <datalist id="optBudgetList">
+              <option value="0"></option>
+              <option value="512"></option>
+              <option value="4096"></option>
+              <option value="SIZE_MAX"></option>
+            </datalist>
+          </div>
+          <div class="opt-field" style="grid-column: 1 / -1;">
+            <label for="optScopes" title="Semicolon-separated scopes: [fwd:]local1,local2;... where fwd is subset of pkba (*, **, &amp;, ...) and ~b64url encodes arbitrary binary local names">scopes ([fwd:]local1,local2;...)</label>
+            <input id="optScopes" type="text" placeholder="e.g. a,foo;pk:b,it  (use : for empty scope, ~b64url for binary local)">
+          </div>
+        </div>
+        <div class="opt-checks-row">
+          <span style="color:var(--muted);">switches:</span>
+          <label title="PM_OPTIONS_COMMAND_LINE_A (-a)"><input type="checkbox" id="optCmdA">-a</label>
+          <label title="PM_OPTIONS_COMMAND_LINE_E (-e)"><input type="checkbox" id="optCmdE">-e</label>
+          <label title="PM_OPTIONS_COMMAND_LINE_L (-l)"><input type="checkbox" id="optCmdL">-l</label>
+          <label title="PM_OPTIONS_COMMAND_LINE_N (-n)"><input type="checkbox" id="optCmdN">-n</label>
+          <label title="PM_OPTIONS_COMMAND_LINE_P (-p)"><input type="checkbox" id="optCmdP">-p</label>
+          <label title="PM_OPTIONS_COMMAND_LINE_X (-x)"><input type="checkbox" id="optCmdX">-x</label>
+        </div>
+        <div class="opt-checks-row">
+          <span style="color:var(--muted);">flags:</span>
+          <label title="Use pm_parse_stream instead of pm_parse"><input type="checkbox" id="optStream">stream</label>
+          <label title="pm_options_attach_comments_set (v2.0.0+)"><input type="checkbox" id="optComments">attach_comments</label>
+          <label title="pm_options_main_script_set"><input type="checkbox" id="optMain">main_script</label>
+          <label title="pm_options_partial_script_set"><input type="checkbox" id="optPartial">partial_script</label>
+          <label title="pm_options_freeze_set"><input type="checkbox" id="optFreeze">freeze</label>
+          <label title="pm_options_encoding_locked_set"><input type="checkbox" id="optEncLock">encoding_locked</label>
+          <label title="Register no-op pm_options_shebang_callback_set"><input type="checkbox" id="optShebangCb">shebang_cb</label>
         </div>
       </div>
       <div id="sourceBox" class="source-box" title="Double-click (or click '✎ Edit Code') to edit Ruby snippet in-place"></div>
@@ -983,6 +1179,371 @@ function findPrismVersionIndex(query) {
   return idx;
 }
 
+const OPTION_URL_KEYS = [
+  'enc', 'ruby_ver', 'line', 'cmd', 'main', 'partial', 'freeze',
+  'comments', 'enc_lock', 'frozen_lit', 'stream', 'filepath',
+  'shebang_cb', 'budget', 'scopes'
+];
+
+function defaultParserOptions() {
+  return {
+    enc: '',
+    ruby_ver: '',
+    line: 1,
+    cmd: '',
+    main: false,
+    partial: false,
+    freeze: false,
+    comments: false,
+    enc_lock: false,
+    frozen_lit: '',
+    stream: false,
+    filepath: '',
+    shebang_cb: false,
+    budget: '',
+    scopes: ''
+  };
+}
+
+let currentParserOptions = defaultParserOptions();
+let currentRawSourceBytes = null;
+
+function encodeBytesBase64(bytes) {
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+function encodeBytesBase64Url(bytes) {
+  return encodeBytesBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function serializeScopeObjArray(scopesArr) {
+  if (!Array.isArray(scopesArr) || scopesArr.length === 0) return '';
+  return scopesArr.map(sc => {
+    const fwdRaw = String((sc && sc.forwarding) || '');
+    const fwd = ['p', 'k', 'b', 'a'].filter(ch => fwdRaw.includes(ch)).join('');
+    const locals = Array.isArray(sc && sc.locals) ? sc.locals : [];
+    if (locals.length === 0) {
+      return fwd ? `${fwd}:` : ':';
+    }
+    const encLocals = locals.map(loc => {
+      const s = String(loc ?? '');
+      if (/^[A-Za-z0-9_]+$/.test(s)) return s;
+      // In meta.options.scopes, trace_runtime encodes each raw byte 0x00..0xff as charCodeAt(i)
+      const b = new Uint8Array(s.length);
+      let allLatin1 = true;
+      for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c > 0xff) { allLatin1 = false; break; }
+        b[i] = c;
+      }
+      const raw = allLatin1 ? b : new TextEncoder().encode(s);
+      return '~' + encodeBytesBase64Url(raw);
+    }).join(',');
+    return fwd ? `${fwd}:${encLocals}` : encLocals;
+  }).join(';');
+}
+
+function normalizeCmdFlags(rawCmd) {
+  const s = String(rawCmd ?? '');
+  return ['a', 'e', 'l', 'n', 'p', 'x'].filter(ch => s.includes(ch)).join('');
+}
+
+function isTruthyOptVal(v) {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v !== 0;
+  const s = String(v ?? '').trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
+function normalizeParserOptions(raw = {}) {
+  const out = defaultParserOptions();
+  if (!raw || typeof raw !== 'object') return out;
+
+  const enc = raw.enc ?? raw.encoding ?? '';
+  out.enc = String(enc).trim();
+
+  const rv = raw.ruby_ver ?? raw.rubyVersion ?? '';
+  out.ruby_ver = String(rv).trim();
+
+  const rawLine = raw.line ?? raw.startLine ?? raw.start_line;
+  if (rawLine !== undefined && rawLine !== null && String(rawLine).trim() !== '') {
+    const n = Number(rawLine);
+    if (Number.isFinite(n)) {
+      out.line = Math.max(-2147483648, Math.min(2147483647, Math.trunc(n)));
+    }
+  }
+
+  out.cmd = normalizeCmdFlags(raw.cmd ?? raw.commandLine ?? raw.command_line ?? '');
+  out.main = isTruthyOptVal(raw.main ?? raw.mainScript ?? raw.main_script);
+  out.partial = isTruthyOptVal(raw.partial ?? raw.partialScript ?? raw.partial_script);
+  out.freeze = isTruthyOptVal(raw.freeze);
+  out.comments = isTruthyOptVal(raw.comments ?? raw.attachComments ?? raw.attach_comments);
+  out.enc_lock = isTruthyOptVal(raw.enc_lock ?? raw.encodingLocked ?? raw.encoding_locked);
+
+  const fl = raw.frozen_lit ?? raw.frozenStringLiteral ?? raw.frozen_string_literal;
+  if (fl === true || fl === 1 || String(fl).trim().toLowerCase() === 'true' || String(fl).trim() === '1') {
+    out.frozen_lit = '1';
+  } else if (fl === false || fl === 0 || String(fl).trim().toLowerCase() === 'false' || String(fl).trim() === '0') {
+    out.frozen_lit = '0';
+  }
+
+  out.stream = isTruthyOptVal(raw.stream ?? raw.streamMode ?? raw.stream_mode);
+  out.filepath = String(raw.filepath ?? '').trim();
+  out.shebang_cb = isTruthyOptVal(raw.shebang_cb ?? raw.shebangCallback ?? raw.shebang_callback);
+
+  const b = raw.budget ?? raw.stackBudget ?? raw.stack_budget;
+  if (b !== undefined && b !== null && String(b).trim() !== '') {
+    const bs = String(b).trim();
+    if (bs === 'SIZE_MAX' || bs.toLowerCase() === 'max' || bs === '-1') {
+      out.budget = 'SIZE_MAX';
+    } else if (/^\d+$/.test(bs)) {
+      out.budget = bs;
+    }
+  }
+
+  if (Array.isArray(raw.scopes)) {
+    out.scopes = serializeScopeObjArray(raw.scopes);
+  } else if (typeof raw.scopes === 'string') {
+    out.scopes = raw.scopes.trim();
+  }
+
+  return out;
+}
+
+function parseOptionsFromSearchParams(params) {
+  const raw = {};
+  let hasAny = false;
+  for (const k of [...OPTION_URL_KEYS, 'encoding']) {
+    if (params.has(k)) {
+      raw[k] = params.get(k);
+      hasAny = true;
+    }
+  }
+  return { opts: normalizeParserOptions(raw), hasAny };
+}
+
+function parseOptionsFromQueryString(queryStr) {
+  const q = String(queryStr ?? '').replace(/^\?/, '');
+  return parseOptionsFromSearchParams(new URLSearchParams(q)).opts;
+}
+
+function applyOptionsToSearchParams(params, opts = currentParserOptions) {
+  for (const k of [...OPTION_URL_KEYS, 'encoding']) {
+    params.delete(k);
+  }
+  const o = normalizeParserOptions(opts);
+  if (o.enc) params.set('enc', o.enc);
+  if (o.ruby_ver) params.set('ruby_ver', o.ruby_ver);
+  if (o.line !== 1) params.set('line', String(o.line));
+  if (o.cmd) params.set('cmd', o.cmd);
+  if (o.main) params.set('main', '1');
+  if (o.partial) params.set('partial', '1');
+  if (o.freeze) params.set('freeze', '1');
+  if (o.comments) params.set('comments', '1');
+  if (o.enc_lock) params.set('enc_lock', '1');
+  if (o.frozen_lit === '1' || o.frozen_lit === '0') params.set('frozen_lit', o.frozen_lit);
+  if (o.stream) params.set('stream', '1');
+  if (o.filepath) params.set('filepath', o.filepath);
+  if (o.shebang_cb) params.set('shebang_cb', '1');
+  if (o.budget) params.set('budget', o.budget);
+  if (o.scopes) params.set('scopes', o.scopes);
+}
+
+function serializeOptionsToQuery(opts = currentParserOptions) {
+  const p = new URLSearchParams();
+  applyOptionsToSearchParams(p, opts);
+  return p.toString();
+}
+
+function hasActiveParserOptions(opts = currentParserOptions) {
+  return serializeOptionsToQuery(opts).length > 0;
+}
+
+function getActiveOptionDescriptors(opts = currentParserOptions) {
+  const o = normalizeParserOptions(opts);
+  const list = [];
+  if (o.enc) list.push({ key: 'enc', label: `enc=${o.enc}`, clear: () => { currentParserOptions.enc = ''; } });
+  if (o.ruby_ver) list.push({ key: 'ruby_ver', label: `ruby_ver=${o.ruby_ver}`, clear: () => { currentParserOptions.ruby_ver = ''; } });
+  if (o.line !== 1) list.push({ key: 'line', label: `line=${o.line}`, clear: () => { currentParserOptions.line = 1; } });
+  if (o.cmd) list.push({ key: 'cmd', label: `-${o.cmd}`, clear: () => { currentParserOptions.cmd = ''; } });
+  if (o.stream) list.push({ key: 'stream', label: 'stream', clear: () => { currentParserOptions.stream = false; } });
+  if (o.comments) list.push({ key: 'comments', label: 'attach_comments', clear: () => { currentParserOptions.comments = false; } });
+  if (o.main) list.push({ key: 'main', label: 'main_script', clear: () => { currentParserOptions.main = false; } });
+  if (o.partial) list.push({ key: 'partial', label: 'partial_script', clear: () => { currentParserOptions.partial = false; } });
+  if (o.freeze) list.push({ key: 'freeze', label: 'freeze', clear: () => { currentParserOptions.freeze = false; } });
+  if (o.enc_lock) list.push({ key: 'enc_lock', label: 'encoding_locked', clear: () => { currentParserOptions.enc_lock = false; } });
+  if (o.frozen_lit === '1' || o.frozen_lit === '0') {
+    list.push({
+      key: 'frozen_lit',
+      label: `frozen_lit=${o.frozen_lit === '1' ? 'true' : 'false'}`,
+      clear: () => { currentParserOptions.frozen_lit = ''; }
+    });
+  }
+  if (o.filepath) list.push({ key: 'filepath', label: `filepath=${o.filepath}`, clear: () => { currentParserOptions.filepath = ''; } });
+  if (o.shebang_cb) list.push({ key: 'shebang_cb', label: 'shebang_cb', clear: () => { currentParserOptions.shebang_cb = false; } });
+  if (o.budget) list.push({ key: 'budget', label: `budget=${o.budget}`, clear: () => { currentParserOptions.budget = ''; } });
+  if (o.scopes) list.push({ key: 'scopes', label: `scopes=${o.scopes}`, clear: () => { currentParserOptions.scopes = ''; } });
+  return list;
+}
+
+function syncOptionsFormFromState() {
+  const o = normalizeParserOptions(currentParserOptions);
+  currentParserOptions = o;
+  const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+  const setChk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = Boolean(v); };
+
+  setVal('optEnc', o.enc);
+  setVal('optRubyVer', o.ruby_ver);
+  setVal('optLine', String(o.line));
+  setVal('optFrozenLit', o.frozen_lit);
+  setVal('optFilepath', o.filepath);
+  setVal('optBudget', o.budget);
+  setVal('optScopes', o.scopes);
+
+  setChk('optCmdA', o.cmd.includes('a'));
+  setChk('optCmdE', o.cmd.includes('e'));
+  setChk('optCmdL', o.cmd.includes('l'));
+  setChk('optCmdN', o.cmd.includes('n'));
+  setChk('optCmdP', o.cmd.includes('p'));
+  setChk('optCmdX', o.cmd.includes('x'));
+
+  setChk('optStream', o.stream);
+  setChk('optComments', o.comments);
+  setChk('optMain', o.main);
+  setChk('optPartial', o.partial);
+  setChk('optFreeze', o.freeze);
+  setChk('optEncLock', o.enc_lock);
+  setChk('optShebangCb', o.shebang_cb);
+
+  renderActiveOptionsBar();
+}
+
+function readOptionsStateFromForm() {
+  const getVal = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+  const getChk = (id) => { const el = document.getElementById(id); return Boolean(el && el.checked); };
+  const cmdChars = [];
+  if (getChk('optCmdA')) cmdChars.push('a');
+  if (getChk('optCmdE')) cmdChars.push('e');
+  if (getChk('optCmdL')) cmdChars.push('l');
+  if (getChk('optCmdN')) cmdChars.push('n');
+  if (getChk('optCmdP')) cmdChars.push('p');
+  if (getChk('optCmdX')) cmdChars.push('x');
+
+  currentParserOptions = normalizeParserOptions({
+    enc: getVal('optEnc'),
+    ruby_ver: getVal('optRubyVer'),
+    line: getVal('optLine'),
+    frozen_lit: getVal('optFrozenLit'),
+    filepath: getVal('optFilepath'),
+    budget: getVal('optBudget'),
+    scopes: getVal('optScopes'),
+    cmd: cmdChars.join(''),
+    stream: getChk('optStream'),
+    comments: getChk('optComments'),
+    main: getChk('optMain'),
+    partial: getChk('optPartial'),
+    freeze: getChk('optFreeze'),
+    enc_lock: getChk('optEncLock'),
+    shebang_cb: getChk('optShebangCb')
+  });
+  renderActiveOptionsBar();
+  return currentParserOptions;
+}
+
+function renderActiveOptionsBar() {
+  const bar = document.getElementById('activeOptionsBar');
+  const btn = document.getElementById('btnToggleOptions');
+  const active = getActiveOptionDescriptors(currentParserOptions);
+
+  if (btn) {
+    if (active.length > 0) {
+      btn.textContent = `⚙ Options (${active.length})`;
+      btn.classList.add('has-active-opts');
+    } else {
+      btn.textContent = '⚙ Options';
+      btn.classList.remove('has-active-opts');
+    }
+  }
+  if (!bar) return;
+  bar.innerHTML = '';
+  if (active.length === 0) {
+    bar.style.display = 'none';
+    return;
+  }
+  bar.style.display = 'flex';
+  const titleSpan = document.createElement('span');
+  titleSpan.style.fontSize = '10.5px';
+  titleSpan.style.color = 'var(--accent)';
+  titleSpan.style.fontWeight = '600';
+  titleSpan.style.textTransform = 'uppercase';
+  titleSpan.style.letterSpacing = '0.4px';
+  titleSpan.textContent = 'pm_options:';
+  bar.appendChild(titleSpan);
+
+  active.forEach(desc => {
+    const pill = document.createElement('span');
+    pill.className = 'opt-pill';
+    const lbl = document.createElement('span');
+    lbl.textContent = desc.label;
+    lbl.style.cursor = 'pointer';
+    lbl.title = 'Click to open Parser Options';
+    lbl.addEventListener('click', () => {
+      const panel = document.getElementById('parserOptionsPanel');
+      if (panel) panel.style.display = 'block';
+    });
+    const rm = document.createElement('button');
+    rm.className = 'opt-pill-remove';
+    rm.type = 'button';
+    rm.title = `Clear ${desc.key} and re-parse`;
+    rm.textContent = '×';
+    rm.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      desc.clear();
+      syncOptionsFormFromState();
+      await reparseCurrentWithOptions();
+    });
+    pill.appendChild(lbl);
+    pill.appendChild(rm);
+    bar.appendChild(pill);
+  });
+
+  const resetBtn = document.createElement('button');
+  resetBtn.type = 'button';
+  resetBtn.style.marginLeft = 'auto';
+  resetBtn.style.padding = '1px 6px';
+  resetBtn.style.fontSize = '10.5px';
+  resetBtn.textContent = 'Reset all';
+  resetBtn.title = 'Clear all active parser options and re-parse';
+  resetBtn.addEventListener('click', async () => {
+    currentParserOptions = defaultParserOptions();
+    syncOptionsFormFromState();
+    await reparseCurrentWithOptions();
+  });
+  bar.appendChild(resetBtn);
+}
+
+function getActiveSourceInput() {
+  const editor = document.getElementById('rubyEditor');
+  const isEditing = editor && editor.style.display !== 'none';
+  if (isEditing) return editor.value;
+  if (currentRawSourceBytes instanceof Uint8Array) {
+    return { text: currentTrace ? currentTrace.source : '', rawBytes: currentRawSourceBytes };
+  }
+  return currentTrace ? currentTrace.source : '';
+}
+
+async function reparseCurrentWithOptions() {
+  if (!currentTrace && !document.getElementById('rubyEditor').value) return;
+  const srcInput = getActiveSourceInput();
+  const hasUrlState = new URLSearchParams(window.location.search).has('code') || hasActiveParserOptions();
+  await parseWithWasm(srcInput, currentTrace ? currentTrace.name : 'Live Wasm Parse', hasUrlState);
+}
+
 async function selectPrismVersion(versionQuery, reparse = true) {
   const idx = findPrismVersionIndex(versionQuery);
   if (idx < 0) return false;
@@ -995,8 +1556,8 @@ async function selectPrismVersion(versionQuery, reparse = true) {
   if (reparse && currentTrace) {
     const editor = document.getElementById('rubyEditor');
     const isEditing = editor && editor.style.display !== 'none';
-    const src = isEditing ? editor.value : currentTrace.source;
-    const hasCodeInUrl = new URLSearchParams(window.location.search).has('code');
+    const src = getActiveSourceInput();
+    const hasCodeInUrl = new URLSearchParams(window.location.search).has('code') || hasActiveParserOptions();
     await parseWithWasm(src, currentTrace.name, hasCodeInUrl || isEditing);
   }
   return true;
@@ -1072,7 +1633,21 @@ async function initWasm() {
   }
 }
 
-async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode = true) {
+function bytesToSourcePayload(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  try {
+    const utf8Text = new TextDecoder('utf-8', { fatal: true }).decode(u8);
+    return { text: utf8Text, rawBytes: u8, isBinary: false };
+  } catch (_) {
+    let latin1 = '';
+    for (let i = 0; i < u8.length; i++) {
+      latin1 += String.fromCharCode(u8[i]);
+    }
+    return { text: latin1, rawBytes: u8, isBinary: true };
+  }
+}
+
+async function parseWithWasm(rubyCodeOrPayload, label = 'Live Wasm Parse', updateUrlCode = true) {
   if (!wasmExports) {
     await initWasm();
     if (!wasmExports) {
@@ -1081,15 +1656,43 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
     }
   }
   const t0 = performance.now();
-  const srcBytes = new TextEncoder().encode(rubyCode);
+  let srcBytes;
+  let rubyCodeText;
+  if (rubyCodeOrPayload instanceof Uint8Array) {
+    const payload = bytesToSourcePayload(rubyCodeOrPayload);
+    srcBytes = payload.rawBytes;
+    rubyCodeText = payload.text;
+    currentRawSourceBytes = payload.isBinary ? payload.rawBytes : null;
+  } else if (rubyCodeOrPayload && typeof rubyCodeOrPayload === 'object' && rubyCodeOrPayload.rawBytes instanceof Uint8Array) {
+    const payload = bytesToSourcePayload(rubyCodeOrPayload.rawBytes);
+    srcBytes = payload.rawBytes;
+    rubyCodeText = payload.text;
+    currentRawSourceBytes = payload.isBinary ? payload.rawBytes : null;
+  } else {
+    rubyCodeText = String(rubyCodeOrPayload ?? '');
+    srcBytes = new TextEncoder().encode(rubyCodeText);
+    currentRawSourceBytes = null;
+  }
+
   const srcPtr = wasmExports.malloc(Math.max(1, srcBytes.length));
   new Uint8Array(wasmExports.memory.buffer, srcPtr, srcBytes.length).set(srcBytes);
+
+  const optsQuery = serializeOptionsToQuery(currentParserOptions);
+  const optsBytes = new TextEncoder().encode(optsQuery);
+  const optsPtr = optsBytes.length > 0 ? wasmExports.malloc(optsBytes.length) : 0;
+  if (optsPtr && optsBytes.length > 0) {
+    new Uint8Array(wasmExports.memory.buffer, optsPtr, optsBytes.length).set(optsBytes);
+  }
 
   const bufPtr = wasmExports.pm_buffer_new();
   let trappedError = null;
 
   try {
-    wasmExports.prism_trace_run_to_buffer(bufPtr, srcPtr, srcBytes.length, 50000);
+    if (typeof wasmExports.prism_trace_run_to_buffer_opts === 'function') {
+      wasmExports.prism_trace_run_to_buffer_opts(bufPtr, srcPtr, srcBytes.length, 50000, optsPtr, optsBytes.length);
+    } else {
+      wasmExports.prism_trace_run_to_buffer(bufPtr, srcPtr, srcBytes.length, 50000);
+    }
   } catch (err) {
     trappedError = err;
   }
@@ -1106,6 +1709,7 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
   if (!trappedError) {
     wasmExports.pm_buffer_free(bufPtr);
     wasmExports.free(srcPtr);
+    if (optsPtr) wasmExports.free(optsPtr);
   } else {
     wasmExports = null;
     initWasm();
@@ -1117,7 +1721,7 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
     try { lines.push(JSON.parse(l)); } catch (_) {}
   });
 
-  const meta = lines[0] || { source: rubyCode };
+  const meta = lines[0] || { source: rubyCodeText };
   const steps = lines.slice(1);
   let leakSummary = null;
   if (steps.length > 0 && steps[steps.length - 1] && steps[steps.length - 1].summary) {
@@ -1156,9 +1760,16 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
 
   const dt = (performance.now() - t0).toFixed(1);
   const metaByteLen = typeof meta.length === 'number' ? meta.length : srcBytes.length;
-  loadTrace({ name: label, source: meta.source, byte_length: metaByteLen, steps, leak_summary: leakSummary }, false);
+  loadTrace({
+    name: label,
+    source: meta.source,
+    byte_length: metaByteLen,
+    options: meta.options || (hasActiveParserOptions() ? { ...currentParserOptions } : null),
+    steps,
+    leak_summary: leakSummary
+  }, false);
   if (updateUrlCode) {
-    updateBrowserUrlWithCode(rubyCode);
+    updateBrowserUrlWithCode(currentRawSourceBytes || rubyCodeText);
   } else {
     updateBrowserUrlVersionOnly();
   }
@@ -1187,24 +1798,35 @@ async function parseWithWasm(rubyCode, label = 'Live Wasm Parse', updateUrlCode 
   }
 }
 
-function encodeCodeBase64(str) {
-  const bytes = new TextEncoder().encode(str);
-  let bin = '';
-  for (let i = 0; i < bytes.length; i++) {
-    bin += String.fromCharCode(bytes[i]);
+function encodeCodeBase64(strOrBytes) {
+  if (strOrBytes instanceof Uint8Array) {
+    return encodeBytesBase64(strOrBytes);
   }
-  return btoa(bin);
+  if (strOrBytes && typeof strOrBytes === 'object' && strOrBytes.rawBytes instanceof Uint8Array) {
+    return encodeBytesBase64(strOrBytes.rawBytes);
+  }
+  if (typeof strOrBytes === 'string' && currentTrace && strOrBytes === currentTrace.source && currentRawSourceBytes instanceof Uint8Array) {
+    return encodeBytesBase64(currentRawSourceBytes);
+  }
+  const bytes = new TextEncoder().encode(String(strOrBytes ?? ''));
+  return encodeBytesBase64(bytes);
 }
 
-function decodeCodeBase64(b64) {
-  const normalized = b64.trim().replace(/ /g, '+').replace(/-/g, '+').replace(/_/g, '/');
+function decodeCodeBase64Bytes(b64) {
+  const trimmed = String(b64 ?? '').trim();
+  if (!trimmed) return new Uint8Array(0);
+  const normalized = trimmed.replace(/ /g, '+').replace(/-/g, '+').replace(/_/g, '/');
   const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
   const bin = atob(padded);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) {
     bytes[i] = bin.charCodeAt(i);
   }
-  return new TextDecoder().decode(bytes);
+  return bytes;
+}
+
+function decodeCodeBase64(b64) {
+  return bytesToSourcePayload(decodeCodeBase64Bytes(b64)).text;
 }
 
 function buildShareableUrl(rubyCode, stepIdx = currentIdx) {
@@ -1213,6 +1835,7 @@ function buildShareableUrl(rubyCode, stepIdx = currentIdx) {
     url.searchParams.set('version', PRISM_BUILD_INFO.id);
   }
   url.searchParams.set('code', encodeCodeBase64(rubyCode));
+  applyOptionsToSearchParams(url.searchParams, currentParserOptions);
   if (Number.isFinite(stepIdx) && stepIdx >= 0) {
     url.searchParams.set('step', String(stepIdx));
   }
@@ -1222,24 +1845,34 @@ function buildShareableUrl(rubyCode, stepIdx = currentIdx) {
 function updateBrowserUrlVersionOnly() {
   try {
     const url = new URL(window.location.href);
+    const urlHadOpts = OPTION_URL_KEYS.some(k => url.searchParams.has(k));
     if (PRISM_BUILD_INFO && PRISM_BUILD_INFO.id) {
-      if (currentPrismVersionIdx === 0 && !url.searchParams.has('code') && !url.searchParams.has('version')) {
+      if (currentPrismVersionIdx === 0 && !url.searchParams.has('code') && !url.searchParams.has('version') && !hasActiveParserOptions() && !urlHadOpts) {
         return;
       }
-      url.searchParams.set('version', PRISM_BUILD_INFO.id);
+      if (url.searchParams.has('version') || currentPrismVersionIdx !== 0 || hasActiveParserOptions()) {
+        url.searchParams.set('version', PRISM_BUILD_INFO.id);
+      }
+      applyOptionsToSearchParams(url.searchParams, currentParserOptions);
       window.history.replaceState(null, '', url.toString());
     }
   } catch (_) {}
 }
 
-function updateBrowserUrlWithCode(rubyCode, stepIdx = null) {
+function updateBrowserUrlWithCode(rubyCodeOrBytes, stepIdx = null) {
   try {
-    if (typeof rubyCode === 'string' && rubyCode.length <= 16384) {
+    const byteLen = (rubyCodeOrBytes instanceof Uint8Array)
+      ? rubyCodeOrBytes.length
+      : (rubyCodeOrBytes && rubyCodeOrBytes.rawBytes instanceof Uint8Array
+        ? rubyCodeOrBytes.rawBytes.length
+        : String(rubyCodeOrBytes ?? '').length);
+    if (byteLen <= 16384) {
       const url = new URL(window.location.href);
       if (PRISM_BUILD_INFO && PRISM_BUILD_INFO.id) {
         url.searchParams.set('version', PRISM_BUILD_INFO.id);
       }
-      url.searchParams.set('code', encodeCodeBase64(rubyCode));
+      url.searchParams.set('code', encodeCodeBase64(rubyCodeOrBytes));
+      applyOptionsToSearchParams(url.searchParams, currentParserOptions);
       if (Number.isFinite(stepIdx) && stepIdx >= 0) {
         url.searchParams.set('step', String(stepIdx));
       } else {
@@ -1253,11 +1886,10 @@ function updateBrowserUrlWithCode(rubyCode, stepIdx = null) {
 function clearBrowserUrlCodeParam() {
   try {
     const url = new URL(window.location.href);
-    if (url.searchParams.has('code') || url.searchParams.has('step')) {
-      url.searchParams.delete('code');
-      url.searchParams.delete('step');
-      window.history.replaceState(null, '', url.toString());
-    }
+    url.searchParams.delete('code');
+    url.searchParams.delete('step');
+    applyOptionsToSearchParams(url.searchParams, currentParserOptions);
+    window.history.replaceState(null, '', url.toString());
   } catch (_) {}
 }
 
@@ -1410,6 +2042,13 @@ function summarizeInvariantBadgeText(invEvents) {
   return `${invEvents.length} parser invariant violations`;
 }
 
+function effectiveStepByteLen(step, trace = currentTrace) {
+  if (step && typeof step.src_len === 'number') return step.src_len;
+  if (trace && typeof trace._sourceByteLen === 'number') return trace._sourceByteLen;
+  if (trace && typeof trace.byte_length === 'number') return trace.byte_length;
+  return new TextEncoder().encode((trace && trace.source) || '').length;
+}
+
 function preprocessTrace(trace) {
   if (trace.steps && trace.steps.length > 0 && trace.steps[trace.steps.length - 1] && trace.steps[trace.steps.length - 1].summary) {
     trace.leak_summary = trace.steps.pop();
@@ -1461,6 +2100,23 @@ function preprocessTrace(trace) {
   trace._hasArena = false;
 
   trace.steps.forEach((s, i) => {
+    const stepSrcByteLen = typeof s.src_len === 'number' ? s.src_len : srcByteLen;
+    s._effectiveSrcByteLen = stepSrcByteLen;
+    if (s.kind === 'STREAM_PASS') {
+      lastAst = [];
+      lastDiagnostics = [];
+      lastComments = [];
+      lastMagicComments = [];
+      lastChangedNodeId = -1;
+      prevCurrStart = 0;
+      prevUnderflowById.clear();
+      prevNodeSigById.clear();
+      prevDiagAnomalyByKey.clear();
+      prevCommentAnomalyByKey.clear();
+      prevMagicAnomalyByKey.clear();
+      prevLoAnomalyByKey.clear();
+    }
+
     const newUnderflows = [];
     const newInvariants = [];
     const srcFile = stepSourceFile(s);
@@ -1476,7 +2132,7 @@ function preprocessTrace(trace) {
           mutatedNodeId = n.id;
           prevNodeSigById.set(n.id, sig);
         }
-        const anomalyKind = nodeAnomalyKind(n, srcByteLen);
+        const anomalyKind = nodeAnomalyKind(n, stepSrcByteLen);
         const isU = Boolean(anomalyKind);
         const wasU = prevUnderflowById.get(n.id) || false;
         if (isU && !wasU) {
@@ -1489,6 +2145,7 @@ function preprocessTrace(trace) {
             step: s.step,
             kind: anomalyKind,
             node: n,
+            srcByteLen: stepSrcByteLen,
             func: s.func,
             line: s.line,
             file: srcFile,
@@ -1505,6 +2162,7 @@ function preprocessTrace(trace) {
             start: n.start,
             end: n.end,
             len: n.len,
+            srcByteLen: stepSrcByteLen,
             func: s.func,
             line: s.line,
             file: srcFile,
@@ -1531,7 +2189,7 @@ function preprocessTrace(trace) {
       if (trace._diagStepByKey[dKey] === undefined) {
         trace._diagStepByKey[dKey] = i;
       }
-      const dKind = diagAnomalyKind(d, srcByteLen);
+      const dKind = diagAnomalyKind(d, stepSrcByteLen);
       const isBad = Boolean(dKind);
       const wasBad = prevDiagAnomalyByKey.get(dKey) || false;
       if (isBad && !wasBad) {
@@ -1550,6 +2208,7 @@ function preprocessTrace(trace) {
           start: d.start,
           end: d.end,
           len: d.len,
+          srcByteLen: stepSrcByteLen,
           func: s.func,
           line: s.line,
           file: srcFile,
@@ -1581,8 +2240,8 @@ function preprocessTrace(trace) {
           end,
           len
         };
-        const u = isSpanUnderflow(c.start, c.end, c.len, c.underflow, srcByteLen);
-        const o = isSpanOutOfBounds(c.start, c.end, c.len, c.underflow, c.oob, srcByteLen);
+        const u = isSpanUnderflow(c.start, c.end, c.len, c.underflow, stepSrcByteLen);
+        const o = isSpanOutOfBounds(c.start, c.end, c.len, c.underflow, c.oob, stepSrcByteLen);
         if (!u && !o) {
           let jsOverlap = Boolean(c.overlap);
           if (!jsOverlap) {
@@ -1609,7 +2268,7 @@ function preprocessTrace(trace) {
       if (trace._commentStepByKey[cKey] === undefined) {
         trace._commentStepByKey[cKey] = i;
       }
-      const cKind = commentAnomalyKind(c, srcByteLen);
+      const cKind = commentAnomalyKind(c, stepSrcByteLen);
       const isBad = Boolean(cKind);
       const wasBad = prevCommentAnomalyByKey.get(cKey) || false;
       if (isBad && !wasBad) {
@@ -1626,6 +2285,7 @@ function preprocessTrace(trace) {
           start: c.start,
           end: c.end,
           len: c.len,
+          srcByteLen: stepSrcByteLen,
           func: s.func,
           line: s.line,
           file: srcFile,
@@ -1650,7 +2310,7 @@ function preprocessTrace(trace) {
       if (trace._magicCommentStepByKey[mKey] === undefined) {
         trace._magicCommentStepByKey[mKey] = i;
       }
-      const mKind = magicCommentAnomalyKind(mc, srcByteLen);
+      const mKind = magicCommentAnomalyKind(mc, stepSrcByteLen);
       const isBad = Boolean(mKind);
       const wasBad = prevMagicAnomalyByKey.get(mKey) || false;
       if (isBad && !wasBad) {
@@ -1658,8 +2318,8 @@ function preprocessTrace(trace) {
           trace._magicCommentAnomalyFirstStepByKey[mKey] = i;
         }
         const keyBad = Boolean(
-          isSpanUnderflow(mc.key_start, mc.key_end, mc.key_len, mc.key_underflow, srcByteLen) ||
-          isSpanOutOfBounds(mc.key_start, mc.key_end, mc.key_len, mc.key_underflow, mc.key_oob, srcByteLen)
+          isSpanUnderflow(mc.key_start, mc.key_end, mc.key_len, mc.key_underflow, stepSrcByteLen) ||
+          isSpanOutOfBounds(mc.key_start, mc.key_end, mc.key_len, mc.key_underflow, mc.key_oob, stepSrcByteLen)
         );
         const start = keyBad ? mc.key_start : mc.val_start;
         const end = keyBad ? mc.key_end : mc.val_end;
@@ -1674,6 +2334,7 @@ function preprocessTrace(trace) {
           start,
           end,
           len,
+          srcByteLen: stepSrcByteLen,
           func: s.func,
           line: s.line,
           file: srcFile,
@@ -1688,7 +2349,7 @@ function preprocessTrace(trace) {
     });
 
     // Line offset anomalies
-    const stepLoAnomalies = collectStepLineOffsetAnomalies(s, srcByteLen);
+    const stepLoAnomalies = collectStepLineOffsetAnomalies(s, stepSrcByteLen);
     s._loAnomalies = stepLoAnomalies;
     stepLoAnomalies.forEach(la => {
       const loKey = `${la.line}:${la.kind}:${la.offset}`;
@@ -1709,6 +2370,7 @@ function preprocessTrace(trace) {
           start: la.offset,
           end: la.offset,
           len: 0,
+          srcByteLen: stepSrcByteLen,
           func: s.func,
           line: s.line,
           file: srcFile,
@@ -1844,6 +2506,10 @@ function renderTimeline() {
       width = '5px';
       zIndex = 2;
       shadow = '0 0 5px var(--red)';
+    } else if (s.kind === 'STREAM_PASS') {
+      color = 'var(--purple)';
+      width = '3.5px';
+      zIndex = 2;
     } else if (s.kind === 'ERROR') {
       color = 'var(--pink)';
       width = '3px';
@@ -1967,12 +2633,20 @@ function renderSource(step, autoScroll = false) {
   lineDiv.appendChild(makeGutter(lineNum, 0));
 
   let focusCell = null;
+  const isByteAlignedSource = (typeof currentTrace._sourceByteLen === 'number' && src.length === currentTrace._sourceByteLen);
+  const activeStreamLen = (typeof step.src_len === 'number' && step.src_len < src.length) ? step.src_len : null;
 
   for (let i = 0; i <= src.length; i++) {
     const ch = i < src.length ? src[i] : 'EOF';
+    const code = i < src.length ? src.charCodeAt(i) : -1;
     const cell = document.createElement('span');
     cell.className = 'char-cell';
-    cell.title = `Line ${lineNum}, Byte offset ${i}`;
+    const hexPart = (code >= 0 && code <= 0xff) ? ` (0x${code.toString(16).padStart(2, '0')})` : '';
+    const tailPart = (activeStreamLen !== null && i >= activeStreamLen && i < src.length) ? ' [unparsed stream tail]' : '';
+    cell.title = `Line ${lineNum}, Byte offset ${i}${hexPart}${tailPart}`;
+    if (activeStreamLen !== null && i >= activeStreamLen && i < src.length) {
+      cell.style.opacity = '0.42';
+    }
 
     if (i >= prevS && i < prevE) cell.classList.add('in-prev');
     if (i >= currS && i < currE) cell.classList.add('in-curr');
@@ -1995,9 +2669,15 @@ function renderSource(step, autoScroll = false) {
     } else if (ch === '\r') {
       cell.classList.add('nl-char');
       txt.textContent = '\\r';
+    } else if (ch === '\t') {
+      cell.classList.add('nl-char');
+      txt.textContent = '\\t';
     } else if (ch === 'EOF') {
       cell.classList.add('nl-char');
       txt.textContent = '␄';
+    } else if (code >= 0 && (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0xff && isByteAlignedSource))) {
+      cell.classList.add('nl-char');
+      txt.textContent = `\\x${code.toString(16).padStart(2, '0')}`;
     } else {
       txt.textContent = ch;
     }
@@ -2118,9 +2798,7 @@ function renderStep() {
   const btnUnderflow = document.getElementById('btnJumpUnderflow');
   const invEvents = currentTrace._invariantEvents || [];
   const uSteps = currentTrace._invariantSteps || currentTrace._underflowSteps || [];
-  const srcByteLen = typeof currentTrace._sourceByteLen === 'number'
-    ? currentTrace._sourceByteLen
-    : new TextEncoder().encode(currentTrace.source || '').length;
+  const srcByteLen = effectiveStepByteLen(step, currentTrace);
   if (invEvents.length > 0) {
     const cats = new Set(invEvents.map(ev => ev.category));
     const kinds = new Set(invEvents.map(ev => ev.kind));
@@ -2171,23 +2849,24 @@ function renderStep() {
         ? safeHtml` <button class="warn" style="padding:1px 6px;font-size:11px;margin-left:4px;" data-jump-step="${Number(ev.stepIdx)}">Step #${ev.step}</button>`
         : rawHtml('');
 
+      const evSrcLen = typeof ev.srcByteLen === 'number' ? ev.srcByteLen : srcByteLen;
       let subjectHtml = rawHtml('');
       let descHtml = rawHtml('');
       if (ev.category === 'node') {
         subjectHtml = safeHtml`Node <code>#${ev.targetId} ${ev.targetType}</code>`;
         descHtml = ev.kind === 'oob'
-          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${srcByteLen}, len=${ev.len}</code>)`
+          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${evSrcLen}, len=${ev.len}</code>)`
           : safeHtml`underflowed (<code>start=${ev.start}, end=${ev.end}, len=${ev.len}</code>)`;
       } else if (ev.category === 'diagnostic') {
         const sevTitle = ev.severity === 'warning' ? 'Warning' : 'Error';
         subjectHtml = safeHtml`${sevTitle} Diagnostic <code>#${ev.targetId} ${ev.targetType}</code>`;
         descHtml = ev.kind === 'oob'
-          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${srcByteLen}, len=${ev.len}</code>)`
+          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${evSrcLen}, len=${ev.len}</code>)`
           : safeHtml`underflowed (<code>start=${ev.start}, end=${ev.end}, len=${ev.len}</code>)`;
       } else if (ev.category === 'comment') {
         subjectHtml = safeHtml`Comment <code>#${ev.targetId} ${ev.targetType}</code>`;
         descHtml = ev.kind === 'oob'
-          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${srcByteLen}, len=${ev.len}</code>)`
+          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${evSrcLen}, len=${ev.len}</code>)`
           : ev.kind === 'overlap'
             ? safeHtml`duplicates/overlaps earlier comment (<code>[${ev.start}..${ev.end}]</code>)`
             : ev.kind === 'order'
@@ -2196,14 +2875,14 @@ function renderStep() {
       } else if (ev.category === 'magic_comment') {
         subjectHtml = safeHtml`Magic Comment <code>#${ev.targetId} (${ev.targetType})</code>`;
         descHtml = ev.kind === 'oob'
-          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${srcByteLen}, len=${ev.len}</code>)`
+          ? safeHtml`out of bounds (<code>start=${ev.start}, end=${ev.end} &gt; src_len=${evSrcLen}, len=${ev.len}</code>)`
           : safeHtml`underflowed (<code>start=${ev.start}, end=${ev.end}, len=${ev.len}</code>)`;
       } else {
         subjectHtml = safeHtml`Line Offset <code>${ev.targetType}:@${ev.offset}</code>`;
         descHtml = ev.kind === 'underflow'
           ? safeHtml`underflowed (<code>offset=${ev.offset}</code>)`
           : ev.kind === 'oob'
-            ? safeHtml`out of bounds (<code>offset=${ev.offset} &gt; src_len=${srcByteLen}</code>)`
+            ? safeHtml`out of bounds (<code>offset=${ev.offset} &gt; src_len=${evSrcLen}</code>)`
             : ev.kind === 'nonzero_start'
               ? safeHtml`invalid initial offset (<code>L1=${ev.offset} != 0</code>)`
               : ev.kind === 'empty'
@@ -2619,9 +3298,10 @@ function buildGeminiContextMarkdown(step) {
     nearby.push(`${marker}Step ${s.step}: ${s.kind} in ${s.func}() (${stepSourceFile(s)}:${s.line}) curr=${s.curr[2]}[${s.curr[0]}..${s.curr[1]}] lex_state=${s.lex_state}${s._isRewind ? ' [REWIND ' + s._rewindDelta + 'B]' : ''}`);
   }
   const nodes = step._astSnapshot || [];
-  const srcByteLen = typeof currentTrace._sourceByteLen === 'number'
+  const srcByteLen = effectiveStepByteLen(step, currentTrace);
+  const fullByteLen = typeof currentTrace._sourceByteLen === 'number'
     ? currentTrace._sourceByteLen
-    : new TextEncoder().encode(currentTrace.source || '').length;
+    : srcByteLen;
   const underflows = nodes.filter(n => isNodeUnderflow(n, srcByteLen));
   const oobs = nodes.filter(n => isNodeOutOfBounds(n, srcByteLen));
   const comments = step._commentsSnapshot || [];
@@ -2629,12 +3309,14 @@ function buildGeminiContextMarkdown(step) {
   const diags = step._diagnosticsSnapshot || [];
   const invEvents = currentTrace._invariantEvents || [];
   const crashStep = currentTrace._crashIdx >= 0 ? currentTrace.steps[currentTrace._crashIdx] : null;
+  const optsQuery = serializeOptionsToQuery(currentParserOptions);
 
   return [
     `# Prism Ruby Parser Trace Context`,
     `- Prism Version: v${PRISM_BUILD_INFO.version} (${PRISM_BUILD_INFO.describe}, commit ${PRISM_BUILD_INFO.short_sha})`,
     `- Trace Name: ${currentTrace.name}`,
-    `- Ruby Source (${srcByteLen} bytes): ${JSON.stringify(currentTrace.source)}`,
+    optsQuery ? `- Parser Options (pm_options_t): ${optsQuery}` : '',
+    `- Ruby Source (${fullByteLen} bytes${srcByteLen !== fullByteLen ? `, active stream slice ${srcByteLen} bytes` : ''}): ${JSON.stringify(currentTrace.source)}`,
     `- Current Step: ${step.step} / ${total - 1}`,
     `- Event: ${step.kind} at ${srcFile}:${step.line} in ${step.func}()`,
     `- lex_state: ${step.lex_state}`,
@@ -2786,9 +3468,7 @@ function renderAstForest(step) {
   const prevAstScrollTop = astPaneBody ? astPaneBody.scrollTop : 0;
   treeBox.innerHTML = '';
   orphansBox.innerHTML = '';
-  const srcByteLen = typeof currentTrace._sourceByteLen === 'number'
-    ? currentTrace._sourceByteLen
-    : new TextEncoder().encode(currentTrace.source || '').length;
+  const srcByteLen = effectiveStepByteLen(step, currentTrace);
   const underflowCount = nodes.filter(n => Boolean(nodeAnomalyKind(n, srcByteLen))).length;
 
   if (nodes.length === 0) {
@@ -3017,12 +3697,48 @@ document.getElementById('btnOpenRb').addEventListener('click', () => {
   document.getElementById('rbFileInput').click();
 });
 
+document.getElementById('btnToggleOptions').addEventListener('click', () => {
+  const panel = document.getElementById('parserOptionsPanel');
+  if (!panel) return;
+  const opening = panel.style.display !== 'block';
+  panel.style.display = opening ? 'block' : 'none';
+  if (opening) syncOptionsFormFromState();
+});
+
+document.getElementById('btnApplyOptions').addEventListener('click', async () => {
+  readOptionsStateFromForm();
+  await reparseCurrentWithOptions();
+});
+
+document.getElementById('btnResetOptions').addEventListener('click', async () => {
+  currentParserOptions = defaultParserOptions();
+  syncOptionsFormFromState();
+  await reparseCurrentWithOptions();
+});
+
+document.querySelectorAll('#parserOptionsPanel input[type="checkbox"], #parserOptionsPanel select').forEach(el => {
+  el.addEventListener('change', async () => {
+    readOptionsStateFromForm();
+    await reparseCurrentWithOptions();
+  });
+});
+
+['optEnc', 'optLine', 'optFilepath', 'optBudget', 'optScopes'].forEach(id => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      readOptionsStateFromForm();
+      await reparseCurrentWithOptions();
+    }
+  });
+});
+
 document.getElementById('btnShareCode').addEventListener('click', async () => {
-  const editor = document.getElementById('rubyEditor');
-  const isEditing = editor.style.display !== 'none';
-  const rubyCode = isEditing ? editor.value : (currentTrace ? currentTrace.source : '');
-  const shareUrl = buildShareableUrl(rubyCode, currentIdx);
-  updateBrowserUrlWithCode(rubyCode, currentIdx);
+  const srcInput = getActiveSourceInput();
+  const shareUrl = buildShareableUrl(srcInput, currentIdx);
+  updateBrowserUrlWithCode(srcInput, currentIdx);
   const btn = document.getElementById('btnShareCode');
   const orig = btn.textContent;
   try {
@@ -3066,6 +3782,7 @@ function getKindBadgeStyle(kind) {
     case 'WARNING':
       return { bg: 'rgba(210, 153, 34, 0.22)', fg: '#d29922', border: '#d29922' };
     case 'HEREDOC_FLUSH':
+    case 'STREAM_PASS':
       return { bg: 'rgba(188, 140, 255, 0.25)', fg: '#bc8cff', border: '#bc8cff' };
     case 'NODE_NEW':
     case 'NODE_LIST_APPEND':
@@ -3088,6 +3805,7 @@ function buildCanvasSourceModel(src) {
 
   for (let i = 0; i <= src.length; i++) {
     const ch = i < src.length ? src[i] : 'EOF';
+    const code = i < src.length ? src.charCodeAt(i) : -1;
     let display = ch;
     let isMeta = false;
     let units = 1;
@@ -3107,6 +3825,10 @@ function buildCanvasSourceModel(src) {
       display = '→ ';
       isMeta = true;
       units = 2;
+    } else if (code >= 0 && (code < 0x20 || (code >= 0x7f && code <= 0xff))) {
+      display = `\\x${code.toString(16).padStart(2, '0')}`;
+      isMeta = true;
+      units = 4;
     }
     const cell = {
       offset: i,
@@ -3845,10 +4567,11 @@ document.getElementById('rbFileInput').addEventListener('change', (e) => {
   if (!file) return;
   const reader = new FileReader();
   reader.onload = () => {
-    document.getElementById('rubyEditor').value = reader.result;
-    parseWithWasm(reader.result, file.name);
+    const bytes = new Uint8Array(reader.result);
+    document.getElementById('rubyEditor').value = bytesToSourcePayload(bytes).text;
+    parseWithWasm(bytes, file.name);
   };
-  reader.readAsText(file);
+  reader.readAsArrayBuffer(file);
 });
 
 document.getElementById('btnPlayPause').addEventListener('click', togglePlayback);
@@ -3934,8 +4657,17 @@ function attachTrackScrubber(trackEl) {
 attachTrackScrubber(document.getElementById('timelineTrack'));
 
 presetSelect.addEventListener('change', async (e) => {
-  clearBrowserUrlCodeParam();
   const preset = PRESETS[parseInt(e.target.value, 10)];
+  if (preset && typeof preset.options_query === 'string' && preset.options_query) {
+    currentParserOptions = parseOptionsFromQueryString(preset.options_query);
+  } else if (preset && preset.options && typeof preset.options === 'object') {
+    currentParserOptions = normalizeParserOptions(preset.options);
+  } else {
+    currentParserOptions = defaultParserOptions();
+  }
+  currentRawSourceBytes = null;
+  syncOptionsFormFromState();
+  clearBrowserUrlCodeParam();
   if (!preset) return;
   if (preset.steps) {
     loadTrace(preset);
@@ -3956,10 +4688,20 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
     if (steps.length > 0 && steps[steps.length - 1] && steps[steps.length - 1].summary) {
       leakSummary = steps.pop();
     }
+    if (meta && typeof meta.options_query === 'string' && meta.options_query) {
+      currentParserOptions = parseOptionsFromQueryString(meta.options_query);
+    } else if (meta && meta.options && typeof meta.options === 'object') {
+      currentParserOptions = normalizeParserOptions(meta.options);
+    } else {
+      currentParserOptions = defaultParserOptions();
+    }
+    currentRawSourceBytes = null;
+    syncOptionsFormFromState();
     loadTrace({
       name: file.name,
       source: meta.source,
       byte_length: typeof meta.length === 'number' ? meta.length : undefined,
+      options: meta.options || null,
       steps,
       leak_summary: leakSummary
     });
@@ -4239,8 +4981,9 @@ function buildTraceSummaryObject() {
   const srcByteLen = typeof currentTrace._sourceByteLen === 'number'
     ? currentTrace._sourceByteLen
     : new TextEncoder().encode(currentTrace.source || '').length;
+  const lastStepByteLen = effectiveStepByteLen(lastStep, currentTrace);
   const lo = lastStep.line_offsets || [];
-  const badLineOffsets = collectStepLineOffsetAnomalies(lastStep, srcByteLen).map(la => ({
+  const badLineOffsets = collectStepLineOffsetAnomalies(lastStep, lastStepByteLen).map(la => ({
     lineIndex: la.line > 0 ? la.line - 1 : 0,
     line: la.line,
     kind: la.kind,
@@ -4252,6 +4995,7 @@ function buildTraceSummaryObject() {
   const lastDiags = lastStep._diagnosticsSnapshot || [];
   const crashStep = currentTrace._crashIdx >= 0 ? steps[currentTrace._crashIdx] : null;
   const { wasm_b64, ...cleanBuildInfo } = PRISM_BUILD_INFO || {};
+  const optsQuery = serializeOptionsToQuery(currentParserOptions);
   return {
     name: currentTrace.name,
     prismBuild: cleanBuildInfo,
@@ -4263,7 +5007,9 @@ function buildTraceSummaryObject() {
     })),
     source: currentTrace.source,
     sourceBytes: srcByteLen,
-    shareUrl: buildShareableUrl(currentTrace.source),
+    options: hasActiveParserOptions() ? { ...currentParserOptions } : null,
+    optionsQuery: optsQuery,
+    shareUrl: buildShareableUrl(getActiveSourceInput()),
     currentStepIndex: currentIdx,
     totalSteps: steps.length,
     lexTokenCount: steps.filter(s => s.kind === 'LEX_TOKEN').length,
@@ -4389,7 +5135,7 @@ async function registerWebMcpTools() {
   const toolDefs = [
     {
       name: 'parse_and_trace',
-      description: 'Parse and trace a Ruby source snippet in the live Prism Wasm visualizer, update the UI and shareable URL (?code=), and return a structured summary of steps, tokens, crashes, AST/comment/diagnostic location invariants, and line_offsets anomalies.',
+      description: 'Parse and trace a Ruby source snippet in the live Prism Wasm visualizer with optional pm_options_t / pm_parse_stream settings, update the UI and shareable URL (?code=), and return a structured summary of steps, tokens, crashes, AST/comment/diagnostic location invariants, and line_offsets anomalies.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -4400,6 +5146,9 @@ async function registerWebMcpTools() {
           version: {
             type: 'string',
             description: `Optional Prism version ID to trace with (${PRISM_VERSIONS.map(v => v.id).join(', ')}).`
+          },
+          options: {
+            description: 'Optional pm_options_t / pm_parse_stream configuration, passed either as a URL query string (e.g. "enc=ASCII-8BIT&ruby_ver=3.3&cmd=al&stream=1") or as an object ({ enc, ruby_ver, line, cmd, main, partial, freeze, comments, enc_lock, frozen_lit, stream, filepath, shebang_cb, budget, scopes }). Pass null or "" to reset options to defaults.'
           },
           jumpTo: {
             type: 'string',
@@ -4412,6 +5161,16 @@ async function registerWebMcpTools() {
       handler: async (input) => {
         if (input && input.version) {
           await selectPrismVersion(input.version, false);
+        }
+        if (input && input.options !== undefined) {
+          if (input.options === null || input.options === '') {
+            currentParserOptions = defaultParserOptions();
+          } else if (typeof input.options === 'string') {
+            currentParserOptions = parseOptionsFromQueryString(input.options);
+          } else if (typeof input.options === 'object') {
+            currentParserOptions = normalizeParserOptions(input.options);
+          }
+          syncOptionsFormFromState();
         }
         const code = String(input && input.code !== undefined ? input.code : '');
         document.getElementById('rubyEditor').value = code;
@@ -4515,7 +5274,7 @@ async function registerWebMcpTools() {
         properties: {
           kind: {
             type: 'string',
-            description: 'Optional event kind filter (e.g. LEX_TOKEN, LEX_MODE_PUSH, LEX_MODE_POP, HEREDOC_FLUSH, PARSE_ENTER, PARSE_EXIT, NODE_NEW, ERROR, WARNING, POST_PARSE, CRASH).'
+            description: 'Optional event kind filter (e.g. LEX_TOKEN, LEX_MODE_PUSH, LEX_MODE_POP, HEREDOC_FLUSH, PARSE_ENTER, PARSE_EXIT, NODE_NEW, ERROR, WARNING, STREAM_PASS, POST_PARSE, CRASH).'
           },
           func: {
             type: 'string',
@@ -4626,7 +5385,12 @@ async function registerWebMcpTools() {
   const versionParam = params.get('version');
   const codeParam = params.get('code');
   const stepParam = params.get('step');
-  const hasCodeParam = (codeParam !== null && codeParam !== '');
+  const { opts: urlOpts, hasAny: hasOptsParam } = parseOptionsFromSearchParams(params);
+  if (hasOptsParam) {
+    currentParserOptions = urlOpts;
+    syncOptionsFormFromState();
+  }
+  const hasCodeParam = (codeParam !== null);
   if (versionParam) {
     await selectPrismVersion(versionParam, false);
   } else {
@@ -4634,9 +5398,9 @@ async function registerWebMcpTools() {
   }
   if (hasCodeParam) {
     try {
-      const decoded = decodeCodeBase64(codeParam);
-      document.getElementById('rubyEditor').value = decoded;
-      await parseWithWasm(decoded, 'Shared URL Snippet');
+      const rawBytes = decodeCodeBase64Bytes(codeParam);
+      document.getElementById('rubyEditor').value = bytesToSourcePayload(rawBytes).text;
+      await parseWithWasm(rawBytes, 'Shared URL Snippet');
     } catch (err) {
       setSafeHtml(
         document.getElementById('wasmStatus'),
@@ -4644,7 +5408,16 @@ async function registerWebMcpTools() {
       );
     }
   } else if (PRESETS[0]) {
-    if (PRESETS[0].steps) {
+    if (!hasOptsParam) {
+      if (typeof PRESETS[0].options_query === 'string' && PRESETS[0].options_query) {
+        currentParserOptions = parseOptionsFromQueryString(PRESETS[0].options_query);
+        syncOptionsFormFromState();
+      } else if (PRESETS[0].options && typeof PRESETS[0].options === 'object') {
+        currentParserOptions = normalizeParserOptions(PRESETS[0].options);
+        syncOptionsFormFromState();
+      }
+    }
+    if (PRESETS[0].steps && !hasOptsParam) {
       loadTrace(PRESETS[0]);
     } else {
       await parseWithWasm(PRESETS[0].source, PRESETS[0].name, false);
