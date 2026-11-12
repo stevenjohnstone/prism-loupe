@@ -14,6 +14,8 @@ int g_trace_call_depth = 0;
 int g_trace_in_hook = 0;
 int g_trace_crashed = 0;
 static uint64_t g_last_ast_hash = 0;
+static const pm_list_node_t *g_last_emitted_error_tail = NULL;
+static const pm_list_node_t *g_last_emitted_warning_tail = NULL;
 static prism_trace_crash_cb_t g_trace_crash_cb = NULL;
 
 static int g_trace_xalloc_tracking = 0;
@@ -188,6 +190,8 @@ prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps) {
     g_trace_in_hook = 0;
     g_trace_crashed = 0;
     g_last_ast_hash = 0;
+    g_last_emitted_error_tail = NULL;
+    g_last_emitted_warning_tail = NULL;
     g_trace_xalloc_tracking = 0;
     g_trace_xalloc_raw_live_bytes = (buf != NULL && buf->value != NULL) ? (((prism_trace_alloc_hdr_t *) buf->value) - 1)->size : 0;
     g_trace_xalloc_live_bytes = 0;
@@ -197,6 +201,37 @@ prism_trace_reset(pm_buffer_t *buf, uint64_t max_steps) {
     g_trace_xalloc_free_count = 0;
     g_trace_xalloc_live_blocks = 0;
     g_trace_event_start_len = 0;
+}
+
+static void
+json_escape_to_cstr(char *dst, size_t dst_cap, const char *src, size_t max_src_bytes) {
+    if (dst_cap == 0) return;
+    size_t pos = 0;
+    if (pos + 1 < dst_cap) dst[pos++] = '"';
+    if (src != NULL) {
+        for (size_t i = 0; src[i] != '\0' && i < max_src_bytes; i++) {
+            if (pos + 8 >= dst_cap) break;
+            uint8_t c = (uint8_t)src[i];
+            switch (c) {
+                case '"':  dst[pos++] = '\\'; dst[pos++] = '"'; break;
+                case '\\': dst[pos++] = '\\'; dst[pos++] = '\\'; break;
+                case '\b': dst[pos++] = '\\'; dst[pos++] = 'b'; break;
+                case '\f': dst[pos++] = '\\'; dst[pos++] = 'f'; break;
+                case '\n': dst[pos++] = '\\'; dst[pos++] = 'n'; break;
+                case '\r': dst[pos++] = '\\'; dst[pos++] = 'r'; break;
+                case '\t': dst[pos++] = '\\'; dst[pos++] = 't'; break;
+                default:
+                    if (c < 0x20 || c >= 0x7f) {
+                        pos += (size_t)snprintf(dst + pos, dst_cap - pos, "\\u%04x", (unsigned)c);
+                    } else {
+                        dst[pos++] = (char)c;
+                    }
+                    break;
+            }
+        }
+    }
+    if (pos + 1 < dst_cap) dst[pos++] = '"';
+    dst[pos] = '\0';
 }
 
 static void
@@ -425,25 +460,72 @@ measure_arena(const pm_arena_t *arena, size_t *out_used, size_t *out_cap, size_t
 }
 #endif
 
+static const char *
+diag_type_name(const pm_diagnostic_t *diag) {
+    if (diag == NULL) return "UNKNOWN";
+#if PRISM_TRACE_HAS_DIAG_TYPE_FN
+    const char *dtype = pm_diagnostic_type(diag);
+#else
+    const char *dtype = pm_diagnostic_id_human(diag->diag_id);
+#endif
+    return dtype != NULL ? dtype : "UNKNOWN";
+}
+
+static void
+emit_diag_hook_event(
+    const pm_parser_t *parser,
+    const pm_list_t *list,
+    const pm_list_node_t **last_tail_slot,
+    const char *event_kind,
+    const char *severity,
+    const char *func,
+    int line
+) {
+    if (parser == NULL || g_trace_buf == NULL || g_trace_in_hook) return;
+    const pm_list_node_t *tail = list != NULL ? list->tail : NULL;
+    if (tail != NULL && tail == *last_tail_slot) return;
+    *last_tail_slot = tail;
+
+    const pm_diagnostic_t *diag = (const pm_diagnostic_t *)tail;
+    if (diag != NULL) {
+        uint32_t d_start = loc_start_offset(parser, &diag->location);
+        uint32_t d_len = loc_length_bytes(&diag->location);
+        uint32_t d_end = d_start + d_len;
+        char esc_type[256];
+        char esc_msg[1152];
+        char detail[1600];
+        json_escape_to_cstr(esc_type, sizeof(esc_type), diag_type_name(diag), 96);
+        json_escape_to_cstr(esc_msg, sizeof(esc_msg), diag->message ? diag->message : "", 180);
+        snprintf(
+            detail,
+            sizeof(detail),
+            "{\"severity\":\"%s\",\"diag_type\":%s,\"message\":%s,\"level\":%u,"
+            "\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"length\":%" PRIu32 ",\"len\":%" PRIu32 "}",
+            severity,
+            esc_type,
+            esc_msg,
+            (unsigned)diag->level,
+            d_start,
+            d_end,
+            d_len,
+            d_len
+        );
+        prism_trace_emit_event(parser, event_kind, func, line, detail, 0);
+    } else {
+        prism_trace_emit_event(parser, event_kind, func, line, NULL, 0);
+    }
+}
+
 void
 prism_trace_emit_last_error(const pm_parser_t *parser, const char *func, int line) {
     if (parser == NULL) return;
-    const pm_diagnostic_t *diag = (const pm_diagnostic_t *) parser->error_list.tail;
-    char buf[512];
-    if (diag != NULL) {
-#if PRISM_TRACE_HAS_DIAG_TYPE_FN
-        const char *dtype = pm_diagnostic_type(diag);
-#else
-        const char *dtype = pm_diagnostic_id_human(diag->diag_id);
-#endif
-        uint32_t d_start = loc_start_offset(parser, &diag->location);
-        uint32_t d_len = loc_length_bytes(&diag->location);
-        snprintf(buf, sizeof(buf), "{\"diag_type\":\"%s\",\"start\":%" PRIu32 ",\"length\":%" PRIu32 "}",
-                 dtype ? dtype : "ERROR", d_start, d_len);
-        prism_trace_emit_event(parser, "ERROR", func, line, buf, 0);
-    } else {
-        prism_trace_emit_event(parser, "ERROR", func, line, NULL, 0);
-    }
+    emit_diag_hook_event(parser, &parser->error_list, &g_last_emitted_error_tail, "ERROR", "error", func, line);
+}
+
+void
+prism_trace_emit_last_warning(const pm_parser_t *parser, const char *func, int line) {
+    if (parser == NULL) return;
+    emit_diag_hook_event(parser, &parser->warning_list, &g_last_emitted_warning_tail, "WARNING", "warning", func, line);
 }
 
 void

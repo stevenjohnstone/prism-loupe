@@ -57,6 +57,7 @@ void prism_trace_emit_event(
 );
 
 void prism_trace_emit_last_error(const pm_parser_t *parser, const char *func, int line);
+void prism_trace_emit_last_warning(const pm_parser_t *parser, const char *func, int line);
 
 static inline bool
 prism_trace_emit_bool(bool result, const pm_parser_t *parser, const char *kind, const char *func, int line) {

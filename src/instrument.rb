@@ -207,14 +207,28 @@ def instrument_prism_c(src_path, out_path)
     ['#define lex_state_set(p_, s_) (lex_state_set((p_), (s_)), prism_trace_emit_event((p_), "LEX_STATE", __func__, __LINE__, NULL, 0))']
   )
 
-  # 4. Hook pm_parser_err and all pm_parser_err_* wrappers dynamically by signature
-  err_funcs = orig_content.scan(/^(pm_parser_err(?:_[a-z0-9_]+)?)\(/).flatten.uniq
-  raise "Could not find any pm_parser_err* functions in #{src_path}" if err_funcs.empty?
+  # 4. Hook pm_parser_err*, PM_PARSER_ERR_FORMAT, pm_parser_warn*, and PM_PARSER_WARN_FORMAT
+  top_header_slice = orig_content.lines.first(1000).join
+  top_err_funcs = top_header_slice.scan(/^(pm_parser_err(?:_[a-z0-9_]+)?)\(/).flatten.uniq
+  raise "Could not find any top-level pm_parser_err* functions in #{src_path}" if top_err_funcs.empty?
+  top_warn_funcs = top_header_slice.scan(/^(pm_parser_warn(?:_[a-z0-9_]+)?)\(/).flatten.uniq
 
-  err_macros = err_funcs.map do |fn|
+  diag_macros = top_err_funcs.map do |fn|
     "#define #{fn}(p_, ...) (#{fn}((p_), __VA_ARGS__), prism_trace_emit_last_error((p_), __func__, __LINE__))"
   end
-  inject_after_function!(content, orig_content, err_funcs.last, err_macros)
+  if (err_fmt = orig_content.match(/^#define\s+(PM_PARSER_ERR_FORMAT\(([^,)]+),[^\n]*?\))\s*\\\n\s*(pm_diagnostic_list_append_format\([^\n]+)$/))
+    diag_macros << "#undef PM_PARSER_ERR_FORMAT"
+    diag_macros << "#define #{err_fmt[1]} (#{err_fmt[3]}, prism_trace_emit_last_error((#{err_fmt[2].strip}), __func__, __LINE__))"
+  end
+  top_warn_funcs.each do |fn|
+    diag_macros << "#define #{fn}(p_, ...) (#{fn}((p_), __VA_ARGS__), prism_trace_emit_last_warning((p_), __func__, __LINE__))"
+  end
+  if (warn_fmt = orig_content.match(/^#define\s+(PM_PARSER_WARN_FORMAT\(([^,)]+),[^\n]*?\))\s*\\\n\s*(pm_diagnostic_list_append_format\([^\n]+)$/))
+    diag_macros << "#undef PM_PARSER_WARN_FORMAT"
+    diag_macros << "#define #{warn_fmt[1]} (#{warn_fmt[3]}, prism_trace_emit_last_warning((#{warn_fmt[2].strip}), __func__, __LINE__))"
+  end
+  diag_anchor = (top_err_funcs + top_warn_funcs).max_by { |fn| orig_content.index(/^#{Regexp.escape(fn)}\(/) || 0 }
+  inject_after_function!(content, orig_content, diag_anchor, diag_macros)
 
   # 5. Hook parser_lex_callback by signature
   inject_after_function!(
