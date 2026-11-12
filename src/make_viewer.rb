@@ -2622,8 +2622,12 @@ function buildGeminiContextMarkdown(step) {
   const srcByteLen = typeof currentTrace._sourceByteLen === 'number'
     ? currentTrace._sourceByteLen
     : new TextEncoder().encode(currentTrace.source || '').length;
-  const underflows = nodes.filter(n => isNodeUnderflow(n));
+  const underflows = nodes.filter(n => isNodeUnderflow(n, srcByteLen));
   const oobs = nodes.filter(n => isNodeOutOfBounds(n, srcByteLen));
+  const comments = step._commentsSnapshot || [];
+  const magicComments = step._magicCommentsSnapshot || [];
+  const diags = step._diagnosticsSnapshot || [];
+  const invEvents = currentTrace._invariantEvents || [];
   const crashStep = currentTrace._crashIdx >= 0 ? currentTrace.steps[currentTrace._crashIdx] : null;
 
   return [
@@ -2640,10 +2644,12 @@ function buildGeminiContextMarkdown(step) {
     `- lex_modes stack (top->bottom): ${JSON.stringify(step.lex_modes)}`,
     `- parser call_stack: ${step.call_stack.join(' -> ')}`,
     `- line_offsets (${step.line_offsets.length}): [${step.line_offsets.join(', ')}]`,
+    `- Comments: ${comments.length} comment(s), ${magicComments.length} magic comment(s)`,
+    `- Diagnostics: ${diags.filter(d => d.severity !== 'warning').length} error(s), ${diags.filter(d => d.severity === 'warning').length} warning(s)`,
     `- Arena Memory Used/Cap: AST=${step.mem ? step.mem.ast[0] : 0}/${step.mem ? step.mem.ast[1] : 0}B, Meta=${step.mem ? step.mem.meta[0] : 0}/${step.mem ? step.mem.meta[1] : 0}B, Scratch=${step.mem ? step.mem.scratch[0] : 0}/${step.mem ? step.mem.scratch[1] : 0}B`,
     `- Allocated AST Nodes: ${nodes.length} (${underflows.length} underflowed, ${oobs.length} out-of-bounds locations)`,
-    (currentTrace._underflowEvents && currentTrace._underflowEvents.length > 0)
-      ? `- DETECTED CORRUPTED NODES: ` + currentTrace._underflowEvents.map(ev => `#${ev.node.id} ${ev.node.type} [${ev.kind === 'oob' ? 'OUT_OF_BOUNDS' : 'UNDERFLOW'} start=${ev.node.start}, end=${ev.node.end}, len=${ev.node.len}] detected at Step ${ev.step} in ${ev.func}() (${ev.file}:${ev.line})`).join('; ')
+    invEvents.length > 0
+      ? `- DETECTED PARSER INVARIANT VIOLATIONS: ` + invEvents.map(ev => `${ev.category}#${ev.targetId} ${ev.targetType} [${ev.kind.toUpperCase()} start=${ev.start}, end=${ev.end}, len=${ev.len}] detected at Step ${ev.step} in ${ev.func}() (${ev.file}:${ev.line})`).join('; ')
       : '',
     crashStep ? `- INTERCEPTED CRASH at Step ${crashStep.step}: ${JSON.stringify(crashStep.detail)}` : '',
     `\n## Surrounding Trace Steps (${startWin}..${endWin}):\n` + nearby.join('\n')
@@ -4230,13 +4236,20 @@ function buildTraceSummaryObject() {
   if (!currentTrace) return { loaded: false };
   const steps = currentTrace.steps || [];
   const lastStep = steps[steps.length - 1] || {};
+  const srcByteLen = typeof currentTrace._sourceByteLen === 'number'
+    ? currentTrace._sourceByteLen
+    : new TextEncoder().encode(currentTrace.source || '').length;
   const lo = lastStep.line_offsets || [];
-  const badLineOffsets = [];
-  for (let i = 1; i < lo.length; i++) {
-    if (lo[i] <= lo[i - 1]) {
-      badLineOffsets.push({ lineIndex: i, offset: lo[i], prevOffset: lo[i - 1] });
-    }
-  }
+  const badLineOffsets = collectStepLineOffsetAnomalies(lastStep, srcByteLen).map(la => ({
+    lineIndex: la.line > 0 ? la.line - 1 : 0,
+    line: la.line,
+    kind: la.kind,
+    offset: la.offset,
+    prevOffset: la.prev
+  }));
+  const lastComments = lastStep._commentsSnapshot || [];
+  const lastMagicComments = lastStep._magicCommentsSnapshot || [];
+  const lastDiags = lastStep._diagnosticsSnapshot || [];
   const crashStep = currentTrace._crashIdx >= 0 ? steps[currentTrace._crashIdx] : null;
   const { wasm_b64, ...cleanBuildInfo } = PRISM_BUILD_INFO || {};
   return {
@@ -4249,7 +4262,7 @@ function buildTraceSummaryObject() {
       date: v.date
     })),
     source: currentTrace.source,
-    sourceBytes: new TextEncoder().encode(currentTrace.source).length,
+    sourceBytes: srcByteLen,
     shareUrl: buildShareableUrl(currentTrace.source),
     currentStepIndex: currentIdx,
     totalSteps: steps.length,
@@ -4278,8 +4291,59 @@ function buildTraceSummaryObject() {
       file: ev.file,
       line: ev.line
     })),
+    commentsCount: lastComments.length,
+    magicCommentsCount: lastMagicComments.length,
+    errorsCount: typeof lastStep.errors === 'number'
+      ? lastStep.errors
+      : lastDiags.filter(d => d.severity !== 'warning').length,
+    warningsCount: typeof lastStep.warnings === 'number'
+      ? lastStep.warnings
+      : lastDiags.filter(d => d.severity === 'warning').length,
+    commentAnomalies: (currentTrace._commentAnomalyEvents || []).map(ev => ({
+      stepIndex: ev.stepIdx,
+      step: ev.step,
+      category: ev.category,
+      kind: ev.kind,
+      id: ev.targetId,
+      type: ev.targetType,
+      start: ev.start,
+      end: ev.end,
+      len: ev.len,
+      func: ev.func,
+      file: ev.file,
+      line: ev.line
+    })),
+    diagnosticAnomalies: (currentTrace._diagAnomalyEvents || []).map(ev => ({
+      stepIndex: ev.stepIdx,
+      step: ev.step,
+      severity: ev.severity,
+      kind: ev.kind,
+      id: ev.targetId,
+      type: ev.targetType,
+      message: ev.message,
+      start: ev.start,
+      end: ev.end,
+      len: ev.len,
+      func: ev.func,
+      file: ev.file,
+      line: ev.line
+    })),
     lineOffsetsCount: lo.length,
-    lineOffsetAnomalies: badLineOffsets
+    lineOffsetAnomalies: badLineOffsets,
+    invariantViolations: (currentTrace._invariantEvents || []).map(ev => ({
+      stepIndex: ev.stepIdx,
+      step: ev.step,
+      category: ev.category,
+      kind: ev.kind,
+      targetId: ev.targetId,
+      targetType: ev.targetType,
+      start: ev.start,
+      end: ev.end,
+      len: ev.len,
+      func: ev.func,
+      file: ev.file,
+      line: ev.line
+    }))
   };
 }
 
@@ -4305,10 +4369,16 @@ function buildStepStateObject(idx = currentIdx) {
     contexts: s.contexts || [],
     callStack: s.call_stack || [],
     lineOffsets: s.line_offsets || [],
+    lineOffsetAnomalies: s._loAnomalies || [],
     errors: s.errors || 0,
+    warnings: s.warnings || 0,
+    diagnostics: s._diagnosticsSnapshot || [],
+    comments: s._commentsSnapshot || [],
+    magicComments: s._magicCommentsSnapshot || [],
     isRewind: Boolean(s._isRewind),
     rewindDelta: s._rewindDelta || 0,
     hasNewUnderflow: Boolean(s._hasNewUnderflow),
+    hasNewInvariant: Boolean(s._hasNewInvariant),
     memUsedBytes: s._memTotalUsed || 0,
     memCapBytes: s._memTotalCap || 0,
     astNodes: s._astSnapshot || []
@@ -4319,7 +4389,7 @@ async function registerWebMcpTools() {
   const toolDefs = [
     {
       name: 'parse_and_trace',
-      description: 'Parse and trace a Ruby source snippet in the live Prism Wasm visualizer, update the UI and shareable URL (?code=), and return a structured summary of steps, tokens, crashes, AST location underflows, and line_offsets anomalies.',
+      description: 'Parse and trace a Ruby source snippet in the live Prism Wasm visualizer, update the UI and shareable URL (?code=), and return a structured summary of steps, tokens, crashes, AST/comment/diagnostic location invariants, and line_offsets anomalies.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -4333,7 +4403,7 @@ async function registerWebMcpTools() {
           },
           jumpTo: {
             type: 'string',
-            enum: ['start', 'end', 'crash', 'underflow'],
+            enum: ['start', 'end', 'crash', 'underflow', 'anomaly', 'invariant'],
             description: 'Optional position to move the playhead to after tracing (default: start).'
           }
         },
@@ -4349,7 +4419,7 @@ async function registerWebMcpTools() {
         if (input && input.jumpTo && currentTrace) {
           if (input.jumpTo === 'crash' && currentTrace._crashIdx >= 0) {
             jumpToStep(currentTrace._crashIdx);
-          } else if (input.jumpTo === 'underflow' && currentTrace._underflowIdx >= 0) {
+          } else if ((input.jumpTo === 'underflow' || input.jumpTo === 'anomaly' || input.jumpTo === 'invariant') && currentTrace._underflowIdx >= 0) {
             jumpToStep(currentTrace._underflowIdx);
           } else if (input.jumpTo === 'end') {
             jumpToStep(currentTrace.steps.length - 1);
@@ -4362,7 +4432,7 @@ async function registerWebMcpTools() {
     },
     {
       name: 'get_trace_summary',
-      description: 'Return metadata and anomaly summary for the currently loaded Prism trace (Prism version/SHA, Ruby source, total steps, crash details, AST node location underflows, duplicate/out-of-order line_offsets, peak arena memory, and shareable URL).',
+      description: 'Return metadata and invariant summary for the currently loaded Prism trace (Prism version/SHA, Ruby source, total steps, crash details, AST node / comment / diagnostic location underflows & OOB, duplicate/overlapping comments, line_offsets anomalies, peak arena memory, and shareable URL).',
       inputSchema: {
         type: 'object',
         properties: {}
@@ -4371,7 +4441,7 @@ async function registerWebMcpTools() {
     },
     {
       name: 'get_step_state',
-      description: 'Get the complete lexer, parser, call stack, line_offsets, memory, and AST snapshot for a trace step (defaults to the currently displayed step).',
+      description: 'Get the complete lexer, parser, call stack, line_offsets, comments, diagnostics, memory, and AST snapshot for a trace step (defaults to the currently displayed step).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -4398,20 +4468,20 @@ async function registerWebMcpTools() {
           jumpToStep(targetIdx);
         }
         if (input.format === 'markdown') {
-          return { stepIndex: targetIdx, markdown: buildGeminiContextMarkdown() };
+          return { stepIndex: targetIdx, markdown: buildGeminiContextMarkdown(currentTrace.steps[targetIdx]) };
         }
         return buildStepStateObject(targetIdx);
       }
     },
     {
       name: 'jump_to_step',
-      description: 'Move the visualizer playhead to a specific step number or semantic landmark (crash, underflow, next_token, prev_token, next_ast, prev_ast, next_alloc, prev_alloc, next_rewind, prev_rewind, start, end) and return that step state.',
+      description: 'Move the visualizer playhead to a specific step number or semantic landmark (crash, anomaly, invariant, underflow, next_token, prev_token, next_ast, prev_ast, next_alloc, prev_alloc, next_rewind, prev_rewind, start, end) and return that step state.',
       inputSchema: {
         type: 'object',
         properties: {
           target: {
             type: 'string',
-            description: "Step number (e.g. '42') or landmark: 'crash', 'underflow', 'next_token', 'prev_token', 'next_ast', 'prev_ast', 'next_alloc', 'prev_alloc', 'next_rewind', 'prev_rewind', 'start', 'end'."
+            description: "Step number (e.g. '42') or landmark: 'crash', 'anomaly', 'invariant', 'underflow', 'next_token', 'prev_token', 'next_ast', 'prev_ast', 'next_alloc', 'prev_alloc', 'next_rewind', 'prev_rewind', 'start', 'end'."
           }
         },
         required: ['target']
@@ -4419,7 +4489,7 @@ async function registerWebMcpTools() {
       handler: async (input = {}) => {
         const t = String(input.target || '').trim();
         if (t === 'crash' && currentTrace._crashIdx >= 0) jumpToStep(currentTrace._crashIdx);
-        else if (t === 'underflow') document.getElementById('btnJumpUnderflow').click();
+        else if (t === 'underflow' || t === 'anomaly' || t === 'invariant') document.getElementById('btnJumpUnderflow').click();
         else if (t === 'next_token') stepToKind(['LEX_TOKEN'], 1);
         else if (t === 'prev_token') stepToKind(['LEX_TOKEN'], -1);
         else if (t === 'next_ast') stepToKind(['NODE_NEW', 'NODE_LIST_APPEND'], 1);
@@ -4439,13 +4509,13 @@ async function registerWebMcpTools() {
     },
     {
       name: 'search_trace_steps',
-      description: 'Filter trace steps by event kind, C function name, cursor rewind, or AST location underflow to quickly locate key transitions.',
+      description: 'Filter trace steps by event kind, C function name, cursor rewind, or invariant violation (node, comment, diagnostic, or line_offset) to quickly locate key transitions.',
       inputSchema: {
         type: 'object',
         properties: {
           kind: {
             type: 'string',
-            description: 'Optional event kind filter (e.g. LEX_TOKEN, LEX_MODE_PUSH, LEX_MODE_POP, HEREDOC_FLUSH, PARSE_ENTER, PARSE_EXIT, NODE_NEW, ERROR, CRASH).'
+            description: 'Optional event kind filter (e.g. LEX_TOKEN, LEX_MODE_PUSH, LEX_MODE_POP, HEREDOC_FLUSH, PARSE_ENTER, PARSE_EXIT, NODE_NEW, ERROR, WARNING, POST_PARSE, CRASH).'
           },
           func: {
             type: 'string',
@@ -4457,7 +4527,11 @@ async function registerWebMcpTools() {
           },
           onlyUnderflows: {
             type: 'boolean',
-            description: 'If true, only return steps where a new AST node location underflow occurred.'
+            description: 'If true, only return steps where a new AST node location underflow/OOB occurred.'
+          },
+          onlyAnomalies: {
+            type: 'boolean',
+            description: 'If true, only return steps where any new invariant violation (node, comment, diagnostic, or line_offset) occurred.'
           },
           limit: {
             type: 'number',
@@ -4475,6 +4549,7 @@ async function registerWebMcpTools() {
           if (input.func && !(s.func || '').includes(input.func)) continue;
           if (input.onlyRewinds && !s._isRewind) continue;
           if (input.onlyUnderflows && !s._hasNewUnderflow) continue;
+          if (input.onlyAnomalies && !s._hasNewInvariant) continue;
           matches.push({
             stepIndex: i,
             step: s.step,
@@ -4486,7 +4561,8 @@ async function registerWebMcpTools() {
             nextStart: s.next_start,
             heredocEnd: s.heredoc_end,
             isRewind: Boolean(s._isRewind),
-            hasNewUnderflow: Boolean(s._hasNewUnderflow)
+            hasNewUnderflow: Boolean(s._hasNewUnderflow),
+            hasNewInvariant: Boolean(s._hasNewInvariant)
           });
           if (matches.length >= maxResults) break;
         }
@@ -4578,7 +4654,7 @@ async function registerWebMcpTools() {
   if (stepParam && currentTrace) {
     if (stepParam === 'crash' && currentTrace._crashIdx >= 0) {
       jumpToStep(currentTrace._crashIdx);
-    } else if (stepParam === 'underflow' && currentTrace._underflowIdx >= 0) {
+    } else if ((stepParam === 'underflow' || stepParam === 'anomaly' || stepParam === 'invariant') && currentTrace._underflowIdx >= 0) {
       jumpToStep(currentTrace._underflowIdx);
     } else {
       const n = parseInt(stepParam, 10);

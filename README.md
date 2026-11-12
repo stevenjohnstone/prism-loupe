@@ -10,7 +10,7 @@ An interactive, single-file, in-browser C99 parser, lexer, and AST execution vis
 
 ### 1. In-Browser WebAssembly Tracing
 - **Live Ruby Editing**: Double-click the Ruby source buffer (or click **`✎ Edit Code`**) and press **`⌘+Enter` / `Ctrl+Enter`** to parse and trace any Ruby snippet directly in the browser via an embedded WASI WebAssembly build of Prism (`build/prism_trace.wasm`).
-- **Fine-Grained Execution Events**: Records every `PARSE_ENTER`, `PARSE_EXIT`, `LEX_TOKEN`, `LEX_MODE_PUSH`, `LEX_MODE_POP`, `LEX_STATE`, `HEREDOC_FLUSH`, `NODE_NEW`, `NODE_LIST_APPEND`, `ERROR`, and `CRASH` transition while preserving exact upstream C source filenames and line numbers.
+- **Fine-Grained Execution Events**: Records every `PARSE_ENTER`, `PARSE_EXIT`, `LEX_TOKEN`, `LEX_MODE_PUSH`, `LEX_MODE_POP`, `LEX_STATE`, `HEREDOC_FLUSH`, `NODE_NEW`, `NODE_LIST_APPEND`, `ERROR`, `WARNING`, `POST_PARSE`, and `CRASH` transition while preserving exact upstream C source filenames and line numbers.
 - **Multi-Version In-Browser Switcher**: Includes an interactive header selector for the last two minor releases of the current major version, the final release of the previous major version, and `main` (e.g. `v2.1.0`, `v2.0.0`, `v1.9.0`, and `main`), each linked to its exact commit on GitHub. Switching versions swaps the in-memory Wasm module and re-traces the active snippet in-place.
 - **File Import**: Load `.rb` source files directly into the in-browser Wasm tracer (`📂 .rb`) or inspect pre-recorded `.jsonl` trace files (`📂 .jsonl`).
 
@@ -18,9 +18,9 @@ An interactive, single-file, in-browser C99 parser, lexer, and AST execution vis
 - **Color-Coded Timeline Scrubber**: Click or drag across the timeline bar to scrub through the trace. Visual markers highlight:
   - **Green**: Lexed tokens (`LEX_TOKEN`)
   - **Blue**: AST node creation and list appends (`NODE_NEW`, `NODE_LIST_APPEND`)
-  - **Amber**: Lexer cursor rewinds (`s.curr[0] < prevCurrStart`, e.g., heredoc body restores)
+  - **Amber**: Lexer cursor rewinds (`s.curr[0] < prevCurrStart`, e.g., heredoc body restores) and parser warnings (`WARNING`)
   - **Pink**: Syntax errors (`ERROR`)
-  - **Red**: Parser assertions / traps (`CRASH`) or invalid AST node bounds (`end < start`)
+  - **Red**: Parser assertions / traps (`CRASH`) or invariant violations across AST node locations, comments, magic comments, error/warning diagnostics, and `line_offsets` (underflow `end < start`, out-of-bounds `end > src_len`, overlapping/duplicate comments, or non-monotonic/invalid newline offsets)
 - **Targeted Step Controls & Keyboard Shortcuts**:
   - `Space`: Play / Pause automatic stepping
   - `←` / `→`: Previous / Next trace step
@@ -28,20 +28,22 @@ An interactive, single-file, in-browser C99 parser, lexer, and AST execution vis
   - `n` / `Shift+n`: Next / Previous AST node event (`NODE_NEW` / `NODE_LIST_APPEND`)
   - `m` / `Shift+m`: Next / Previous arena memory allocation (`+Mem` / `-Mem`)
   - `r` / `Shift+r`: Next / Previous lexer cursor rewind (`+Rewind` / `-Rewind`)
-  - `u` / `Shift+u`: Next / Previous invalid AST node location (`⚠ Bad Node`)
+  - `u` / `Shift+u`: Next / Previous invariant violation across AST nodes, comments, diagnostics, and `line_offsets` (`⚠ Anomaly`)
   - `c`: Jump to `CRASH` step (when present)
 - **Configurable Playback Speed**: Click **`⚙` (Settings)** in the header to customize the playback step interval (`10ms`–`10000ms`, with quick presets for `50ms`, `100ms`, `250ms`, `500ms`, and `1s`), persisted in `localStorage`.
 
 ### 3. Three-Pane Parser & Lexer State Inspector
 - **Pane 1 — Ruby Buffer & Live Lexer**:
-  - Byte-accurate character grid highlighting `parser->previous` (amber), `parser->current` (green), active line, and hovered AST node ranges.
-  - Live `parser->line_offsets` table with automatic detection of non-monotonic newline offset entries.
+  - Byte-accurate character grid highlighting `parser->previous` (amber), `parser->current` (green), active line, and hovered AST/comment/diagnostic ranges.
+  - Live `parser->line_offsets` table with automatic detection of empty, non-zero initial (`L1 != 0`), non-monotonic (`off <= prev`), underflowed, or out-of-bounds newline offsets.
+  - Live `parser->comment_list` & `parser->magic_comment_list` inspector flagging location underflows, out-of-bounds spans, overlapping/duplicate comment ranges, and post-attach sort violations (while distinguishing legitimate pre-sort heredoc `↺ lex-order` comments).
+  - Live `parser->error_list` & `parser->warning_list` diagnostic inspector with severity/level badges, clickable step attribution, and location underflow/out-of-bounds checks.
 - **Pane 2 — Lexer State, Mode Stack & Call Stack**:
-  - Current transition metadata (`step`, `kind`, `func`, C source location, `next_start`, `heredoc_end`, `lex_state`, and syntax error count).
+  - Current transition metadata (`step`, `kind`, `func`, C source location, `next_start`, `heredoc_end`, `lex_state`, error/warning counts, and comment count).
   - Live `parser->lex_modes` stack (`top → bottom`), `parser->current_context` stack, and clickable `parse_*` recursive-descent call stack with GitHub source links.
 - **Pane 3 — Live Arenas, Memory & AST Assembly**:
   - Real-time byte, capacity, and block telemetry for `parser->arena` (AST nodes), `metadata_arena`, `scratch_arena`, `line_offsets`, and `constant_pool`.
-  - Live bottom-up AST forest distinguishing active candidate roots from superseded/orphaned nodes, with hover-to-highlight source spans and warnings for inverted node locations (`end < start`).
+  - Live bottom-up AST forest distinguishing active candidate roots from superseded/orphaned nodes, with hover-to-highlight source spans and warnings for underflowed (`end < start`) or out-of-bounds (`end > src_len`) node locations.
 
 ### 4. Shareable URLs & Instant Video Export
 - **Shareable Links (`?version=` & `?code=`)**: Click **`🔗 Share`** to copy a URL with the selected Prism version (`?version=`) and current Ruby snippet Base64-encoded in `?code=` (plus optional `&step=<n|underflow|crash>` deep-linking). Opening the URL automatically selects the requested Prism version, decodes the snippet, and traces it in Wasm.
